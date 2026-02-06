@@ -9,45 +9,51 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# COLE AQUI SUA URL DE RESULTADOS
+RESULTS_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearchResults.jsp?searchId=2"
+
 def scrape_orange_county():
-    url = "https://www.octaxdeeds.com/TaxDeedSales"  # exemplo, pode mudar depois se o site for outro
-    response = requests.get(url)
+    response = requests.get(RESULTS_URL)
     soup = BeautifulSoup(response.text, "html.parser")
 
-    table = soup.find("table")
-    df = pd.read_html(str(table))[0]
+    rows = soup.select("table#searchResultsTable tbody tr")
 
-    df = df.rename(columns={
-        "Address": "address",
-        "City": "city",
-        "County": "county",
-        "State": "state",
-        "Opening Bid": "amount_due",
-        "Sale Date": "auction_date",
-    })
+    data = []
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
 
-    df["sale_type"] = "tax_deed"
+        # coluna 1: Tax Sale + número
+        desc = cols[0].get_text(" ", strip=True)
 
-    links = []
-    for row in table.find_all("tr")[1:]:
-        a = row.find("a")
-        links.append(a["href"] if a else None)
+        # coluna 2: tabela interna com detalhes
+        details = cols[1]
 
-    df["official_link"] = links
+        sale_date = details.find(text="Sale Date:")
+        sale_date = sale_date.find_next("b").text.strip() if sale_date else None
 
-    df["amount_due"] = (
-        df["amount_due"]
-        .astype(str)
-        .str.replace("$", "")
-        .str.replace(",", "")
-        .astype(float)
-    )
+        applicant = details.find(text="Applicant Name:")
+        applicant = applicant.find_next("b").text.strip() if applicant else None
 
-    df["auction_date"] = pd.to_datetime(df["auction_date"], errors="coerce")
+        status = details.find(text="Status:")
+        status = status.find_next("b").text.strip() if status else None
 
-    df["notes"] = None
+        parcel = desc.split()[-1]  # último item é o número do tax sale
 
-    return df
+        data.append({
+            "address": parcel,
+            "city": "Orange County",
+            "county": "Orange",
+            "state": "FL",
+            "amount_due": 0,
+            "sale_type": "tax_deed",
+            "auction_date": pd.to_datetime(sale_date, errors="coerce"),
+            "official_link": RESULTS_URL,
+            "notes": f"Applicant: {applicant} | Status: {status}"
+        })
+
+    return data
 
 def upsert_property(row):
     existing = (
@@ -59,21 +65,13 @@ def upsert_property(row):
     )
 
     if existing.data:
-        supabase.table("properties").update({
-            "city": row["city"],
-            "county": row["county"],
-            "state": row["state"],
-            "amount_due": row["amount_due"],
-            "sale_type": row["sale_type"],
-            "official_link": row["official_link"],
-            "notes": row["notes"],
-        }).eq("id", existing.data[0]["id"]).execute()
+        supabase.table("properties").update(row).eq("id", existing.data[0]["id"]).execute()
     else:
         supabase.table("properties").insert(row).execute()
 
 def run():
-    df = scrape_orange_county()
-    for row in df.to_dict(orient="records"):
+    data = scrape_orange_county()
+    for row in data:
         upsert_property(row)
 
 if __name__ == "__main__":
