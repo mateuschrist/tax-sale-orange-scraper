@@ -1,27 +1,26 @@
-import os
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from supabase import create_client
 
-# 🔐 Variáveis de ambiente (configure no GitHub Actions)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# 🔗 Endpoint da sua Edge Function (já testada e funcionando)
+ENDPOINT = "https://qeboakaofiqgvbyykvwi.supabase.co/functions/v1/import-properties"
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# 🔗 Versão para imprimir — já filtrada em Active Sale (DeedStatusID in 'AS')
+# 🔗 Página de resultados (versão para imprimir)
 RESULTS_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearchResults.jsp?searchId=2&printing=true"
 
 
+# ---------------------------------------------------------
+# 1) SCRAPER — Extrai dados da versão para imprimir
+# ---------------------------------------------------------
 def scrape_orange_county():
+    print("🔍 Baixando página de resultados...")
     resp = requests.get(RESULTS_URL)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Cada linha de resultado
     rows = soup.select("#searchResultsTable tbody tr")
+    print(f"📄 Linhas encontradas: {len(rows)}")
 
     data = []
 
@@ -30,13 +29,12 @@ def scrape_orange_county():
         if len(cols) < 2:
             continue
 
-        # --- COLUNA 1: Tax Sale + número ---
+        # --- COLUNA 1: Tax Sale ID ---
         desc_text = cols[0].get_text(" ", strip=True)
-        # Ex: "Tax Sale 2023-17830"
         parts = desc_text.split()
         tax_sale_id = parts[-1] if parts else None
 
-        # --- COLUNA 2: Detalhes (Sale Date, Applicant, Status, Parcel, Min Bid, High Bid) ---
+        # --- COLUNA 2: Detalhes ---
         details = cols[1]
 
         def extract(label):
@@ -59,46 +57,55 @@ def scrape_orange_county():
             return float(v.replace("$", "").replace(",", ""))
 
         row_data = {
-            "address": parcel,  # aqui usamos o Parcel como "address"
-            "city": "Orange County",
+            "address": parcel,
+            "city": "Orlando",
             "county": "Orange",
             "state": "FL",
             "amount_due": clean_money(min_bid),
             "sale_type": "tax_deed",
-            "auction_date": pd.to_datetime(sale_date, errors="coerce"),
+            "auction_date": pd.to_datetime(sale_date, errors="coerce").strftime("%Y-%m-%d"),
             "official_link": RESULTS_URL,
             "notes": f"Tax Sale: {tax_sale_id} | Applicant: {applicant} | Status: {status} | High Bid: {high_bid}",
         }
 
         data.append(row_data)
 
+    print(f"📦 Total de propriedades extraídas: {len(data)}")
     return data
 
 
-def upsert_property(row):
-    # Evita duplicar: chave = address + auction_date
-    existing = (
-        supabase.table("properties")
-        .select("*")
-        .eq("address", row["address"])
-        .eq("auction_date", row["auction_date"])
-        .execute()
+# ---------------------------------------------------------
+# 2) ENVIO PARA A EDGE FUNCTION
+# ---------------------------------------------------------
+def send_to_supabase(data):
+    print("🚀 Enviando dados para a Edge Function...")
+
+    resp = requests.post(
+        ENDPOINT,
+        json=data,
+        headers={"Content-Type": "application/json"}
     )
 
-    if existing.data:
-        prop_id = existing.data[0]["id"]
-        supabase.table("properties").update(row).eq("id", prop_id).execute()
+    print("📨 Resposta da Edge Function:")
+    print(resp.text)
+
+    if resp.status_code != 200:
+        print("❌ Erro ao enviar para Supabase:", resp.status_code)
     else:
-        supabase.table("properties").insert(row).execute()
+        print("✅ Dados enviados com sucesso!")
 
 
+# ---------------------------------------------------------
+# 3) EXECUÇÃO PRINCIPAL
+# ---------------------------------------------------------
 def run():
-    properties = scrape_orange_county()
-    for row in properties:
-        # ignora linhas sem parcel ou sem data
-        if not row["address"] or pd.isna(row["auction_date"]):
-            continue
-        upsert_property(row)
+    data = scrape_orange_county()
+
+    if not data:
+        print("⚠ Nenhuma propriedade encontrada. Encerrando.")
+        return
+
+    send_to_supabase(data)
 
 
 if __name__ == "__main__":
