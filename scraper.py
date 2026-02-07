@@ -2,7 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
-# 🔗 Endpoint da sua Edge Function (já testada e funcionando)
+# 🔗 Endpoint da sua Edge Function
 ENDPOINT = "https://qeboakaofiqgvbyykvwi.supabase.co/functions/v1/import-properties"
 
 # 🔗 Página de resultados (versão para imprimir)
@@ -14,8 +14,22 @@ RESULTS_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearchResults.
 # ---------------------------------------------------------
 def scrape_orange_county():
     print("🔍 Baixando página de resultados...")
-    resp = requests.get(RESULTS_URL)
-    resp.raise_for_status()
+
+    # Sessão persistente + User-Agent (PARTE 1 + PARTE 2)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    })
+
+    resp = session.get(RESULTS_URL)
+
+    # DEBUG (PARTE 3)
+    print("\n--- DEBUG ---")
+    print("URL final:", resp.url)
+    print("Status:", resp.status_code)
+    print("HTML (primeiros 1000 chars):")
+    print(resp.text[:1000])
+    print("--- FIM DEBUG ---\n")
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -70,7 +84,7 @@ def scrape_orange_county():
 
         data.append(row_data)
 
-    print(f"📦 Total de propriedades extraídas: {len(data)}")
+    print(f"🗂️ Total de propriedades extraídas: {len(data)}")
     return data
 
 
@@ -102,7 +116,7 @@ def run():
     data = scrape_orange_county()
 
     if not data:
-        print("⚠ Nenhuma propriedade encontrada. Encerrando.")
+        print("⚠️ Nenhuma propriedade encontrada. Encerrando.")
         return
 
     send_to_supabase(data)
