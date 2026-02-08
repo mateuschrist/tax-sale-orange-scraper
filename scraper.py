@@ -5,10 +5,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 import requests
 
-# Endpoint da sua Edge Function
 ENDPOINT = "https://qeboakaofiqgvbyykvwi.supabase.co/functions/v1/import-properties"
-
-# URL inicial (página de busca)
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
@@ -22,7 +19,6 @@ def parse_date(v):
     if not v:
         return None
     try:
-        # Ex: "Mar 12, 2026"
         dt = datetime.strptime(v.strip(), "%b %d, %Y")
         return dt.strftime("%Y-%m-%d")
     except Exception:
@@ -36,32 +32,40 @@ async def scrape_with_playwright():
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
+        print("🌐 Acessando página inicial...")
+        await page.goto("https://or.occompt.com/recorder/web/login.jsp", wait_until="networkidle")
+
+        # 1️⃣ Clicar no botão "I Acknowledge"
+        if await page.locator("input[value='I Acknowledge']").count() > 0:
+            print("🟢 Clicando em 'I Acknowledge'...")
+            await page.click("input[value='I Acknowledge']")
+            await page.wait_for_load_state("networkidle")
+
+        # 2️⃣ Clicar no botão "Tax Deed Sales" (se aparecer)
+        if await page.locator("button:has-text('Tax Deed Sales')").count() > 0:
+            print("🟢 Clicando em 'Tax Deed Sales'...")
+            await page.click("button:has-text('Tax Deed Sales')")
+            await page.wait_for_load_state("networkidle")
+
+        # 3️⃣ Agora estamos na página de busca
         print("🌐 Acessando página de busca...")
         await page.goto(SEARCH_URL, wait_until="networkidle")
 
-        # Aqui você pode aplicar um filtro mínimo se quiser (ex: Status = Active Sale)
-        # Mas como você já tem buscas recentes, vamos direto para a versão "Printable Version"
-        # se ela estiver disponível na página de resultados.
+        # 4️⃣ Clicar em "Search" (sem filtros)
+        print("🔎 Clicando em Search...")
+        await page.click("input[value='Search']")
+        await page.wait_for_load_state("networkidle")
 
-        # Se você quiser simular o clique em "Search", descomente:
-        # await page.click("text=Search")
-        # await page.wait_for_load_state("networkidle")
-
-        # Neste fluxo, vamos assumir que você acessa diretamente uma busca recente
-        # ou que a página já mostra resultados após o primeiro load.
-
-        # Tenta clicar em "Printable Version" se existir
-        printable_link = page.locator("text=Printable Version")
-        if await printable_link.count() > 0:
-            print("🖨️ Clicando em 'Printable Version'...")
-            await printable_link.first.click()
+        # 5️⃣ Clicar em "Printable Version"
+        printable = page.locator("text=Printable Version")
+        if await printable.count() > 0:
+            print("🖨️ Clicando em Printable Version...")
+            await printable.first.click()
             await page.wait_for_load_state("networkidle")
 
-        # Agora estamos na página de impressão com a tabela
         url_final = page.url
         print(f"📄 URL final: {url_final}")
 
-        # Garante que a tabela existe
         rows = page.locator("#searchResultsTable tbody tr")
         row_count = await rows.count()
         print(f"📄 Linhas encontradas: {row_count}")
@@ -71,28 +75,17 @@ async def scrape_with_playwright():
         for i in range(row_count):
             row = rows.nth(i)
             cols = row.locator("td")
-            col_count = await cols.count()
-            if col_count < 2:
+            if await cols.count() < 2:
                 continue
 
-            # Coluna 1: descrição (Tax Sale ID)
             desc_text = (await cols.nth(0).inner_text()).strip()
             parts = desc_text.split()
             tax_sale_id = parts[-1] if parts else None
 
-            # Coluna 2: detalhes
-            details_html = await cols.nth(1).inner_html()
-
-            # Vamos usar uma abordagem simples baseada em texto
             details_text = (await cols.nth(1).inner_text()).splitlines()
             details_text = [t.strip() for t in details_text if t.strip()]
 
-            sale_date = None
-            applicant = None
-            status = None
-            parcel = None
-            min_bid = None
-            high_bid = None
+            sale_date = applicant = status = parcel = min_bid = high_bid = None
 
             for line in details_text:
                 if line.startswith("Sale Date:"):
@@ -125,7 +118,6 @@ async def scrape_with_playwright():
         print(f"🗂️ Total de propriedades extraídas: {len(data)}")
 
         await browser.close()
-
         return data
 
 
