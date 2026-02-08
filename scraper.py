@@ -34,10 +34,10 @@ def parse_date(v):
 
 
 # -----------------------------
-# PDF PARSER ROBUSTO
+# PARSER ULTRA TOLERANTE
 # -----------------------------
 def extract_from_property_info_pdf(pdf_bytes):
-    """Extrai o endereço e legal description do Property_Information.pdf."""
+    """Extrai endereço e legal description de forma ultra tolerante."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -48,30 +48,41 @@ def extract_from_property_info_pdf(pdf_bytes):
     lines = [l.strip() for l in text.split("\n")]
 
     # -----------------------------
-    # 1) Achar linha "ADDRESS ON RECORD ON CURRENT TAX ROLL"
+    # 1) Achar linha "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
     # -----------------------------
     idx = None
     for i, line in enumerate(lines):
-        if "ADDRESS ON RECORD ON CURRENT TAX ROLL" in line.upper():
+        if "ADDRESS ON RECORD ON CURRENT TAX ROLL:" in line.upper():
             idx = i
             break
 
     if idx is None:
         return None, None
 
-    # Pegar as próximas linhas não vazias
-    non_empty = []
-    j = idx + 1
-    while j < len(lines) and len(non_empty) < 3:
+    # -----------------------------
+    # 2) Coletar próximas 5 linhas (ultra tolerante)
+    # -----------------------------
+    candidates = []
+    for j in range(idx + 1, min(idx + 6, len(lines))):
         if lines[j].strip():
-            non_empty.append(lines[j].strip())
-        j += 1
+            candidates.append(lines[j].strip())
 
-    if len(non_empty) < 2:
+    # Procurar linha da rua (tem número + texto)
+    street = None
+    for c in candidates:
+        if re.match(r"^\d+\s+.+", c):
+            street = c
+            break
+
+    # Procurar linha da cidade (tem , FL + ZIP)
+    city_line = None
+    for c in candidates:
+        if re.search(r",\s*FL\s*\d{5}", c):
+            city_line = c
+            break
+
+    if not street or not city_line:
         return None, None
-
-    street = non_empty[0]
-    city_line = non_empty[1]
 
     # Extrair cidade, estado, zip
     m = re.search(r"([A-Za-z\s]+),\s*(FL)\s*(\d{5})", city_line)
@@ -90,7 +101,7 @@ def extract_from_property_info_pdf(pdf_bytes):
     }
 
     # -----------------------------
-    # 2) Extrair LEGAL DESCRIPTION
+    # 3) Extrair LEGAL DESCRIPTION (ultra tolerante)
     # -----------------------------
     legal_description = None
     legal_idx = None
@@ -102,15 +113,15 @@ def extract_from_property_info_pdf(pdf_bytes):
 
     if legal_idx is not None:
         collected = []
-        k = legal_idx + 1
-        while k < len(lines):
+        for k in range(legal_idx + 1, len(lines)):
             l = lines[k]
+
             # Novo bloco em CAPS com dois pontos → parar
             if re.match(r"^[A-Z0-9 \(\)\/]+:\s*$", l):
                 break
+
             if l.strip():
                 collected.append(l)
-            k += 1
 
         if collected:
             legal_description = "\n".join(collected).strip()
