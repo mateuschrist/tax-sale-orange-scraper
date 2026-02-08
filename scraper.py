@@ -38,15 +38,17 @@ def parse_date(v):
 # -----------------------------
 def extract_from_property_info_pdf(pdf_bytes):
     """Extrai endereço e legal description de forma ultra tolerante."""
+    
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-    except Exception:
-        return None, None
+    text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-    text = text.replace("\r", "").strip()
-    lines = [l.strip() for l in text.split("\n")]
+print("===== PDF RAW TEXT =====")
+print(text)
+print("========================")
 
+text = text.replace("\r", "").strip()
+lines = [l.strip() for l in text.split("\n")]
     # -----------------------------
     # 1) Achar linha "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
     # -----------------------------
