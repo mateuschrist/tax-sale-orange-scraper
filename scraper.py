@@ -1,7 +1,5 @@
 import asyncio
-import json
 from datetime import datetime
-
 from playwright.async_api import async_playwright
 import requests
 
@@ -32,31 +30,36 @@ async def scrape_with_playwright():
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
+        # 1️⃣ Acessar página inicial
         print("🌐 Acessando página inicial...")
         await page.goto("https://or.occompt.com/recorder/web/login.jsp", wait_until="networkidle")
 
-        # 1️⃣ Clicar no botão "I Acknowledge"
+        # 2️⃣ Clicar em "I Acknowledge"
         if await page.locator("input[value='I Acknowledge']").count() > 0:
             print("🟢 Clicando em 'I Acknowledge'...")
             await page.click("input[value='I Acknowledge']")
             await page.wait_for_load_state("networkidle")
 
-        # 2️⃣ Clicar no botão "Tax Deed Sales" (se aparecer)
+        # 3️⃣ Clicar em "Tax Deed Sales"
         if await page.locator("button:has-text('Tax Deed Sales')").count() > 0:
             print("🟢 Clicando em 'Tax Deed Sales'...")
             await page.click("button:has-text('Tax Deed Sales')")
             await page.wait_for_load_state("networkidle")
 
-        # 3️⃣ Agora estamos na página de busca
+        # 4️⃣ Agora estamos na página de busca
         print("🌐 Acessando página de busca...")
         await page.goto(SEARCH_URL, wait_until="networkidle")
 
-        # 4️⃣ Clicar em "Search" (sem filtros)
+        # 5️⃣ Selecionar "Active Sale" no dropdown de Status
+        print("🟢 Selecionando 'Active Sale'...")
+        await page.select_option("select[name='DeedStatusID']", value="AS")
+
+        # 6️⃣ Clicar em Search
         print("🔎 Clicando em Search...")
         await page.click("input[value='Search']")
         await page.wait_for_load_state("networkidle")
 
-        # 5️⃣ Clicar em "Printable Version"
+        # 7️⃣ Clicar em Printable Version
         printable = page.locator("text=Printable Version")
         if await printable.count() > 0:
             print("🖨️ Clicando em Printable Version...")
@@ -66,6 +69,7 @@ async def scrape_with_playwright():
         url_final = page.url
         print(f"📄 URL final: {url_final}")
 
+        # 8️⃣ Extrair tabela
         rows = page.locator("#searchResultsTable tbody tr")
         row_count = await rows.count()
         print(f"📄 Linhas encontradas: {row_count}")
