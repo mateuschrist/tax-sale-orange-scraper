@@ -33,28 +33,27 @@ def parse_date(v):
     return None
 
 
-def extract_situs_and_legal_from_pdf(pdf_bytes):
-    """Extrai o Situs Address e Legal Description do PDF."""
+def extract_from_property_info_pdf(pdf_bytes):
+    """Extrai o endereço e legal description do Property_Information.pdf."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
     except Exception:
         return None, None
 
-    # Normalizar
     text = text.replace("\r", "").strip()
 
     # -----------------------------
-    # 1) Extrair SITUS ADDRESS
+    # 1) Extrair ADDRESS ON RECORD ON CURRENT TAX ROLL
     # -----------------------------
-    situs_regex = r"(Situs Address|Situs)[:\s]*\n(.+?)\n(.+?)\n"
-    match = re.search(situs_regex, text, re.IGNORECASE)
+    address_regex = r"ADDRESS ON RECORD ON CURRENT TAX ROLL\s*\n(.+?)\n(.+?)\n"
+    match = re.search(address_regex, text, re.IGNORECASE)
 
     if not match:
         return None, None
 
-    line1 = match.group(2).strip()
-    line2 = match.group(3).strip()
+    line1 = match.group(1).strip()
+    line2 = match.group(2).strip()
 
     # Extrair cidade, estado, zip
     city_state_zip = re.search(r"([A-Z\s]+),\s*(FL)\s*(\d{5})", line2)
@@ -65,22 +64,24 @@ def extract_situs_and_legal_from_pdf(pdf_bytes):
     state = city_state_zip.group(2).strip()
     zip_code = city_state_zip.group(3).strip()
 
+    situs = {
+        "address": line1,
+        "city": city,
+        "state": state,
+        "zip": zip_code,
+    }
+
     # -----------------------------
     # 2) Extrair LEGAL DESCRIPTION
     # -----------------------------
-    legal_regex = r"(Legal Description|Legal)[:\s]*\n([\s\S]*?)(?=\n[A-Z][a-zA-Z ]+?:|\Z)"
+    legal_regex = r"(Legal Description|LEGAL DESCRIPTION)[:\s]*\n([\s\S]*?)(?=\n[A-Z][A-Za-z ]+?:|\Z)"
     legal_match = re.search(legal_regex, text, re.IGNORECASE)
 
     legal_description = None
     if legal_match:
         legal_description = legal_match.group(2).strip()
 
-    return {
-        "address": line1,
-        "city": city,
-        "state": state,
-        "zip": zip_code,
-    }, legal_description
+    return situs, legal_description
 
 
 # -----------------------------
@@ -163,15 +164,13 @@ async def scrape_with_playwright():
             min_bid = await safe_text(get_text_after("Min Bid:"))
             high_bid = await safe_text(get_text_after("High Bid:"))
 
-            # 6) Achar link do PDF "Other Documents"
-            pdf_link = None
-            pdf_locator = page.locator("a:has-text('Other Documents')")
-            if await pdf_locator.count() > 0:
-                pdf_link = await pdf_locator.first.get_attribute("href")
-
-            if not pdf_link:
-                print("⚠️ Sem PDF de Other Documents. Ignorando propriedade.")
+            # 6) Achar link do PDF "View Property Information"
+            pdf_locator = page.locator("a:has-text('View Property Information')")
+            if await pdf_locator.count() == 0:
+                print("⚠️ Sem 'View Property Information'. Ignorando propriedade.")
                 continue
+
+            pdf_link = await pdf_locator.first.get_attribute("href")
 
             if not pdf_link.startswith("http"):
                 pdf_link = "https://or.occompt.com/recorder/eagleweb/" + pdf_link.lstrip("/")
@@ -179,10 +178,10 @@ async def scrape_with_playwright():
             print(f"📄 Baixando PDF: {pdf_link}")
             pdf_bytes = requests.get(pdf_link).content
 
-            situs, legal_description = extract_situs_and_legal_from_pdf(pdf_bytes)
+            situs, legal_description = extract_from_property_info_pdf(pdf_bytes)
 
             if not situs:
-                print("⚠️ Sem Situs Address no PDF. Ignorando propriedade.")
+                print("⚠️ Sem endereço no PDF. Ignorando propriedade.")
                 continue
 
             # Montar registro final
