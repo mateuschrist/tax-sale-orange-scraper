@@ -33,6 +33,9 @@ def parse_date(v):
     return None
 
 
+# -----------------------------
+# PDF PARSER ROBUSTO
+# -----------------------------
 def extract_from_property_info_pdf(pdf_bytes):
     """Extrai o endereço e legal description do Property_Information.pdf."""
     try:
@@ -42,30 +45,45 @@ def extract_from_property_info_pdf(pdf_bytes):
         return None, None
 
     text = text.replace("\r", "").strip()
+    lines = [l.strip() for l in text.split("\n")]
 
     # -----------------------------
-    # 1) Extrair ADDRESS ON RECORD ON CURRENT TAX ROLL
+    # 1) Achar linha "ADDRESS ON RECORD ON CURRENT TAX ROLL"
     # -----------------------------
-    address_regex = r"ADDRESS ON RECORD ON CURRENT TAX ROLL\s*\n(.+?)\n(.+?)\n"
-    match = re.search(address_regex, text, re.IGNORECASE)
+    idx = None
+    for i, line in enumerate(lines):
+        if "ADDRESS ON RECORD ON CURRENT TAX ROLL" in line.upper():
+            idx = i
+            break
 
-    if not match:
+    if idx is None:
         return None, None
 
-    line1 = match.group(1).strip()
-    line2 = match.group(2).strip()
+    # Pegar as próximas linhas não vazias
+    non_empty = []
+    j = idx + 1
+    while j < len(lines) and len(non_empty) < 3:
+        if lines[j].strip():
+            non_empty.append(lines[j].strip())
+        j += 1
+
+    if len(non_empty) < 2:
+        return None, None
+
+    street = non_empty[0]
+    city_line = non_empty[1]
 
     # Extrair cidade, estado, zip
-    city_state_zip = re.search(r"([A-Z\s]+),\s*(FL)\s*(\d{5})", line2)
-    if not city_state_zip:
+    m = re.search(r"([A-Za-z\s]+),\s*(FL)\s*(\d{5})", city_line)
+    if not m:
         return None, None
 
-    city = city_state_zip.group(1).strip()
-    state = city_state_zip.group(2).strip()
-    zip_code = city_state_zip.group(3).strip()
+    city = m.group(1).strip().upper()
+    state = m.group(2).strip()
+    zip_code = m.group(3).strip()
 
     situs = {
-        "address": line1,
+        "address": street,
         "city": city,
         "state": state,
         "zip": zip_code,
@@ -74,12 +92,28 @@ def extract_from_property_info_pdf(pdf_bytes):
     # -----------------------------
     # 2) Extrair LEGAL DESCRIPTION
     # -----------------------------
-    legal_regex = r"(Legal Description|LEGAL DESCRIPTION)[:\s]*\n([\s\S]*?)(?=\n[A-Z][A-Za-z ]+?:|\Z)"
-    legal_match = re.search(legal_regex, text, re.IGNORECASE)
-
     legal_description = None
-    if legal_match:
-        legal_description = legal_match.group(2).strip()
+    legal_idx = None
+
+    for i, line in enumerate(lines):
+        if "LEGAL DESCRIPTION" in line.upper():
+            legal_idx = i
+            break
+
+    if legal_idx is not None:
+        collected = []
+        k = legal_idx + 1
+        while k < len(lines):
+            l = lines[k]
+            # Novo bloco em CAPS com dois pontos → parar
+            if re.match(r"^[A-Z0-9 \(\)\/]+:\s*$", l):
+                break
+            if l.strip():
+                collected.append(l)
+            k += 1
+
+        if collected:
+            legal_description = "\n".join(collected).strip()
 
     return situs, legal_description
 
@@ -158,11 +192,7 @@ async def scrape_with_playwright():
                 return (await locator.first.inner_text()).strip()
 
             sale_date = await safe_text(get_text_after("Sale Date:"))
-            applicant = await safe_text(get_text_after("Applicant Name:"))
-            status = await safe_text(get_text_after("Status:"))
-            parcel = await safe_text(get_text_after("Parcel:"))
             min_bid = await safe_text(get_text_after("Min Bid:"))
-            high_bid = await safe_text(get_text_after("High Bid:"))
 
             # 6) Achar link do PDF "View Property Information"
             pdf_locator = page.locator("a:has-text('View Property Information')")
