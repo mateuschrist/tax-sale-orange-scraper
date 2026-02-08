@@ -25,4 +25,5 @@ jobs:
           playwright install --with-deps
 
       - name: Run scraper
-        run: python scraper_playwright.py
+        run: python scraper.py
+
