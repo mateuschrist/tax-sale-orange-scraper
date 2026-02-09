@@ -1,140 +1,14 @@
 import asyncio
 import io
-import re
-from datetime import datetime
-
 import pdfplumber
 import requests
 from playwright.async_api import async_playwright
 
-ENDPOINT = "https://qeboakaofiqgvbyykvwi.supabase.co/functions/v1/import-properties"
 LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def clean_money(v):
-    if not v:
-        return 0.0
-    return float(v.replace("$", "").replace(",", "").strip())
-
-
-def parse_date(v):
-    if not v:
-        return None
-    for fmt in ("%b %d, %Y", "%m/%d/%Y"):
-        try:
-            dt = datetime.strptime(v.strip(), fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-    return None
-
-
-# -----------------------------
-# PARSER ULTRA TOLERANTE
-# -----------------------------
-def extract_from_property_info_pdf(pdf_bytes):
-    """Extrai endereço e legal description de forma ultra tolerante."""
-    
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-    text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-
-print("===== PDF RAW TEXT =====")
-print(text)
-print("========================")
-
-text = text.replace("\r", "").strip()
-lines = [l.strip() for l in text.split("\n")]
-    # -----------------------------
-    # 1) Achar linha "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
-    # -----------------------------
-    idx = None
-    for i, line in enumerate(lines):
-        if "ADDRESS ON RECORD ON CURRENT TAX ROLL:" in line.upper():
-            idx = i
-            break
-
-    if idx is None:
-        return None, None
-
-    # -----------------------------
-    # 2) Coletar próximas 5 linhas (ultra tolerante)
-    # -----------------------------
-    candidates = []
-    for j in range(idx + 1, min(idx + 6, len(lines))):
-        if lines[j].strip():
-            candidates.append(lines[j].strip())
-
-    # Procurar linha da rua (tem número + texto)
-    street = None
-    for c in candidates:
-        if re.match(r"^\d+\s+.+", c):
-            street = c
-            break
-
-    # Procurar linha da cidade (tem , FL + ZIP)
-    city_line = None
-    for c in candidates:
-        if re.search(r",\s*FL\s*\d{5}", c):
-            city_line = c
-            break
-
-    if not street or not city_line:
-        return None, None
-
-    # Extrair cidade, estado, zip
-    m = re.search(r"([A-Za-z\s]+),\s*(FL)\s*(\d{5})", city_line)
-    if not m:
-        return None, None
-
-    city = m.group(1).strip().upper()
-    state = m.group(2).strip()
-    zip_code = m.group(3).strip()
-
-    situs = {
-        "address": street,
-        "city": city,
-        "state": state,
-        "zip": zip_code,
-    }
-
-    # -----------------------------
-    # 3) Extrair LEGAL DESCRIPTION (ultra tolerante)
-    # -----------------------------
-    legal_description = None
-    legal_idx = None
-
-    for i, line in enumerate(lines):
-        if "LEGAL DESCRIPTION" in line.upper():
-            legal_idx = i
-            break
-
-    if legal_idx is not None:
-        collected = []
-        for k in range(legal_idx + 1, len(lines)):
-            l = lines[k]
-
-            # Novo bloco em CAPS com dois pontos → parar
-            if re.match(r"^[A-Z0-9 \(\)\/]+:\s*$", l):
-                break
-
-            if l.strip():
-                collected.append(l)
-
-        if collected:
-            legal_description = "\n".join(collected).strip()
-
-    return situs, legal_description
-
-
-# -----------------------------
-# Scraper principal
-# -----------------------------
-async def scrape_with_playwright():
+async def scrape_pdf_raw_text():
     print("🔍 Iniciando Playwright...")
 
     async with async_playwright() as p:
@@ -171,7 +45,7 @@ async def scrape_with_playwright():
         if await printable.count() == 0:
             print("⚠️ 'Printable Version' não encontrado.")
             await browser.close()
-            return []
+            return None
 
         print("🖨️ Clicando em Printable Version...")
         await printable.first.click()
@@ -184,102 +58,56 @@ async def scrape_with_playwright():
 
         if link_count == 0:
             await browser.close()
-            return []
+            return None
 
-        hrefs = await links.evaluate_all("els => els.map(e => e.href)")
+        # Pegar o primeiro link
+        first_link = await links.first.get_attribute("href")
 
-        data = []
+        print(f"➡️ Acessando primeiro Tax Sale: {first_link}")
+        await page.goto(first_link, wait_until="networkidle")
 
-        # 5) Visitar cada página de detalhe
-        for idx, href in enumerate(hrefs):
-            print(f"\n➡️ ({idx+1}/{len(hrefs)}) Acessando detalhe: {href}")
-            await page.goto(href, wait_until="networkidle")
+        # 5) Achar link do PDF "View Property Information"
+        pdf_locator = page.locator("a:has-text('View Property Information')")
+        if await pdf_locator.count() == 0:
+            print("⚠️ Sem 'View Property Information'.")
+            await browser.close()
+            return None
 
-            # Extrair dados básicos
-            def get_text_after(label):
-                return page.locator(f"text={label}").locator("xpath=following-sibling::*[1]")
+        pdf_link = await pdf_locator.first.get_attribute("href")
 
-            async def safe_text(locator):
-                if await locator.count() == 0:
-                    return None
-                return (await locator.first.inner_text()).strip()
+        if not pdf_link.startswith("http"):
+            pdf_link = "https://or.occompt.com/recorder/eagleweb/" + pdf_link.lstrip("/")
 
-            sale_date = await safe_text(get_text_after("Sale Date:"))
-            min_bid = await safe_text(get_text_after("Min Bid:"))
+        print(f"📄 Baixando PDF: {pdf_link}")
+        pdf_bytes = requests.get(pdf_link).content
 
-            # 6) Achar link do PDF "View Property Information"
-            pdf_locator = page.locator("a:has-text('View Property Information')")
-            if await pdf_locator.count() == 0:
-                print("⚠️ Sem 'View Property Information'. Ignorando propriedade.")
-                continue
+        # 6) Ler PDF cru
+        print("📄 Lendo PDF...")
 
-            pdf_link = await pdf_locator.first.get_attribute("href")
-
-            if not pdf_link.startswith("http"):
-                pdf_link = "https://or.occompt.com/recorder/eagleweb/" + pdf_link.lstrip("/")
-
-            print(f"📄 Baixando PDF: {pdf_link}")
-            pdf_bytes = requests.get(pdf_link).content
-
-            situs, legal_description = extract_from_property_info_pdf(pdf_bytes)
-
-            if not situs:
-                print("⚠️ Sem endereço no PDF. Ignorando propriedade.")
-                continue
-
-            # Montar registro final
-            row_data = {
-                "address": situs["address"],
-                "city": situs["city"],
-                "state": situs["state"],
-                "zip": situs["zip"],
-                "county": "Orange",
-                "amount_due": clean_money(min_bid),
-                "sale_type": "tax_deed",
-                "auction_date": parse_date(sale_date),
-                "official_link": href,
-                "notes": legal_description or "",
-            }
-
-            data.append(row_data)
-            print("✅ Propriedade adicionada.")
-
-        print(f"\n🗂️ Total final de propriedades válidas: {len(data)}")
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                pages_text.append(text)
 
         await browser.close()
-        return data
+        return pages_text
 
 
-# -----------------------------
-# Envio para Supabase
-# -----------------------------
-def send_to_supabase(data):
-    if not data:
-        print("⚠️ Nenhuma propriedade para enviar.")
-        return
-
-    print("🚀 Enviando dados para a Edge Function...")
-    resp = requests.post(
-        ENDPOINT,
-        json=data,
-        headers={"Content-Type": "application/json"},
-        timeout=60,
-    )
-
-    print("📨 Resposta da Edge Function:")
-    print(resp.status_code, resp.text)
-
-
-# -----------------------------
-# Execução
-# -----------------------------
 def run():
-    data = asyncio.run(scrape_with_playwright())
-    if not data:
-        print("⚠️ Nenhuma propriedade encontrada.")
+    pages = asyncio.run(scrape_pdf_raw_text())
+
+    if not pages:
+        print("⚠️ Nenhum PDF lido.")
         return
-    send_to_supabase(data)
+
+    print("\n==================== PDF RAW TEXT ====================\n")
+    for i, page in enumerate(pages):
+        print(f"\n----- PAGE {i+1} -----\n")
+        print(page)
+    print("\n==================== FIM DO PDF ======================\n")
 
 
 if __name__ == "__main__":
     run()
+
