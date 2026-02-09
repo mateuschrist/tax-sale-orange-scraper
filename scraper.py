@@ -6,6 +6,9 @@ LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def extract_first_match(pattern, text, flags=re.IGNORECASE):
     m = re.search(pattern, text, flags)
     return m.group(1).strip() if m else None
@@ -21,6 +24,9 @@ def parse_date_us(v):
     return v
 
 
+# -----------------------------
+# PARSER DO HTML PRINCIPAL
+# -----------------------------
 def parse_main_html(text: str):
     data = {}
 
@@ -49,6 +55,9 @@ def parse_main_html(text: str):
     return data
 
 
+# -----------------------------
+# PARSER DO HTML DE PROPERTY INFORMATION
+# -----------------------------
 def parse_property_info_html(text: str):
     data = {}
 
@@ -61,18 +70,27 @@ def parse_property_info_html(text: str):
     owner = None
     legal_description = None
 
-    for l in lines:
-        if re.match(r"^\d+\s+.+", l):
-            address = l
-            break
+    # Endereço: após "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
+    if "ADDRESS ON RECORD ON CURRENT TAX ROLL:" in text.upper():
+        idx = None
+        for i, l in enumerate(lines):
+            if "ADDRESS ON RECORD ON CURRENT TAX ROLL" in l.upper():
+                idx = i
+                break
 
-    for l in lines:
-        m = re.search(r"([A-Za-z\s]+),\s*FL\s*(\d{5})", l)
-        if m:
-            city = m.group(1).strip().upper()
-            zip_code = m.group(2).strip()
-            break
+        if idx is not None:
+            # Próximas linhas contêm endereço
+            for j in range(idx + 1, idx + 6):
+                if j < len(lines):
+                    l = lines[j]
+                    if re.match(r"^\d+\s+.+", l):
+                        address = l
+                    m = re.search(r"([A-Za-z\s]+),\s*FL\s*(\d{5})", l)
+                    if m:
+                        city = m.group(1).strip().upper()
+                        zip_code = m.group(2).strip()
 
+    # Owner
     for l in lines:
         if "OWNER" in l.upper():
             m = re.search(r"Owner[:\-]?\s*(.+)", l, re.IGNORECASE)
@@ -80,6 +98,7 @@ def parse_property_info_html(text: str):
                 owner = m.group(1).strip()
             break
 
+    # Legal Description
     legal_idx = None
     for i, l in enumerate(lines):
         if "LEGAL DESCRIPTION" in l.upper():
@@ -106,6 +125,9 @@ def parse_property_info_html(text: str):
     return data
 
 
+# -----------------------------
+# SCRAPER PRINCIPAL
+# -----------------------------
 async def scrape_properties(limit=3):
     print("🔍 Iniciando Playwright...")
 
@@ -114,69 +136,51 @@ async def scrape_properties(limit=3):
         context = await browser.new_context()
         page = await context.new_page()
 
+        # LOGIN
         print("🌐 Acessando página inicial...")
         await page.goto(LOGIN_URL, wait_until="networkidle")
 
         if await page.locator("input[value='I Acknowledge']").count() > 0:
-            print("🟢 Clicando em 'I Acknowledge'...")
             await page.click("input[value='I Acknowledge']")
             await page.wait_for_load_state("networkidle")
 
         if await page.locator("button:has-text('Tax Deed Sales')").count() > 0:
-            print("🟢 Clicando em 'Tax Deed Sales'...")
             await page.click("button:has-text('Tax Deed Sales')")
             await page.wait_for_load_state("networkidle")
 
-        print("🌐 Acessando página de busca...")
+        # BUSCA
         await page.goto(SEARCH_URL, wait_until="networkidle")
-
-        print("🟢 Selecionando 'Active Sale'...")
         await page.select_option("select[name='DeedStatusID']", value="AS")
-
-        print("🔎 Clicando em Search...")
         await page.click("input[value='Search']")
         await page.wait_for_load_state("networkidle")
 
-        printable = page.locator("text=Printable Version")
-        print("🖨️ Clicando em Printable Version...")
-        await printable.first.click()
+        # PRINTABLE VERSION
+        await page.locator("text=Printable Version").first.click()
         await page.wait_for_load_state("networkidle")
 
         results = []
+        BASE = "https://or.occompt.com/recorder/"
 
         for idx in range(limit):
             print(f"\n================ PROPRIEDADE {idx+1}/{limit} ================")
 
             links = page.locator("#searchResultsTable a:has-text('Tax Sale')")
-            link_count = await links.count()
-            print(f"🔗 Links de Tax Sale na lista: {link_count}")
-
-            if idx >= link_count:
-                print("⚠️ Índice maior que quantidade de links. Parando.")
-                break
-
-            print("➡️ Clicando no link do Tax Sale na lista...")
             await links.nth(idx).click()
             await page.wait_for_load_state("networkidle")
 
+            # HTML PRINCIPAL
             main_text = await page.inner_text("body")
             main_data = parse_main_html(main_text)
 
+            # PEGAR HREF DO PROPERTY INFORMATION
             prop_info_link = page.locator("a:has-text('View Property Information')")
-            if await prop_info_link.count() == 0:
-                print("⚠️ 'View Property Information' não encontrado.")
-                prop_data = {
-                    "address": None,
-                    "city": None,
-                    "state": "FL",
-                    "zip": None,
-                    "owner": None,
-                    "legal_description": None,
-                }
-            else:
-                print("📄 Clicando em 'View Property Information'...")
-                await prop_info_link.first.click()
-                await page.wait_for_load_state("networkidle")
+            href = await prop_info_link.first.get_attribute("href")
+
+            if href:
+                href_full = href if href.startswith("http") else BASE + href.lstrip("./")
+
+                print(f"📄 Indo direto para Property Information: {href_full}")
+                await page.goto(href_full, wait_until="networkidle")
 
                 prop_text = await page.inner_text("body")
 
@@ -185,13 +189,23 @@ async def scrape_properties(limit=3):
                 print("--------------------------------------------------------------\n")
 
                 prop_data = parse_property_info_html(prop_text)
+            else:
+                prop_data = {
+                    "address": None,
+                    "city": None,
+                    "state": "FL",
+                    "zip": None,
+                    "owner": None,
+                    "legal_description": None,
+                }
 
-                print("↩️ Voltando para página do Tax Sale...")
-                await page.go_back(wait_until="networkidle")
-
-            print("↩️ Voltando para lista (Printable Version)...")
+            # VOLTAR PARA TAX SALE
             await page.go_back(wait_until="networkidle")
 
+            # VOLTAR PARA LISTA
+            await page.go_back(wait_until="networkidle")
+
+            # MONTAR OBJETO FINAL
             final = {
                 "parcel_number": main_data.get("parcel_number"),
                 "sale_date": parse_date_us(main_data.get("sale_date_raw")),
@@ -206,7 +220,6 @@ async def scrape_properties(limit=3):
                 "zip": prop_data.get("zip"),
                 "owner": prop_data.get("owner"),
                 "legal_description": prop_data.get("legal_description"),
-                "official_link": None,  # se quiser depois, podemos montar via href
             }
 
             results.append(final)
@@ -215,6 +228,9 @@ async def scrape_properties(limit=3):
         return results
 
 
+# -----------------------------
+# EXECUÇÃO
+# -----------------------------
 def run():
     properties = asyncio.run(scrape_properties(limit=3))
 
