@@ -58,7 +58,6 @@ def parse_main_html(text: str):
 
 # -----------------------------
 # PARSER DO BLOCO DE ADDRESS / OWNER / LEGAL
-# (funciona tanto para HTML quanto para texto do iframe)
 # -----------------------------
 def parse_property_block(text: str):
     data = {}
@@ -133,63 +132,6 @@ def has_address_block(text: str) -> bool:
 
 
 # -----------------------------
-# TENTA LER PROPERTY INFO VIA HTML (2 TENTATIVAS)
-# -----------------------------
-async def try_read_property_html(page):
-    for attempt in range(2):
-        text = await page.inner_text("body")
-        print(f"\n[HTML TRY {attempt+1}] tamanho do texto:", len(text))
-        if has_address_block(text):
-            print("[HTML] Bloco de ADDRESS encontrado.")
-            return parse_property_block(text)
-        print("[HTML] Bloco de ADDRESS NÃO encontrado, tentando novamente...")
-        await page.reload(wait_until="networkidle")
-
-    print("[HTML] Falha após 2 tentativas.")
-    return None
-
-
-# -----------------------------
-# FALLBACK: TENTA LER PROPERTY INFO VIA IFRAME (PDF EMBEDADO)
-# -----------------------------
-async def try_read_property_iframe(page):
-    print("\n[IFRAME] Tentando ler texto do iframe (PDF embedado)...")
-
-    for frame in page.frames:
-        try:
-            # Ignora o frame principal
-            if frame == page.main_frame:
-                continue
-
-            print("[IFRAME] Frame URL:", frame.url)
-            try:
-                text = await frame.inner_text("body")
-            except Exception:
-                continue
-
-            if not text or len(text.strip()) == 0:
-                continue
-
-            print("[IFRAME] Tamanho do texto:", len(text))
-
-            if has_address_block(text):
-                print("[IFRAME] Bloco de ADDRESS encontrado.")
-                return parse_property_block(text)
-        except Exception:
-            continue
-
-    print("[IFRAME] Nenhum frame com bloco de ADDRESS encontrado.")
-    return {
-        "address": None,
-        "city": None,
-        "state": "FL",
-        "zip": None,
-        "owner": None,
-        "legal_description": None,
-    }
-
-
-# -----------------------------
 # SCRAPER PRINCIPAL
 # -----------------------------
 async def scrape_properties(limit=3):
@@ -246,8 +188,55 @@ async def scrape_properties(limit=3):
 
             # 3) Pegar HREF de View Property Information
             prop_info_link = page.locator("a:has-text('View Property Information')")
-            if await prop_info_link.count() == 0:
-                print("⚠️ 'View Property Information' não encontrado.")
+            href = await prop_info_link.first.get_attribute("href")
+
+            if href:
+                href_full = href if href.startswith("http") else BASE + href.lstrip("./")
+                print(f"📄 Indo direto para Property Information: {href_full}")
+                await page.goto(href_full, wait_until="networkidle")
+
+                # AGUARDAR 10 SEGUNDOS
+                print("⏳ Aguardando 10 segundos para carregar Property Information...")
+                await page.wait_for_timeout(10000)
+
+                # PRIMEIRA TENTATIVA: HTML DIRETO
+                html_text = await page.inner_text("body")
+                print("[HTML] Tamanho do texto:", len(html_text))
+
+                if has_address_block(html_text):
+                    print("[HTML] Bloco de ADDRESS encontrado.")
+                    prop_data = parse_property_block(html_text)
+                else:
+                    print("[HTML] Bloco não encontrado. Tentando iframe...")
+
+                    # FALLBACK: IFRAME
+                    prop_data = None
+                    for frame in page.frames:
+                        if frame == page.main_frame:
+                            continue
+                        try:
+                            frame_text = await frame.inner_text("body")
+                            print("[IFRAME] Tamanho do texto:", len(frame_text))
+                            if has_address_block(frame_text):
+                                print("[IFRAME] Bloco de ADDRESS encontrado.")
+                                prop_data = parse_property_block(frame_text)
+                                break
+                        except:
+                            continue
+
+                    if prop_data is None:
+                        print("[IFRAME] Nenhum bloco encontrado. Usando valores vazios.")
+                        prop_data = {
+                            "address": None,
+                            "city": None,
+                            "state": "FL",
+                            "zip": None,
+                            "owner": None,
+                            "legal_description": None,
+                        }
+
+            else:
+                print("⚠️ Link de 'View Property Information' sem href.")
                 prop_data = {
                     "address": None,
                     "city": None,
@@ -256,29 +245,6 @@ async def scrape_properties(limit=3):
                     "owner": None,
                     "legal_description": None,
                 }
-            else:
-                href = await prop_info_link.first.get_attribute("href")
-                if href:
-                    href_full = href if href.startswith("http") else BASE + href.lstrip("./")
-                    print(f"📄 Indo direto para Property Information: {href_full}")
-                    await page.goto(href_full, wait_until="networkidle")
-
-                    # 4) Tentar HTML (2x)
-                    prop_data = await try_read_property_html(page)
-
-                    # 5) Se HTML falhar, fallback para iframe (PDF embedado)
-                    if prop_data is None:
-                        prop_data = await try_read_property_iframe(page)
-                else:
-                    print("⚠️ Link de 'View Property Information' sem href.")
-                    prop_data = {
-                        "address": None,
-                        "city": None,
-                        "state": "FL",
-                        "zip": None,
-                        "owner": None,
-                        "legal_description": None,
-                    }
 
             # 6) Voltar 1x (Tax Sale)
             print("↩️ Voltando para página do Tax Sale...")
