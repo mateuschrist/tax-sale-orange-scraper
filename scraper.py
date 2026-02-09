@@ -147,21 +147,30 @@ async def scrape_properties(limit=3):
         await page.goto(LOGIN_URL, wait_until="networkidle")
 
         if await page.locator("input[value='I Acknowledge']").count() > 0:
+            print("🟢 Clicando em 'I Acknowledge'...")
             await page.click("input[value='I Acknowledge']")
             await page.wait_for_load_state("networkidle")
 
         if await page.locator("button:has-text('Tax Deed Sales')").count() > 0:
+            print("🟢 Clicando em 'Tax Deed Sales'...")
             await page.click("button:has-text('Tax Deed Sales')")
             await page.wait_for_load_state("networkidle")
 
         # BUSCA
+        print("🌐 Acessando página de busca...")
         await page.goto(SEARCH_URL, wait_until="networkidle")
+
+        print("🟢 Selecionando 'Active Sale'...")
         await page.select_option("select[name='DeedStatusID']", value="AS")
+
+        print("🔎 Clicando em Search...")
         await page.click("input[value='Search']")
         await page.wait_for_load_state("networkidle")
 
         # PRINTABLE VERSION
-        await page.locator("text=Printable Version").first.click()
+        printable = page.locator("text=Printable Version")
+        print("🖨️ Clicando em Printable Version...")
+        await printable.first.click()
         await page.wait_for_load_state("networkidle")
 
         results = []
@@ -186,11 +195,29 @@ async def scrape_properties(limit=3):
             main_text = await page.inner_text("body")
             main_data = parse_main_html(main_text)
 
-            # 3) Pegar HREF de View Property Information
-            prop_info_link = page.locator("a:has-text('View Property Information')")
-            href = await prop_info_link.first.get_attribute("href")
+            # 3) Pegar SOMENTE o link correto de View Property Information
+            print("🔍 Buscando link correto de 'View Property Information'...")
 
-            if href:
+            all_links = await page.locator("a:has-text('View Property Information')").all()
+
+            href = None
+            for link in all_links:
+                url = await link.get_attribute("href")
+                if url and "/eagleweb/" in url:
+                    href = url
+                    break
+
+            if not href:
+                print("⚠️ Nenhum link válido encontrado (com /eagleweb/).")
+                prop_data = {
+                    "address": None,
+                    "city": None,
+                    "state": "FL",
+                    "zip": None,
+                    "owner": None,
+                    "legal_description": None,
+                }
+            else:
                 href_full = href if href.startswith("http") else BASE + href.lstrip("./")
                 print(f"📄 Indo direto para Property Information: {href_full}")
                 await page.goto(href_full, wait_until="networkidle")
@@ -234,17 +261,6 @@ async def scrape_properties(limit=3):
                             "owner": None,
                             "legal_description": None,
                         }
-
-            else:
-                print("⚠️ Link de 'View Property Information' sem href.")
-                prop_data = {
-                    "address": None,
-                    "city": None,
-                    "state": "FL",
-                    "zip": None,
-                    "owner": None,
-                    "legal_description": None,
-                }
 
             # 6) Voltar 1x (Tax Sale)
             print("↩️ Voltando para página do Tax Sale...")
