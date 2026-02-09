@@ -1,11 +1,17 @@
 import asyncio
 import re
+import requests
+from io import BytesIO
+import pdfplumber
 from playwright.async_api import async_playwright
 
 LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def extract(pattern, text):
     m = re.search(pattern, text, re.IGNORECASE)
     return m.group(1).strip() if m else None
@@ -17,11 +23,18 @@ def clean_money(v):
     return float(v.replace("$", "").replace(",", "").strip())
 
 
-def has_address_block(text):
-    return "ADDRESS ON RECORD ON CURRENT TAX ROLL" in text.upper()
+def parse_tax_sale(text):
+    return {
+        "parcel_number": extract(r"Parcel Number\s+([0-9\-]+)", text),
+        "sale_date": extract(r"Sale Date\s+([0-9/]+)", text),
+        "opening_bid": clean_money(extract(r"Opening Bid Amount\$?([0-9\.,]+)", text)),
+        "application_number": extract(r"Tax Deed Application Number\s+([0-9\-]+)", text),
+        "deed_status": extract(r"Deed Status\s+([A-Za-z ]+)", text),
+        "homestead": extract(r"Homestead\?\s*([A-Za-z]+)", text),
+    }
 
 
-def parse_property_block(text):
+def parse_property_from_pdf(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     address = None
@@ -57,17 +70,9 @@ def parse_property_block(text):
     }
 
 
-def parse_tax_sale(text):
-    return {
-        "parcel_number": extract(r"Parcel Number\s+([0-9\-]+)", text),
-        "sale_date": extract(r"Sale Date\s+([0-9/]+)", text),
-        "opening_bid": clean_money(extract(r"Opening Bid Amount\$?([0-9\.,]+)", text)),
-        "application_number": extract(r"Tax Deed Application Number\s+([0-9\-]+)", text),
-        "deed_status": extract(r"Deed Status\s+([A-Za-z ]+)", text),
-        "homestead": extract(r"Homestead\?\s*([A-Za-z]+)", text),
-    }
-
-
+# -----------------------------
+# SCRAPER PRINCIPAL
+# -----------------------------
 async def scrape_properties(limit=3):
     print("🔍 Iniciando Playwright...")
 
@@ -123,19 +128,17 @@ async def scrape_properties(limit=3):
             print("⏳ Aguardando redirecionamento...")
             await page.wait_for_load_state("networkidle")
 
-            final_url = page.url
-            print("📌 URL final carregada:", final_url)
+            pdf_url = page.url
+            print("📌 URL final do PDF:", pdf_url)
 
-            print("⏳ Aguardando 10 segundos para carregar PDF...")
-            await page.wait_for_timeout(10000)
+            print("⬇️ Baixando PDF em memória...")
+            pdf_bytes = requests.get(pdf_url).content
 
-            html_text = await page.inner_text("body")
+            print("📄 Extraindo texto do PDF...")
+            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+                full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-            if has_address_block(html_text):
-                prop_data = parse_property_block(html_text)
-            else:
-                print("⚠️ Bloco não encontrado.")
-                prop_data = {"address": None, "city": None, "state": "FL", "zip": None}
+            prop_data = parse_property_from_pdf(full_text)
 
             print("↩️ Voltando para Tax Sale...")
             await page.go_back(wait_until="networkidle")
@@ -161,3 +164,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
