@@ -4,6 +4,7 @@ from playwright.async_api import async_playwright
 
 LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
+BASE = "https://or.occompt.com/recorder/"
 
 
 # -----------------------------
@@ -25,7 +26,7 @@ def parse_date_us(v):
 
 
 # -----------------------------
-# PARSER DO HTML PRINCIPAL
+# PARSER DO HTML PRINCIPAL (TAX SALE)
 # -----------------------------
 def parse_main_html(text: str):
     data = {}
@@ -56,9 +57,10 @@ def parse_main_html(text: str):
 
 
 # -----------------------------
-# PARSER DO HTML DE PROPERTY INFORMATION
+# PARSER DO BLOCO DE ADDRESS / OWNER / LEGAL
+# (funciona tanto para HTML quanto para texto do iframe)
 # -----------------------------
-def parse_property_info_html(text: str):
+def parse_property_block(text: str):
     data = {}
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -70,27 +72,28 @@ def parse_property_info_html(text: str):
     owner = None
     legal_description = None
 
-    # Endereço: após "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
-    if "ADDRESS ON RECORD ON CURRENT TAX ROLL:" in text.upper():
-        idx = None
-        for i, l in enumerate(lines):
-            if "ADDRESS ON RECORD ON CURRENT TAX ROLL" in l.upper():
-                idx = i
+    # 1) ADDRESS ON RECORD ON CURRENT TAX ROLL
+    idx = None
+    for i, l in enumerate(lines):
+        if "ADDRESS ON RECORD ON CURRENT TAX ROLL" in l.upper():
+            idx = i
+            break
+
+    if idx is not None:
+        for j in range(idx + 1, idx + 6):
+            if j >= len(lines):
                 break
+            l = lines[j]
 
-        if idx is not None:
-            # Próximas linhas contêm endereço
-            for j in range(idx + 1, idx + 6):
-                if j < len(lines):
-                    l = lines[j]
-                    if re.match(r"^\d+\s+.+", l):
-                        address = l
-                    m = re.search(r"([A-Za-z\s]+),\s*FL\s*(\d{5})", l)
-                    if m:
-                        city = m.group(1).strip().upper()
-                        zip_code = m.group(2).strip()
+            if re.match(r"^\d+\s+.+", l):
+                address = l
 
-    # Owner
+            m = re.search(r"([A-Za-z\s]+),\s*FL\s*(\d{5})", l)
+            if m:
+                city = m.group(1).strip().upper()
+                zip_code = m.group(2).strip()
+
+    # 2) OWNER
     for l in lines:
         if "OWNER" in l.upper():
             m = re.search(r"Owner[:\-]?\s*(.+)", l, re.IGNORECASE)
@@ -98,7 +101,7 @@ def parse_property_info_html(text: str):
                 owner = m.group(1).strip()
             break
 
-    # Legal Description
+    # 3) LEGAL DESCRIPTION
     legal_idx = None
     for i, l in enumerate(lines):
         if "LEGAL DESCRIPTION" in l.upper():
@@ -123,6 +126,67 @@ def parse_property_info_html(text: str):
     data["legal_description"] = legal_description
 
     return data
+
+
+def has_address_block(text: str) -> bool:
+    return "ADDRESS ON RECORD ON CURRENT TAX ROLL" in text.upper()
+
+
+# -----------------------------
+# TENTA LER PROPERTY INFO VIA HTML (2 TENTATIVAS)
+# -----------------------------
+async def try_read_property_html(page):
+    for attempt in range(2):
+        text = await page.inner_text("body")
+        print(f"\n[HTML TRY {attempt+1}] tamanho do texto:", len(text))
+        if has_address_block(text):
+            print("[HTML] Bloco de ADDRESS encontrado.")
+            return parse_property_block(text)
+        print("[HTML] Bloco de ADDRESS NÃO encontrado, tentando novamente...")
+        await page.reload(wait_until="networkidle")
+
+    print("[HTML] Falha após 2 tentativas.")
+    return None
+
+
+# -----------------------------
+# FALLBACK: TENTA LER PROPERTY INFO VIA IFRAME (PDF EMBEDADO)
+# -----------------------------
+async def try_read_property_iframe(page):
+    print("\n[IFRAME] Tentando ler texto do iframe (PDF embedado)...")
+
+    for frame in page.frames:
+        try:
+            # Ignora o frame principal
+            if frame == page.main_frame:
+                continue
+
+            print("[IFRAME] Frame URL:", frame.url)
+            try:
+                text = await frame.inner_text("body")
+            except Exception:
+                continue
+
+            if not text or len(text.strip()) == 0:
+                continue
+
+            print("[IFRAME] Tamanho do texto:", len(text))
+
+            if has_address_block(text):
+                print("[IFRAME] Bloco de ADDRESS encontrado.")
+                return parse_property_block(text)
+        except Exception:
+            continue
+
+    print("[IFRAME] Nenhum frame com bloco de ADDRESS encontrado.")
+    return {
+        "address": None,
+        "city": None,
+        "state": "FL",
+        "zip": None,
+        "owner": None,
+        "legal_description": None,
+    }
 
 
 # -----------------------------
@@ -159,37 +223,31 @@ async def scrape_properties(limit=3):
         await page.wait_for_load_state("networkidle")
 
         results = []
-        BASE = "https://or.occompt.com/recorder/"
 
         for idx in range(limit):
             print(f"\n================ PROPRIEDADE {idx+1}/{limit} ================")
 
             links = page.locator("#searchResultsTable a:has-text('Tax Sale')")
+            link_count = await links.count()
+            print("🔗 Links na lista:", link_count)
+
+            if idx >= link_count:
+                print("⚠️ Índice maior que quantidade de links. Parando.")
+                break
+
+            # 1) Clicar no lote
+            print("➡️ Clicando no link do Tax Sale...")
             await links.nth(idx).click()
             await page.wait_for_load_state("networkidle")
 
-            # HTML PRINCIPAL
+            # 2) HTML principal (Tax Sale)
             main_text = await page.inner_text("body")
             main_data = parse_main_html(main_text)
 
-            # PEGAR HREF DO PROPERTY INFORMATION
+            # 3) Pegar HREF de View Property Information
             prop_info_link = page.locator("a:has-text('View Property Information')")
-            href = await prop_info_link.first.get_attribute("href")
-
-            if href:
-                href_full = href if href.startswith("http") else BASE + href.lstrip("./")
-
-                print(f"📄 Indo direto para Property Information: {href_full}")
-                await page.goto(href_full, wait_until="networkidle")
-
-                prop_text = await page.inner_text("body")
-
-                print("\n----- DEBUG: PRIMEIRAS LINHAS DA PÁGINA DE PROPERTY INFO -----")
-                print("\n".join(prop_text.splitlines()[:40]))
-                print("--------------------------------------------------------------\n")
-
-                prop_data = parse_property_info_html(prop_text)
-            else:
+            if await prop_info_link.count() == 0:
+                print("⚠️ 'View Property Information' não encontrado.")
                 prop_data = {
                     "address": None,
                     "city": None,
@@ -198,14 +256,39 @@ async def scrape_properties(limit=3):
                     "owner": None,
                     "legal_description": None,
                 }
+            else:
+                href = await prop_info_link.first.get_attribute("href")
+                if href:
+                    href_full = href if href.startswith("http") else BASE + href.lstrip("./")
+                    print(f"📄 Indo direto para Property Information: {href_full}")
+                    await page.goto(href_full, wait_until="networkidle")
 
-            # VOLTAR PARA TAX SALE
+                    # 4) Tentar HTML (2x)
+                    prop_data = await try_read_property_html(page)
+
+                    # 5) Se HTML falhar, fallback para iframe (PDF embedado)
+                    if prop_data is None:
+                        prop_data = await try_read_property_iframe(page)
+                else:
+                    print("⚠️ Link de 'View Property Information' sem href.")
+                    prop_data = {
+                        "address": None,
+                        "city": None,
+                        "state": "FL",
+                        "zip": None,
+                        "owner": None,
+                        "legal_description": None,
+                    }
+
+            # 6) Voltar 1x (Tax Sale)
+            print("↩️ Voltando para página do Tax Sale...")
             await page.go_back(wait_until="networkidle")
 
-            # VOLTAR PARA LISTA
+            # 7) Voltar 1x (lista)
+            print("↩️ Voltando para lista (Printable Version)...")
             await page.go_back(wait_until="networkidle")
 
-            # MONTAR OBJETO FINAL
+            # 8) Montar objeto final
             final = {
                 "parcel_number": main_data.get("parcel_number"),
                 "sale_date": parse_date_us(main_data.get("sale_date_raw")),
