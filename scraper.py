@@ -1,14 +1,11 @@
 import asyncio
-import io
-import pdfplumber
-import requests
 from playwright.async_api import async_playwright
 
 LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
-async def scrape_pdf_raw_text():
+async def scrape_html_text():
     print("🔍 Iniciando Playwright...")
 
     async with async_playwright() as p:
@@ -65,7 +62,6 @@ async def scrape_pdf_raw_text():
 
         # Normalizar URL
         BASE = "https://or.occompt.com/recorder/"
-
         if first_link.startswith("http"):
             full_link = first_link
         else:
@@ -75,47 +71,25 @@ async def scrape_pdf_raw_text():
         print(f"➡️ Acessando primeiro Tax Sale: {full_link}")
         await page.goto(full_link, wait_until="networkidle")
 
-        # 5) Achar link do PDF "View Property Information"
-        pdf_locator = page.locator("a:has-text('View Property Information')")
-        if await pdf_locator.count() == 0:
-            print("⚠️ Sem 'View Property Information'.")
-            await browser.close()
-            return None
+        # 5) Extrair TODO o texto visível da página
+        print("📄 Extraindo texto da página HTML...")
 
-        pdf_link = await pdf_locator.first.get_attribute("href")
-
-        # Normalizar PDF link
-        if not pdf_link.startswith("http"):
-            pdf_link = "https://or.occompt.com/recorder/eagleweb/" + pdf_link.lstrip("/")
-
-        print(f"📄 Baixando PDF: {pdf_link}")
-        pdf_bytes = requests.get(pdf_link).content
-
-        # 6) Ler PDF cru
-        print("📄 Lendo PDF...")
-
-        pages_text = []
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                pages_text.append(text)
+        html_text = await page.inner_text("body")
 
         await browser.close()
-        return pages_text
+        return html_text
 
 
 def run():
-    pages = asyncio.run(scrape_pdf_raw_text())
+    text = asyncio.run(scrape_html_text())
 
-    if not pages:
-        print("⚠️ Nenhum PDF lido.")
+    if not text:
+        print("⚠️ Nenhum texto encontrado.")
         return
 
-    print("\n==================== PDF RAW TEXT ====================\n")
-    for i, page in enumerate(pages):
-        print(f"\n----- PAGE {i+1} -----\n")
-        print(page)
-    print("\n==================== FIM DO PDF ======================\n")
+    print("\n==================== HTML RAW TEXT ====================\n")
+    print(text)
+    print("\n==================== FIM ======================\n")
 
 
 if __name__ == "__main__":
