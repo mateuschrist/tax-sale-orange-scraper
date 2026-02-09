@@ -4,12 +4,8 @@ from playwright.async_api import async_playwright
 
 LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
-BASE = "https://or.occompt.com/recorder/"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def extract(pattern, text):
     m = re.search(pattern, text, re.IGNORECASE)
     return m.group(1).strip() if m else None
@@ -72,9 +68,6 @@ def parse_tax_sale(text):
     }
 
 
-# -----------------------------
-# SCRAPER PRINCIPAL
-# -----------------------------
 async def scrape_properties(limit=3):
     print("🔍 Iniciando Playwright...")
 
@@ -83,7 +76,6 @@ async def scrape_properties(limit=3):
         context = await browser.new_context()
         page = await context.new_page()
 
-        # LOGIN
         print("🌐 Acessando página inicial...")
         await page.goto(LOGIN_URL, wait_until="networkidle")
 
@@ -96,7 +88,6 @@ async def scrape_properties(limit=3):
         await page.click("button:has-text('Tax Deed Sales')")
         await page.wait_for_load_state("networkidle")
 
-        # BUSCA
         print("🌐 Acessando página de busca...")
         await page.goto(SEARCH_URL, wait_until="networkidle")
 
@@ -107,7 +98,6 @@ async def scrape_properties(limit=3):
         await page.click("input[value='Search']")
         await page.wait_for_load_state("networkidle")
 
-        # PRINTABLE VERSION
         print("🖨️ Clicando em Printable Version...")
         await page.locator("text=Printable Version").first.click()
         await page.wait_for_load_state("networkidle")
@@ -124,48 +114,36 @@ async def scrape_properties(limit=3):
             await links.nth(idx).click()
             await page.wait_for_load_state("networkidle")
 
-            # Ler dados do lote
             tax_text = await page.inner_text("body")
             tax_data = parse_tax_sale(tax_text)
 
-            # PEGAR LINK CORRETO
-            print("➡️ Clicando no link 'View Property Information'")
-            all_links = await page.locator("a:has-text('View Property Information')").all()
+            print("➡️ Clicando no link 'View Property Information'...")
+            await page.locator("a:has-text('View Property Information')").first.click()
 
-            href = None
-            for link in all_links:
-                url = await link.get_attribute("href")
-                if url and "/eagleweb/" in url:
-                    href = url
-                    break
+            print("⏳ Aguardando redirecionamento...")
+            await page.wait_for_load_state("networkidle")
 
-            if not href:
-                print("⚠️ Nenhum link válido encontrado.")
-                prop_data = {"address": None, "city": None, "state": "FL", "zip": None}
+            final_url = page.url
+            print("📌 URL final carregada:", final_url)
+
+            print("⏳ Aguardando 10 segundos para carregar PDF...")
+            await page.wait_for_timeout(10000)
+
+            html_text = await page.inner_text("body")
+
+            if has_address_block(html_text):
+                prop_data = parse_property_block(html_text)
             else:
-                href_full = href if href.startswith("http") else BASE + href.lstrip("./")
-                await page.goto(href_full, wait_until="networkidle")
+                print("⚠️ Bloco não encontrado.")
+                prop_data = {"address": None, "city": None, "state": "FL", "zip": None}
 
-                print("⏳ Aguardando 10 segundos...")
-                await page.wait_for_timeout(10000)
-
-                html_text = await page.inner_text("body")
-
-                if has_address_block(html_text):
-                    prop_data = parse_property_block(html_text)
-                else:
-                    print("⚠️ Bloco não encontrado.")
-                    prop_data = {"address": None, "city": None, "state": "FL", "zip": None}
-
-            # VOLTAR
             print("↩️ Voltando para Tax Sale...")
             await page.go_back(wait_until="networkidle")
 
             print("↩️ Voltando para Printable Version...")
             await page.go_back(wait_until="networkidle")
 
-            final = {**tax_data, **prop_data}
-            results.append(final)
+            results.append({**tax_data, **prop_data})
 
         await browser.close()
         return results
