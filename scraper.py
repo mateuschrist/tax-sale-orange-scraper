@@ -63,8 +63,17 @@ async def scrape_pdf_raw_text():
         # Pegar o primeiro link
         first_link = await links.first.get_attribute("href")
 
-        print(f"➡️ Acessando primeiro Tax Sale: {first_link}")
-        await page.goto(first_link, wait_until="networkidle")
+        # Normalizar URL
+        BASE = "https://or.occompt.com/recorder/"
+
+        if first_link.startswith("http"):
+            full_link = first_link
+        else:
+            cleaned = first_link.lstrip("./")
+            full_link = BASE + cleaned
+
+        print(f"➡️ Acessando primeiro Tax Sale: {full_link}")
+        await page.goto(full_link, wait_until="networkidle")
 
         # 5) Achar link do PDF "View Property Information"
         pdf_locator = page.locator("a:has-text('View Property Information')")
@@ -75,6 +84,7 @@ async def scrape_pdf_raw_text():
 
         pdf_link = await pdf_locator.first.get_attribute("href")
 
+        # Normalizar PDF link
         if not pdf_link.startswith("http"):
             pdf_link = "https://or.occompt.com/recorder/eagleweb/" + pdf_link.lstrip("/")
 
@@ -110,4 +120,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
