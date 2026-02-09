@@ -6,52 +6,32 @@ LOGIN_URL = "https://or.occompt.com/recorder/web/login.jsp"
 SEARCH_URL = "https://or.occompt.com/recorder/tdsmweb/applicationSearch.jsp"
 
 
-# -----------------------------
-# Helpers de parsing (texto)
-# -----------------------------
 def extract_first_match(pattern, text, flags=re.IGNORECASE):
     m = re.search(pattern, text, flags)
     return m.group(1).strip() if m else None
 
 
 def parse_main_html(text: str):
-    """
-    Parser do HTML principal (Tax Sale).
-    Trabalha em cima do texto cru (inner_text("body")).
-    """
     data = {}
 
-    # Tax Deed Application Number
     data["application_number"] = extract_first_match(
         r"Tax Deed Application Number\s+([0-9\-]+)", text
     )
-
-    # Deed Status
     data["deed_status"] = extract_first_match(
         r"Deed Status\s+([A-Za-z ]+)", text
     )
-
-    # Parcel Number
     data["parcel_number"] = extract_first_match(
         r"Parcel Number\s+([0-9\-]+)", text
     )
-
-    # Sale Date
     data["sale_date_raw"] = extract_first_match(
         r"Sale Date\s+([0-9/]+)", text
     )
-
-    # Opening Bid Amount
     data["opening_bid_raw"] = extract_first_match(
         r"Opening Bid Amount\$?([0-9\.,]+)", text
     )
-
-    # Homestead? (pode ser "Homestead?" seguido de algo)
     data["homestead"] = extract_first_match(
         r"Homestead\?\s*([A-Za-z]+)", text
     )
-
-    # Property Appraised Value
     data["appraised_value_raw"] = extract_first_match(
         r"Property Appraised Value\$?([0-9\.,]+)", text
     )
@@ -62,19 +42,17 @@ def parse_main_html(text: str):
 def parse_property_info_html(text: str):
     """
     Parser da página 'View Property Information'.
-    Aqui vamos buscar:
-    - Address
-    - City, State, ZIP
-    - Owner
-    - Legal Description
-    etc.
-    Como ainda não vimos o HTML, vamos fazer um parser bem genérico.
-    Depois refinamos com base no output real.
+
+    ATENÇÃO: por enquanto vamos ser bem conservadores.
+    O objetivo aqui é:
+    - garantir que estamos lendo a PÁGINA CERTA
+    - ver o conteúdo real no log
+    - só depois refinar regex de endereço/cidade/owner
+
+    Então vou deixar heurísticas simples + você vai ver o texto bruto no log.
     """
     data = {}
 
-    # Tentativa genérica de pegar endereço (linha com número + rua)
-    # Ex: "123 MAIN ST"
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     address = None
@@ -84,13 +62,13 @@ def parse_property_info_html(text: str):
     owner = None
     legal_description = None
 
-    # Heurística para endereço: primeira linha com "^\d+ "
+    # Heurística inicial de endereço: primeira linha com número + rua
     for l in lines:
         if re.match(r"^\d+\s+.+", l):
             address = l
             break
 
-    # Heurística para cidade/estado/zip: linha com ", FL 328xx"
+    # Cidade/ZIP: linha com ", FL 328xx"
     for l in lines:
         m = re.search(r"([A-Za-z\s]+),\s*FL\s*(\d{5})", l)
         if m:
@@ -98,10 +76,9 @@ def parse_property_info_html(text: str):
             zip_code = m.group(2).strip()
             break
 
-    # Owner: linha que contenha "Owner" seguido de nome (bem genérico)
+    # Owner: linha com "Owner"
     for l in lines:
         if "OWNER" in l.upper():
-            # Ex: "Owner: JOHN DOE"
             m = re.search(r"Owner[:\-]?\s*(.+)", l, re.IGNORECASE)
             if m:
                 owner = m.group(1).strip()
@@ -118,7 +95,6 @@ def parse_property_info_html(text: str):
         collected = []
         for k in range(legal_idx + 1, len(lines)):
             l = lines[k]
-            # Se aparecer um novo título em CAPS com dois pontos, paramos
             if re.match(r"^[A-Z0-9 \(\)\/]+:\s*$", l):
                 break
             collected.append(l)
@@ -142,21 +118,17 @@ def clean_money(v):
 
 
 def parse_date_us(v):
-    # Mantemos como string dd/mm/aaaa por enquanto, ou adaptamos depois
     return v
 
 
-# -----------------------------
-# Scraper principal
-# -----------------------------
 async def scrape_properties(limit=3):
     print("🔍 Iniciando Playwright...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context()
+        page = await context.new_page()
 
-        # 1) Login / aceite
         print("🌐 Acessando página inicial...")
         await page.goto(LOGIN_URL, wait_until="networkidle")
 
@@ -170,7 +142,6 @@ async def scrape_properties(limit=3):
             await page.click("button:has-text('Tax Deed Sales')")
             await page.wait_for_load_state("networkidle")
 
-        # 2) Página de busca
         print("🌐 Acessando página de busca...")
         await page.goto(SEARCH_URL, wait_until="networkidle")
 
@@ -181,7 +152,6 @@ async def scrape_properties(limit=3):
         await page.click("input[value='Search']")
         await page.wait_for_load_state("networkidle")
 
-        # 3) Printable Version
         printable = page.locator("text=Printable Version")
         if await printable.count() == 0:
             print("⚠️ 'Printable Version' não encontrado.")
@@ -192,7 +162,6 @@ async def scrape_properties(limit=3):
         await printable.first.click()
         await page.wait_for_load_state("networkidle")
 
-        # 4) Capturar links de Tax Sale
         links = page.locator("#searchResultsTable a:has-text('Tax Sale')")
         link_count = await links.count()
         print(f"🔗 Links de Tax Sale encontrados: {link_count}")
@@ -201,9 +170,7 @@ async def scrape_properties(limit=3):
             await browser.close()
             return []
 
-        # Limitar ao número pedido
         count = min(limit, link_count)
-
         BASE = "https://or.occompt.com/recorder/"
         results = []
 
@@ -222,27 +189,32 @@ async def scrape_properties(limit=3):
             print(f"➡️ Acessando Tax Sale: {full_link}")
             await page.goto(full_link, wait_until="networkidle")
 
-            # 4.1) HTML principal
             main_text = await page.inner_text("body")
             main_data = parse_main_html(main_text)
 
-            # 4.2) Abrir "View Property Information"
             prop_info_link = page.locator("a:has-text('View Property Information')")
             if await prop_info_link.count() == 0:
                 print("⚠️ 'View Property Information' não encontrado.")
                 prop_data = {}
             else:
-                print("📄 Acessando 'View Property Information'...")
-                await prop_info_link.first.click()
-                await page.wait_for_load_state("networkidle")
+                print("📄 Abrindo 'View Property Information' em nova aba...")
 
-                prop_text = await page.inner_text("body")
+                async with context.expect_page() as new_page_info:
+                    await prop_info_link.first.click()
+
+                prop_page = await new_page_info.value
+                await prop_page.wait_for_load_state("networkidle")
+
+                prop_text = await prop_page.inner_text("body")
+
+                print("\n----- DEBUG: TRECHO DA PÁGINA 'PROPERTY INFORMATION' -----")
+                print("\n".join(prop_text.splitlines()[:40]))
+                print("----------------------------------------------------------\n")
+
                 prop_data = parse_property_info_html(prop_text)
 
-                # Voltar para a página do Tax Sale (caso precise)
-                await page.go_back(wait_until="networkidle")
+                await prop_page.close()
 
-            # 4.3) Montar dicionário final
             final = {
                 "parcel_number": main_data.get("parcel_number"),
                 "sale_date": parse_date_us(main_data.get("sale_date_raw")),
