@@ -4,4 +4,3 @@ requests==2.32.3
 pypdfium2==4.30.0
 pytesseract==0.3.10
 pillow==10.2.0
-pypdfium2==4.30.0
