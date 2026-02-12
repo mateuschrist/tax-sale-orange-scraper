@@ -4,7 +4,7 @@ import json
 import time
 import logging
 from io import BytesIO
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import pdfplumber
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -21,7 +21,7 @@ MAX_WAIT = 60_000
 ADDRESS_MARKER = "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("taxdeed-single-tab")
+log = logging.getLogger("taxdeed-gh-fixed")
 
 
 def wait_network(page, timeout=20_000):
@@ -31,17 +31,12 @@ def wait_network(page, timeout=20_000):
         pass
 
 
-def click(page, selector: str, label: str):
-    page.wait_for_selector(selector, timeout=MAX_WAIT)
-    page.click(selector)
-    log.info("Clicked: %s (%s)", label, selector)
-
-
 def click_any(page, selectors: list[str], label: str) -> bool:
     for sel in selectors:
         try:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                loc.first.click()
                 log.info("Clicked: %s (%s)", label, sel)
                 return True
         except Exception:
@@ -49,62 +44,147 @@ def click_any(page, selectors: list[str], label: str) -> bool:
     return False
 
 
-def extract_lot_fields_from_html(html: str) -> dict:
-    def rgx(pattern):
-        m = re.search(pattern, html, re.I | re.S)
-        return m.group(1).strip() if m else None
-
-    return {
-        "parcel_number": rgx(r"Parcel\s*Number.*?</[^>]+>\s*<[^>]+>\s*([^<]+)"),
-        "sale_date": rgx(r"Sale\s*Date.*?</[^>]+>\s*<[^>]+>\s*([^<]+)"),
-        "opening_bid": rgx(r"Opening\s*Bid.*?</[^>]+>\s*<[^>]+>\s*\$?\s*([^<]+)"),
-        "application_number": rgx(r"Application\s*Number.*?</[^>]+>\s*<[^>]+>\s*([^<]+)"),
-        "deed_status": rgx(r"Deed\s*Status.*?</[^>]+>\s*<[^>]+>\s*([^<]+)"),
-        "homestead": rgx(r"Homestead.*?</[^>]+>\s*<[^>]+>\s*([^<]+)"),
-    }
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
+def pdf_text_with_fallback(pdf_bytes: bytes) -> str:
+    """Try extract_text; if empty, rebuild from extract_words."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
+        parts = []
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            txt = txt.strip()
+            if txt:
+                parts.append(txt)
+                continue
 
-    if ADDRESS_MARKER not in text:
-        return {"marker_found": False, "address": None, "city": None, "state": None, "zip": None, "snippet": text[:800]}
+            # fallback words
+            words = page.extract_words() or []
+            if words:
+                line = " ".join([w.get("text", "") for w in words if w.get("text")])
+                line = line.strip()
+                if line:
+                    parts.append(line)
 
-    after = text.split(ADDRESS_MARKER, 1)[1].strip()
-    snippet = after[:700]
+        return "\n".join(parts).strip()
+
+
+def parse_address_from_pdf(pdf_bytes: bytes) -> dict:
+    text = pdf_text_with_fallback(pdf_bytes)
+    if not text:
+        return {"marker_found": False, "address": None, "city": None, "state": None, "zip": None, "snippet": ""}
+
+    # marcador tolerante (ignora múltiplos espaços / quebras)
+    marker_re = re.compile(r"ADDRESS\s+ON\s+RECORD\s+ON\s+CURRENT\s+TAX\s+ROLL\s*:", re.I)
+    m = marker_re.search(text)
+    if not m:
+        return {"marker_found": False, "address": None, "city": None, "state": None, "zip": None, "snippet": text[:900]}
+
+    after = text[m.end():].strip()
+    snippet = after[:800]
     lines = [ln.strip() for ln in snippet.splitlines() if ln.strip()]
 
     street = lines[0] if lines else None
     line2 = lines[1] if len(lines) > 1 else ""
 
-    m = re.search(r"^(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$",
-                  line2.upper().strip())
-    if m:
+    line2u = normalize_ws(line2).upper()
+    m2 = re.search(r"^(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$", line2u)
+    if m2:
         return {
             "marker_found": True,
             "address": street,
-            "city": m.group("city").title().strip(),
-            "state": m.group("state"),
-            "zip": m.group("zip"),
+            "city": m2.group("city").title().strip(),
+            "state": m2.group("state"),
+            "zip": m2.group("zip"),
             "snippet": snippet[:400]
         }
 
-    joined = " | ".join(lines[:5]).upper()
-    m2 = re.search(r"(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)", joined)
+    joined = normalize_ws(" ".join(lines[:5])).upper()
+    m3 = re.search(r"(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)", joined)
     return {
         "marker_found": True,
         "address": street,
-        "city": m2.group("city").title().strip() if m2 else None,
-        "state": m2.group("state") if m2 else None,
-        "zip": m2.group("zip") if m2 else None,
+        "city": m3.group("city").title().strip() if m3 else None,
+        "state": m3.group("state") if m3 else None,
+        "zip": m3.group("zip") if m3 else None,
         "snippet": snippet[:400]
     }
 
 
-def must_be_pdf_headers(headers: dict) -> bool:
+def must_be_pdf(headers: dict) -> bool:
     ct = (headers.get("content-type") or "").lower()
     return "application/pdf" in ct or ct.endswith("/pdf")
+
+
+def extract_rows_from_printable(page) -> list[dict]:
+    """
+    Extrai os dados diretamente da tabela printable.
+    Como não temos o HTML aqui, fazemos um método robusto:
+    - pegar todos os links Tax Sale e capturar a linha (tr) mais próxima
+    - extrair o texto das células da linha como fallback
+    """
+    rows = []
+    links = page.locator("a:has-text('Tax Sale')")
+    total = links.count()
+    log.info("Tax Sale links found: %d", total)
+
+    for i in range(total):
+        a = links.nth(i)
+        href = a.get_attribute("href")
+        if not href:
+            continue
+
+        # pega o texto do TR (linha) pra tentar extrair campos
+        # (subimos para o TR mais próximo)
+        try:
+            tr_text = a.locator("xpath=ancestor::tr[1]").inner_text(timeout=2000)
+        except Exception:
+            tr_text = ""
+
+        tr_text_clean = normalize_ws(tr_text)
+
+        # tenta pegar “node=DOC...” do href
+        full = urljoin(page.url, href)
+        q = parse_qs(urlparse(full).query)
+        node = (q.get("node") or [None])[0]
+
+        rows.append({
+            "node": node,
+            "tax_sale_url": full,
+            "row_text": tr_text_clean
+        })
+
+    return rows
+
+
+def parse_fields_from_row_text(row_text: str) -> dict:
+    """
+    Parser “best-effort” baseado no texto completo da linha.
+    Você pode refinar depois com colunas reais.
+    """
+    txt = row_text
+
+    def pick(pattern):
+        m = re.search(pattern, txt, re.I)
+        return m.group(1).strip() if m else None
+
+    # esses padrões podem precisar ajuste conforme o formato da tabela
+    parcel = pick(r"Parcel\s*Number[:\s]*([0-9A-Z\-]+)")
+    sale_date = pick(r"Sale\s*Date[:\s]*([0-9/]+)")
+    opening_bid = pick(r"Opening\s*Bid[:\s]*\$?([0-9,]+\.\d{2}|[0-9,]+)")
+    application = pick(r"Application\s*Number[:\s]*([0-9A-Z\-]+)")
+    deed_status = pick(r"Deed\s*Status[:\s]*([A-Za-z ]+)")
+    homestead = pick(r"Homestead[:\s]*(Yes|No|Y|N)")
+
+    return {
+        "parcel_number": parcel or "",
+        "sale_date": sale_date or "",
+        "opening_bid": opening_bid or "",
+        "application_number": application or "",
+        "deed_status": deed_status or "",
+        "homestead": homestead or "",
+    }
 
 
 def run():
@@ -113,126 +193,78 @@ def run():
         context = browser.new_context()
         page = context.new_page()
 
-        # 1) Login/Disclaimer
+        # Login / disclaimer
         log.info("OPEN: %s", LOGIN_URL)
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
 
-        ack_ok = click_any(page, [
+        click_any(page, [
             "text=I Acknowledge",
             "button:has-text('I Acknowledge')",
             "a:has-text('I Acknowledge')",
             "input[value='I Acknowledge']",
         ], "I Acknowledge")
-
-        if not ack_ok:
-            log.warning("Não achei 'I Acknowledge' automaticamente.")
         wait_network(page)
 
-        # 2) Search page
+        # Search
         log.info("OPEN SEARCH: %s", SEARCH_URL)
         page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
         wait_network(page)
 
-        # Set DeedStatusID = AS
-        set_ok = False
-        for sel in ["select[name='DeedStatusID']", "select#DeedStatusID"]:
-            try:
-                if page.locator(sel).count() > 0:
-                    page.select_option(sel, value="AS")
-                    set_ok = True
-                    log.info("Set DeedStatusID=AS using %s", sel)
-                    break
-            except Exception:
-                pass
-        if not set_ok:
-            log.warning("Não consegui setar DeedStatusID=AS (ajustar seletor).")
+        # DeedStatusID=AS
+        if page.locator("select[name='DeedStatusID']").count() > 0:
+            page.select_option("select[name='DeedStatusID']", value="AS")
+            log.info("Set DeedStatusID=AS")
 
-        # Click Search (same tab navigation)
-        before = page.url
-        log.info("Before Search URL: %s", before)
         click_any(page, [
             "input[type='submit'][value='Search']",
             "button:has-text('Search')",
             "text=Search"
         ], "Search")
-
-        # Esperar navegar / carregar resultados
         page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
         wait_network(page, 30_000)
         log.info("After Search URL: %s", page.url)
 
-        # Click Printable Version (same tab navigation)
-        before_print = page.url
-        log.info("Before Printable URL: %s", before_print)
-
-        ok = click_any(page, [
+        # Printable
+        click_any(page, [
             "text=Printable Version",
             "a:has-text('Printable Version')",
             "button:has-text('Printable Version')"
         ], "Printable Version")
-
-        if not ok:
-            log.error("Não achei Printable Version.")
-            browser.close()
-            return
-
-        # Esperar a navegação terminar
         page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
         wait_network(page, 30_000)
         log.info("After Printable URL: %s", page.url)
 
         if DEBUG_HTML:
-            log.info("Printable HTML length: %d", len(page.content()))
+            html_len = len(page.content())
+            log.info("Printable HTML length: %d", html_len)
 
-        # 3) Links Tax Sale
-        tax_links = page.locator("a:has-text('Tax Sale')")
-        total = tax_links.count()
-        log.info("Tax Sale links found: %d", total)
-
-        if total == 0:
-            log.error("Nenhum 'Tax Sale' encontrado. (texto pode ser diferente na página printable)")
+        # ✅ Capturar TODOS os lotes (href + texto da linha) antes de navegar
+        all_rows = extract_rows_from_printable(page)
+        if not all_rows:
+            log.error("Nenhuma linha/lot encontrada na printable.")
             browser.close()
             return
 
-        n = min(total, MAX_LOTS)
+        # Pegue os primeiros MAX_LOTS que tenham node
+        selected = [r for r in all_rows if r.get("node")][:MAX_LOTS]
+        log.info("Selected lots: %s", [r["node"] for r in selected])
 
-        for i in range(n):
-            log.info("----- LOT %d/%d -----", i + 1, n)
+        for idx, lot in enumerate(selected, start=1):
+            node = lot["node"]
+            tax_sale_url = lot["tax_sale_url"]
+            row_text = lot["row_text"]
 
-            # Em single-tab: precisamos capturar o href e navegar
-            href = tax_links.nth(i).get_attribute("href")
-            if not href:
-                log.error("Link Tax Sale sem href no índice %d", i)
-                continue
+            fields = parse_fields_from_row_text(note:=row_text)
+            log.info("----- LOT %d/%d node=%s -----", idx, len(selected), node)
+            log.info("Row text: %s", note[:200])
 
-            lot_url = urljoin(page.url, href)
-            log.info("OPEN LOT: %s", lot_url)
-
-            page.goto(lot_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-            wait_network(page)
-
-            lot_html = page.content()
-            lot_data = extract_lot_fields_from_html(lot_html)
-            log.info("Lot extracted fields: %s", lot_data)
-
-            # 4) View Property Information (viewer)
-            vpi = page.locator("a:has-text('View Property Information'), button:has-text('View Property Information')")
-            if vpi.count() == 0:
-                log.error("Não achei 'View Property Information' no lote %d", i + 1)
-                # voltar pro printable e continuar
-                page.go_back()
-                page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page)
-                continue
-
-            # clicar e esperar carregar viewer na mesma aba
-            vpi.first.click()
-            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            # Abre viewer (Tax Sale url é viewDoc.jsp?node=...)
+            page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
             wait_network(page)
             viewer_url = page.url
             log.info("Viewer URL: %s", viewer_url)
 
-            # 5) Capturar href do PDF dentro do viewer
+            # Link do PDF dentro do viewer
             pdf_a = page.locator("a[href*='Property_Information.pdf']")
             href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
@@ -242,49 +274,41 @@ def run():
                 href_pdf = m.group(1) if m else None
 
             if not href_pdf:
-                log.error("Não encontrei link do PDF no viewer.")
-                # voltar para printable: 2 backs (viewer -> lot -> printable)
+                log.error("PDF link não encontrado no viewer.")
+                # volta printable e segue
                 page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page)
                 continue
 
             pdf_url = urljoin(viewer_url, href_pdf)
             log.info("PDF URL: %s", pdf_url)
 
-            # 6) Baixar PDF via mesma sessão
             pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
             log.info("PDF HTTP status: %s", pdf_resp.status)
 
             if not pdf_resp.ok:
                 preview = (pdf_resp.text() or "")[:600]
-                log.error("PDF download failed. Preview:\n%s", preview)
-                # voltar para printable
+                log.error("PDF download failed preview:\n%s", preview)
                 page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page)
                 continue
 
-            if not must_be_pdf_headers(pdf_resp.headers):
+            if not must_be_pdf(pdf_resp.headers):
                 preview = (pdf_resp.text() or "")[:800]
-                log.error("PDF response not application/pdf. Preview:\n%s", preview)
-                # voltar para printable
+                log.error("Not a PDF response preview:\n%s", preview)
                 page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page)
                 continue
 
-            addr = parse_address_from_pdf_bytes(pdf_resp.body())
+            addr = parse_address_from_pdf(pdf_resp.body())
 
             payload = {
                 "county": "Orange",
                 "state": "FL",
-                "parcel_number": lot_data.get("parcel_number"),
-                "sale_date": lot_data.get("sale_date"),
-                "opening_bid": lot_data.get("opening_bid"),
-                "application_number": lot_data.get("application_number"),
-                "deed_status": lot_data.get("deed_status"),
-                "homestead": lot_data.get("homestead"),
+                "node": node,
+                "parcel_number": fields.get("parcel_number", ""),
+                "sale_date": fields.get("sale_date", ""),
+                "opening_bid": fields.get("opening_bid", ""),
+                "application_number": fields.get("application_number", ""),
+                "deed_status": fields.get("deed_status", ""),
+                "homestead": fields.get("homestead", ""),
                 "pdf_url": pdf_url,
                 "address": addr.get("address"),
                 "city": addr.get("city"),
@@ -293,21 +317,18 @@ def run():
             }
 
             print("\n" + "=" * 100)
-            print(f"RESULT LOT {i+1}")
+            print(f"RESULT LOT {idx}")
             print("=" * 100)
             print(json.dumps(payload, indent=2))
 
             if not addr.get("marker_found"):
                 log.warning("Marker not found. Snippet:\n%s", addr.get("snippet"))
 
-            # 7) Voltar para printable (viewer -> lot -> printable)
-            page.go_back()
-            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-            page.go_back()
-            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-            wait_network(page)
-
-            # pequeno delay para evitar rate-limit
+            # Volta para printable (usamos goto para ser estável)
+            # porque go_back depende do histórico do browser
+            page.goto(f"{BASE_URL}/recorder/tdsmweb/applicationSearchResults.jsp?searchId=0&printing=true",
+                      wait_until="domcontentloaded", timeout=MAX_WAIT)
+            wait_network(page, 30_000)
             time.sleep(1.0)
 
         log.info("DONE.")
