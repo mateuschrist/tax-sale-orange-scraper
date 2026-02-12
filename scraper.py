@@ -9,8 +9,6 @@ from urllib.parse import urljoin, urlparse, parse_qs
 import pdfplumber
 import pytesseract
 import pypdfium2
-from PIL import Image
-
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
@@ -64,6 +62,8 @@ def must_be_pdf(headers: dict) -> bool:
 
 # =========================
 # TABLE PARSE (Printable row text)
+# Example row text:
+# "Tax Sale 2023-17830 Sale Date: 03/12/2026 Applicant Name: ... Status: Active Sale Parcel: ... Min Bid: $3,432.29 ..."
 # =========================
 def parse_fields_from_row_text(row_text: str) -> dict:
     txt = row_text
@@ -123,6 +123,7 @@ def extract_lots_from_printable(page) -> list[dict]:
 # PDF TEXT (fallback) + OCR
 # =========================
 def try_pdfplumber_text(pdf_bytes: bytes) -> str:
+    """Fallback: if a PDF ever comes with real embedded text."""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             parts = []
@@ -137,53 +138,38 @@ def try_pdfplumber_text(pdf_bytes: bytes) -> str:
 
 def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> str:
     """
-    OCR das 3 primeiras páginas (0,1,2) por padrão.
-    Alguns lotes têm o endereço físico na 3ª página.
+    OCR das primeiras N páginas usando pypdfium2.page.render() (compatível).
+    Alguns lotes têm o endereço do tax roll na página 2 ou 3.
     """
     pdf = pypdfium2.PdfDocument(pdf_bytes)
     n_pages = len(pdf)
     pages_to_do = min(n_pages, max_pages)
-    page_indices = list(range(pages_to_do))  # [0,1,2]
-
-    images = pdf.render_to(
-        pypdfium2.BitmapConv.pil_image,
-        page_indices=page_indices,
-        scale=scale
-    )
 
     full_text = []
-    for img in images:
-        txt = pytesseract.image_to_string(img)
+    for i in range(pages_to_do):
+        page = pdf[i]
+        bitmap = page.render(scale=scale)
+        img = bitmap.to_pil()
+        txt = pytesseract.image_to_string(img, config="--psm 6")
         if txt:
             full_text.append(txt)
 
     return "\n".join(full_text).strip()
 
 
-def _find_city_state_zip(block: str):
-    """
-    Retorna (city, state, zip) do primeiro match.
-    """
-    m = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", block, re.I)
-    if not m:
-        return None, None, None, None
-    return m.group(0), m.group(1).title().strip(), m.group(2).upper(), m.group(3)
-
-
 def _extract_street_before_city(block: str, city_match_start: int) -> str | None:
     before = block[:city_match_start]
     lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
-    # geralmente a linha imediatamente anterior ao "Orlando, FL 328xx"
     return lines[-1] if lines else None
 
 
 def parse_best_address_from_text(text: str) -> dict:
     """
-    Busca o melhor endereço na ordem:
-    1) ADDRESS ON RECORD ON CURRENT TAX ROLL (físico)
+    Prioridade:
+    1) ADDRESS ON RECORD ON CURRENT TAX ROLL (endereço físico do imóvel)
     2) PHYSICAL ADDRESS
-    3) TITLE HOLDER AND ADDRESS OF RECORD (mailing)
-    Se não achar nenhum marker, pega o primeiro padrão City, ST ZIP e assume street na linha anterior.
+    3) TITLE HOLDER AND ADDRESS OF RECORD (mailing do dono)
+    Fallback: primeiro City, ST ZIP no documento.
     """
     if not text:
         return {
@@ -191,7 +177,7 @@ def parse_best_address_from_text(text: str) -> dict:
             "marker_used": None, "marker_found": False, "snippet": ""
         }
 
-    # lista de markers em prioridade
+    # markers em ordem de prioridade
     markers = [
         ("ADDRESS_ON_RECORD", r"ADDRESS\s+ON\s+RECORD\s+ON\s+CURRENT\s+TAX\s+ROLL\s*[:\-]?"),
         ("PHYSICAL_ADDRESS", r"PHYSICAL\s+ADDRESS\s*[:\-]?"),
@@ -205,7 +191,6 @@ def parse_best_address_from_text(text: str) -> dict:
 
         after = text[mm.end():].strip()
 
-        # achar o primeiro city/state/zip depois do marker
         mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", after, re.I)
         if not mcity:
             continue
@@ -225,7 +210,7 @@ def parse_best_address_from_text(text: str) -> dict:
             "snippet": after[:500]
         }
 
-    # fallback final: primeiro City, ST ZIP no documento todo
+    # fallback final: primeiro City, ST ZIP no documento
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
@@ -266,7 +251,7 @@ def run():
         ], "I Acknowledge")
         wait_network(page)
 
-        # 2) Search
+        # 2) Search page
         log.info("OPEN SEARCH: %s", SEARCH_URL)
         page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
         wait_network(page)
@@ -309,7 +294,7 @@ def run():
         if DEBUG_HTML:
             log.info("Printable HTML length: %d", len(page.content()))
 
-        # 3) Capture lots once
+        # 3) Capture lots once (avoid stale locators)
         lots = extract_lots_from_printable(page)
         lots = [l for l in lots if l.get("node")]
         if not lots:
@@ -336,7 +321,7 @@ def run():
             viewer_url = page.url
             log.info("Viewer URL: %s", viewer_url)
 
-            # 5) Find PDF link
+            # 5) Find PDF link inside viewer
             pdf_a = page.locator("a[href*='Property_Information.pdf']")
             href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
@@ -376,7 +361,7 @@ def run():
             pdf_bytes = pdf_resp.body()
             log.info("PDF bytes: %d", len(pdf_bytes))
 
-            # 7) Extract address: text -> OCR 3 pages
+            # 7) Extract address: text -> OCR (3 pages)
             text = try_pdfplumber_text(pdf_bytes)
             if text:
                 log.info("pdfplumber text length: %d (using text parse)", len(text))
@@ -392,7 +377,6 @@ def run():
                 "state": "FL",
                 "node": node,
 
-                # from printable row
                 "tax_sale_id": fields.get("tax_sale_id", ""),
                 "parcel_number": fields.get("parcel_number", ""),
                 "sale_date": fields.get("sale_date", ""),
@@ -400,7 +384,6 @@ def run():
                 "deed_status": fields.get("deed_status", ""),
                 "applicant_name": fields.get("applicant_name", ""),
 
-                # pdf link + extracted address
                 "pdf_url": pdf_url,
                 "address": addr.get("address"),
                 "city": addr.get("city"),
@@ -417,7 +400,7 @@ def run():
             if not addr.get("marker_found"):
                 log.warning("Address marker not found. Snippet:\n%s", addr.get("snippet", "")[:900])
 
-            # Return to printable
+            # back to printable
             page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
             wait_network(page, 30_000)
             time.sleep(1.0)
