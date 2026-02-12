@@ -7,12 +7,8 @@ from io import BytesIO
 from urllib.parse import urljoin
 
 import pdfplumber
-import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# =========================
-# ENV / CONFIG (GitHub safe)
-# =========================
 BASE_URL = "https://or.occompt.com"
 LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
@@ -21,29 +17,31 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 MAX_LOTS = int(os.getenv("MAX_LOTS", "3"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
-APP_API_BASE = os.getenv("APP_API_BASE")  # opcional
-APP_API_TOKEN = os.getenv("APP_API_TOKEN")  # opcional
-APP_API_ENDPOINT = f"{APP_API_BASE.rstrip('/')}/api/properties" if APP_API_BASE else None
-
 MAX_WAIT = 60_000
 ADDRESS_MARKER = "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("taxdeed-gh")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("taxdeed-single-tab")
 
-# =========================
-# Helpers
-# =========================
-def click_first(page, selectors, label):
-    """Try several selectors; click first that exists."""
+
+def wait_network(page, timeout=20_000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass
+
+
+def click(page, selector: str, label: str):
+    page.wait_for_selector(selector, timeout=MAX_WAIT)
+    page.click(selector)
+    log.info("Clicked: %s (%s)", label, selector)
+
+
+def click_any(page, selectors: list[str], label: str) -> bool:
     for sel in selectors:
         try:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                loc.first.click()
+            if page.locator(sel).count() > 0:
+                page.click(sel)
                 log.info("Clicked: %s (%s)", label, sel)
                 return True
         except Exception:
@@ -51,15 +49,7 @@ def click_first(page, selectors, label):
     return False
 
 
-def wait_network(page, ms=15_000):
-    try:
-        page.wait_for_load_state("networkidle", timeout=ms)
-    except PWTimeout:
-        pass
-
-
 def extract_lot_fields_from_html(html: str) -> dict:
-    """Light regex extraction; replace with selectors later if you want."""
     def rgx(pattern):
         m = re.search(pattern, html, re.I | re.S)
         return m.group(1).strip() if m else None
@@ -79,11 +69,7 @@ def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
         text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
 
     if ADDRESS_MARKER not in text:
-        return {
-            "marker_found": False,
-            "address": None, "city": None, "state": None, "zip": None,
-            "text_snippet": (text[:800] if text else None)
-        }
+        return {"marker_found": False, "address": None, "city": None, "state": None, "zip": None, "snippet": text[:800]}
 
     after = text.split(ADDRESS_MARKER, 1)[1].strip()
     snippet = after[:700]
@@ -92,10 +78,8 @@ def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
     street = lines[0] if lines else None
     line2 = lines[1] if len(lines) > 1 else ""
 
-    m = re.search(
-        r"^(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$",
-        line2.upper().strip()
-    )
+    m = re.search(r"^(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$",
+                  line2.upper().strip())
     if m:
         return {
             "marker_found": True,
@@ -103,10 +87,9 @@ def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
             "city": m.group("city").title().strip(),
             "state": m.group("state"),
             "zip": m.group("zip"),
-            "text_snippet": snippet[:400]
+            "snippet": snippet[:400]
         }
 
-    # fallback
     joined = " | ".join(lines[:5]).upper()
     m2 = re.search(r"(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)", joined)
     return {
@@ -115,62 +98,42 @@ def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
         "city": m2.group("city").title().strip() if m2 else None,
         "state": m2.group("state") if m2 else None,
         "zip": m2.group("zip") if m2 else None,
-        "text_snippet": snippet[:400]
+        "snippet": snippet[:400]
     }
 
 
-def post_to_app(payload: dict):
-    if not APP_API_ENDPOINT:
-        return None, None
-
-    headers = {"Content-Type": "application/json"}
-    if APP_API_TOKEN:
-        headers["Authorization"] = f"Bearer {APP_API_TOKEN}"
-
-    r = requests.post(APP_API_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=30)
-    return r.status_code, r.text[:400]
-
-
-def must_be_pdf(response) -> bool:
-    # Playwright APIResponse has headers via response.headers
-    ct = (response.headers.get("content-type") or "").lower()
+def must_be_pdf_headers(headers: dict) -> bool:
+    ct = (headers.get("content-type") or "").lower()
     return "application/pdf" in ct or ct.endswith("/pdf")
 
 
-# =========================
-# Main scraper (GitHub)
-# =========================
 def run():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         context = browser.new_context()
         page = context.new_page()
 
+        # 1) Login/Disclaimer
         log.info("OPEN: %s", LOGIN_URL)
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
 
-        # Acknowledge (cookie/disclaimer)
-        clicked_ack = click_first(
-            page,
-            [
-                "text=I Acknowledge",
-                "button:has-text('I Acknowledge')",
-                "a:has-text('I Acknowledge')",
-                "input[value='I Acknowledge']",
-            ],
-            "I Acknowledge"
-        )
-        if not clicked_ack:
-            log.warning("Não achei o botão 'I Acknowledge' automaticamente. Pode precisar ajustar seletor.")
+        ack_ok = click_any(page, [
+            "text=I Acknowledge",
+            "button:has-text('I Acknowledge')",
+            "a:has-text('I Acknowledge')",
+            "input[value='I Acknowledge']",
+        ], "I Acknowledge")
 
+        if not ack_ok:
+            log.warning("Não achei 'I Acknowledge' automaticamente.")
         wait_network(page)
 
-        # Go to search page directly (more stable than relying on menu)
+        # 2) Search page
         log.info("OPEN SEARCH: %s", SEARCH_URL)
         page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
         wait_network(page)
 
-        # Select DeedStatusID = AS
+        # Set DeedStatusID = AS
         set_ok = False
         for sel in ["select[name='DeedStatusID']", "select#DeedStatusID"]:
             try:
@@ -180,155 +143,138 @@ def run():
                     log.info("Set DeedStatusID=AS using %s", sel)
                     break
             except Exception:
-                continue
+                pass
         if not set_ok:
-            log.warning("Não consegui setar DeedStatusID=AS. Ajuste seletor do dropdown.")
+            log.warning("Não consegui setar DeedStatusID=AS (ajustar seletor).")
 
-        # Click Search
-        clicked_search = click_first(
-            page,
-            [
-                "input[type='submit'][value='Search']",
-                "button:has-text('Search')",
-                "text=Search"
-            ],
-            "Search"
-        )
-        if not clicked_search:
-            log.error("Não consegui clicar Search. Ajuste seletor.")
-            browser.close()
-            return
+        # Click Search (same tab navigation)
+        before = page.url
+        log.info("Before Search URL: %s", before)
+        click_any(page, [
+            "input[type='submit'][value='Search']",
+            "button:has-text('Search')",
+            "text=Search"
+        ], "Search")
 
+        # Esperar navegar / carregar resultados
+        page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
         wait_network(page, 30_000)
+        log.info("After Search URL: %s", page.url)
 
-        # Click Printable Version (may open popup or same page)
-        printable_page = None
-        log.info("Trying Printable Version...")
-        try:
-            with context.expect_page(timeout=8_000) as pop:
-                clicked = click_first(
-                    page,
-                    [
-                        "text=Printable Version",
-                        "a:has-text('Printable Version')",
-                        "button:has-text('Printable Version')"
-                    ],
-                    "Printable Version"
-                )
-            if clicked:
-                printable_page = pop.value
-        except Exception:
-            # maybe same tab
-            clicked = click_first(
-                page,
-                [
-                    "text=Printable Version",
-                    "a:has-text('Printable Version')",
-                    "button:has-text('Printable Version')"
-                ],
-                "Printable Version"
-            )
-            printable_page = page if clicked else None
+        # Click Printable Version (same tab navigation)
+        before_print = page.url
+        log.info("Before Printable URL: %s", before_print)
 
-        if printable_page is None:
-            log.error("Não consegui abrir Printable Version.")
+        ok = click_any(page, [
+            "text=Printable Version",
+            "a:has-text('Printable Version')",
+            "button:has-text('Printable Version')"
+        ], "Printable Version")
+
+        if not ok:
+            log.error("Não achei Printable Version.")
             browser.close()
             return
 
-        printable_page.bring_to_front()
-        printable_page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-        wait_network(printable_page)
+        # Esperar a navegação terminar
+        page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+        wait_network(page, 30_000)
+        log.info("After Printable URL: %s", page.url)
 
         if DEBUG_HTML:
-            log.info("Printable HTML length: %d", len(printable_page.content()))
+            log.info("Printable HTML length: %d", len(page.content()))
 
-        # Locate "Tax Sale" links
-        tax_links = printable_page.locator("a:has-text('Tax Sale')")
+        # 3) Links Tax Sale
+        tax_links = page.locator("a:has-text('Tax Sale')")
         total = tax_links.count()
         log.info("Tax Sale links found: %d", total)
 
         if total == 0:
-            log.error("Nenhum 'Tax Sale' encontrado. Pode ser que a lista esteja vazia ou texto diferente.")
+            log.error("Nenhum 'Tax Sale' encontrado. (texto pode ser diferente na página printable)")
             browser.close()
             return
 
         n = min(total, MAX_LOTS)
-        log.info("Processing %d lot(s)...", n)
 
         for i in range(n):
             log.info("----- LOT %d/%d -----", i + 1, n)
 
-            # Open lot in new page to avoid history issues
-            with context.expect_page() as pop:
-                tax_links.nth(i).click()
-            lot_page = pop.value
-            lot_page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-            wait_network(lot_page)
+            # Em single-tab: precisamos capturar o href e navegar
+            href = tax_links.nth(i).get_attribute("href")
+            if not href:
+                log.error("Link Tax Sale sem href no índice %d", i)
+                continue
 
-            lot_url = lot_page.url
-            log.info("Lot URL: %s", lot_url)
+            lot_url = urljoin(page.url, href)
+            log.info("OPEN LOT: %s", lot_url)
 
-            lot_html = lot_page.content()
-            if DEBUG_HTML:
-                log.info("Lot HTML length: %d", len(lot_html))
+            page.goto(lot_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+            wait_network(page)
 
+            lot_html = page.content()
             lot_data = extract_lot_fields_from_html(lot_html)
+            log.info("Lot extracted fields: %s", lot_data)
 
-            # Open viewer
-            vpi = lot_page.locator("a:has-text('View Property Information'), button:has-text('View Property Information')")
+            # 4) View Property Information (viewer)
+            vpi = page.locator("a:has-text('View Property Information'), button:has-text('View Property Information')")
             if vpi.count() == 0:
-                log.error("No 'View Property Information' found for lot %d.", i + 1)
-                lot_page.close()
+                log.error("Não achei 'View Property Information' no lote %d", i + 1)
+                # voltar pro printable e continuar
+                page.go_back()
+                page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page)
                 continue
 
-            with context.expect_page() as vpop:
-                vpi.first.click()
-            viewer = vpop.value
-            viewer.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-            wait_network(viewer)
+            # clicar e esperar carregar viewer na mesma aba
+            vpi.first.click()
+            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            wait_network(page)
+            viewer_url = page.url
+            log.info("Viewer URL: %s", viewer_url)
 
-            log.info("Viewer URL: %s", viewer.url)
+            # 5) Capturar href do PDF dentro do viewer
+            pdf_a = page.locator("a[href*='Property_Information.pdf']")
+            href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
-            # Find PDF link inside viewer
-            pdf_a = viewer.locator("a[href*='Property_Information.pdf']")
-            href = pdf_a.first.get_attribute("href") if pdf_a.count() else None
-
-            if not href:
-                # fallback search in html
-                viewer_html = viewer.content()
+            if not href_pdf:
+                viewer_html = page.content()
                 m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
-                href = m.group(1) if m else None
+                href_pdf = m.group(1) if m else None
 
-            if not href:
-                log.error("PDF link not found in viewer for lot %d.", i + 1)
-                viewer.close()
-                lot_page.close()
+            if not href_pdf:
+                log.error("Não encontrei link do PDF no viewer.")
+                # voltar para printable: 2 backs (viewer -> lot -> printable)
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page)
                 continue
 
-            pdf_url = urljoin(viewer.url, href)
+            pdf_url = urljoin(viewer_url, href_pdf)
             log.info("PDF URL: %s", pdf_url)
 
-            # Download PDF using same session/cookies
+            # 6) Baixar PDF via mesma sessão
             pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
-
             log.info("PDF HTTP status: %s", pdf_resp.status)
+
             if not pdf_resp.ok:
-                body_preview = (pdf_resp.text() or "")[:600]
-                log.error("PDF download failed. Body preview:\n%s", body_preview)
-                viewer.close()
-                lot_page.close()
+                preview = (pdf_resp.text() or "")[:600]
+                log.error("PDF download failed. Preview:\n%s", preview)
+                # voltar para printable
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page)
                 continue
 
-            # Validate content-type as PDF
-            if not must_be_pdf(pdf_resp):
+            if not must_be_pdf_headers(pdf_resp.headers):
                 preview = (pdf_resp.text() or "")[:800]
-                log.error("PDF response is not application/pdf. Content preview:\n%s", preview)
-                viewer.close()
-                lot_page.close()
+                log.error("PDF response not application/pdf. Preview:\n%s", preview)
+                # voltar para printable
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                page.go_back(); page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page)
                 continue
 
-            pdf_bytes = pdf_resp.body()
-            addr = parse_address_from_pdf_bytes(pdf_bytes)
+            addr = parse_address_from_pdf_bytes(pdf_resp.body())
 
             payload = {
                 "county": "Orange",
@@ -346,31 +292,26 @@ def run():
                 "zip": addr.get("zip"),
             }
 
-            # Print result to Actions logs (terminal)
             print("\n" + "=" * 100)
             print(f"RESULT LOT {i+1}")
             print("=" * 100)
             print(json.dumps(payload, indent=2))
 
             if not addr.get("marker_found"):
-                log.warning("Marker not found in PDF. Snippet:\n%s", addr.get("text_snippet"))
+                log.warning("Marker not found. Snippet:\n%s", addr.get("snippet"))
 
-            # Optional: post to your app
-            if APP_API_ENDPOINT:
-                status, body = post_to_app(payload)
-                if status and 200 <= status < 300:
-                    log.info("✅ Posted to app: HTTP %d", status)
-                else:
-                    log.warning("⚠️ App response: %s | %s", status, body)
+            # 7) Voltar para printable (viewer -> lot -> printable)
+            page.go_back()
+            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            page.go_back()
+            page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            wait_network(page)
 
-            viewer.close()
-            lot_page.close()
+            # pequeno delay para evitar rate-limit
+            time.sleep(1.0)
 
-            # Rate limit small delay
-            time.sleep(1.2)
-
-        browser.close()
         log.info("DONE.")
+        browser.close()
 
 
 if __name__ == "__main__":
