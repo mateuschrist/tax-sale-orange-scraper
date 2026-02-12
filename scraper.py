@@ -1,51 +1,65 @@
+import os
 import re
-import sys
+import json
+import time
 import logging
 from io import BytesIO
 from urllib.parse import urljoin
 
 import pdfplumber
+import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
-# CONFIG
+# ENV / CONFIG (GitHub safe)
 # =========================
 BASE_URL = "https://or.occompt.com"
 LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
-LIST_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearchResults.jsp?searchId=0&printing=true"
+SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
-MAX_WAIT = 60000
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+MAX_LOTS = int(os.getenv("MAX_LOTS", "3"))
+DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
+
+APP_API_BASE = os.getenv("APP_API_BASE")  # opcional
+APP_API_TOKEN = os.getenv("APP_API_TOKEN")  # opcional
+APP_API_ENDPOINT = f"{APP_API_BASE.rstrip('/')}/api/properties" if APP_API_BASE else None
+
+MAX_WAIT = 60_000
 ADDRESS_MARKER = "ADDRESS ON RECORD ON CURRENT TAX ROLL:"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("taxdeed-test")
-
+log = logging.getLogger("taxdeed-gh")
 
 # =========================
-# HELPERS
+# Helpers
 # =========================
-def try_click_acknowledge(page) -> bool:
-    candidates = [
-        "text=I Acknowledge",
-        "button:has-text('I Acknowledge')",
-        "a:has-text('I Acknowledge')",
-        "input[value='I Acknowledge']",
-    ]
-    for sel in candidates:
+def click_first(page, selectors, label):
+    """Try several selectors; click first that exists."""
+    for sel in selectors:
         try:
-            if page.locator(sel).count() > 0:
-                page.click(sel)
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                loc.first.click()
+                log.info("Clicked: %s (%s)", label, sel)
                 return True
         except Exception:
-            pass
+            continue
     return False
 
 
-def extract_from_lot_html(html: str) -> dict:
-    """Regex simples para diagnóstico (rápido de ajustar)."""
+def wait_network(page, ms=15_000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=ms)
+    except PWTimeout:
+        pass
+
+
+def extract_lot_fields_from_html(html: str) -> dict:
+    """Light regex extraction; replace with selectors later if you want."""
     def rgx(pattern):
         m = re.search(pattern, html, re.I | re.S)
         return m.group(1).strip() if m else None
@@ -61,24 +75,18 @@ def extract_from_lot_html(html: str) -> dict:
 
 
 def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
-    """Extrai address/city/state/zip do PDF."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        pages_text = []
-        for p in pdf.pages:
-            t = p.extract_text() or ""
-            if t:
-                pages_text.append(t)
-        text = "\n".join(pages_text)
+        text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
 
     if ADDRESS_MARKER not in text:
         return {
-            "address": None, "city": None, "state": None, "zip": None,
             "marker_found": False,
-            "text_snippet": text[:700] if text else None,
+            "address": None, "city": None, "state": None, "zip": None,
+            "text_snippet": (text[:800] if text else None)
         }
 
     after = text.split(ADDRESS_MARKER, 1)[1].strip()
-    snippet = after[:600]
+    snippet = after[:700]
     lines = [ln.strip() for ln in snippet.splitlines() if ln.strip()]
 
     street = lines[0] if lines else None
@@ -90,178 +98,280 @@ def parse_address_from_pdf_bytes(pdf_bytes: bytes) -> dict:
     )
     if m:
         return {
+            "marker_found": True,
             "address": street,
             "city": m.group("city").title().strip(),
             "state": m.group("state"),
             "zip": m.group("zip"),
-            "marker_found": True,
-            "text_snippet": snippet[:400],
+            "text_snippet": snippet[:400]
         }
 
-    # fallback: busca city/state/zip em qualquer linha
+    # fallback
     joined = " | ".join(lines[:5]).upper()
     m2 = re.search(r"(?P<city>[A-Z .'-]+),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)", joined)
     return {
+        "marker_found": True,
         "address": street,
         "city": m2.group("city").title().strip() if m2 else None,
         "state": m2.group("state") if m2 else None,
         "zip": m2.group("zip") if m2 else None,
-        "marker_found": True,
-        "text_snippet": snippet[:400],
+        "text_snippet": snippet[:400]
     }
 
 
-def pretty_print(title: str, data):
-    print("\n" + "=" * 90)
-    print(title)
-    print("=" * 90)
-    if isinstance(data, dict):
-        for k, v in data.items():
-            print(f"{k}: {v}")
-    else:
-        print(data)
+def post_to_app(payload: dict):
+    if not APP_API_ENDPOINT:
+        return None, None
+
+    headers = {"Content-Type": "application/json"}
+    if APP_API_TOKEN:
+        headers["Authorization"] = f"Bearer {APP_API_TOKEN}"
+
+    r = requests.post(APP_API_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=30)
+    return r.status_code, r.text[:400]
+
+
+def must_be_pdf(response) -> bool:
+    # Playwright APIResponse has headers via response.headers
+    ct = (response.headers.get("content-type") or "").lower()
+    return "application/pdf" in ct or ct.endswith("/pdf")
 
 
 # =========================
-# MAIN
+# Main scraper (GitHub)
 # =========================
-def main():
+def run():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)  # headless=False pra você ver no teste
+        browser = p.chromium.launch(headless=HEADLESS)
         context = browser.new_context()
         page = context.new_page()
 
-        pretty_print("STEP 1 — OPEN LOGIN/DISCLAIMER", LOGIN_URL)
+        log.info("OPEN: %s", LOGIN_URL)
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
 
-        ack = try_click_acknowledge(page)
-        pretty_print("ACKNOWLEDGE CLICKED?", ack)
+        # Acknowledge (cookie/disclaimer)
+        clicked_ack = click_first(
+            page,
+            [
+                "text=I Acknowledge",
+                "button:has-text('I Acknowledge')",
+                "a:has-text('I Acknowledge')",
+                "input[value='I Acknowledge']",
+            ],
+            "I Acknowledge"
+        )
+        if not clicked_ack:
+            log.warning("Não achei o botão 'I Acknowledge' automaticamente. Pode precisar ajustar seletor.")
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
-            pass
+        wait_network(page)
 
-        pretty_print("STEP 2 — OPEN LIST URL", LIST_URL)
-        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        # Go to search page directly (more stable than relying on menu)
+        log.info("OPEN SEARCH: %s", SEARCH_URL)
+        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        wait_network(page)
 
-        pretty_print("CURRENT URL AFTER LIST NAV", page.url)
+        # Select DeedStatusID = AS
+        set_ok = False
+        for sel in ["select[name='DeedStatusID']", "select#DeedStatusID"]:
+            try:
+                if page.locator(sel).count() > 0:
+                    page.select_option(sel, value="AS")
+                    set_ok = True
+                    log.info("Set DeedStatusID=AS using %s", sel)
+                    break
+            except Exception:
+                continue
+        if not set_ok:
+            log.warning("Não consegui setar DeedStatusID=AS. Ajuste seletor do dropdown.")
 
-        if "login.jsp" in page.url:
-            pretty_print(
-                "ERROR",
-                "Você caiu no login ao abrir a lista. Isso normalmente significa que o searchId=0 não está válido "
-                "ou a sessão não foi aceita. O caminho robusto é automatizar o Search pra gerar um searchId válido."
-            )
+        # Click Search
+        clicked_search = click_first(
+            page,
+            [
+                "input[type='submit'][value='Search']",
+                "button:has-text('Search')",
+                "text=Search"
+            ],
+            "Search"
+        )
+        if not clicked_search:
+            log.error("Não consegui clicar Search. Ajuste seletor.")
             browser.close()
-            sys.exit(1)
+            return
 
-        # Pega o PRIMEIRO link "Tax Sale"
-        links = page.locator("a:has-text('Tax Sale')")
-        total = links.count()
-        pretty_print("FOUND 'Tax Sale' LINKS", total)
+        wait_network(page, 30_000)
+
+        # Click Printable Version (may open popup or same page)
+        printable_page = None
+        log.info("Trying Printable Version...")
+        try:
+            with context.expect_page(timeout=8_000) as pop:
+                clicked = click_first(
+                    page,
+                    [
+                        "text=Printable Version",
+                        "a:has-text('Printable Version')",
+                        "button:has-text('Printable Version')"
+                    ],
+                    "Printable Version"
+                )
+            if clicked:
+                printable_page = pop.value
+        except Exception:
+            # maybe same tab
+            clicked = click_first(
+                page,
+                [
+                    "text=Printable Version",
+                    "a:has-text('Printable Version')",
+                    "button:has-text('Printable Version')"
+                ],
+                "Printable Version"
+            )
+            printable_page = page if clicked else None
+
+        if printable_page is None:
+            log.error("Não consegui abrir Printable Version.")
+            browser.close()
+            return
+
+        printable_page.bring_to_front()
+        printable_page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+        wait_network(printable_page)
+
+        if DEBUG_HTML:
+            log.info("Printable HTML length: %d", len(printable_page.content()))
+
+        # Locate "Tax Sale" links
+        tax_links = printable_page.locator("a:has-text('Tax Sale')")
+        total = tax_links.count()
+        log.info("Tax Sale links found: %d", total)
 
         if total == 0:
-            pretty_print(
-                "ERROR",
-                "Nenhum link 'Tax Sale' encontrado na lista. Possíveis causas: página sem resultados ou texto diferente."
-            )
+            log.error("Nenhum 'Tax Sale' encontrado. Pode ser que a lista esteja vazia ou texto diferente.")
             browser.close()
-            sys.exit(1)
+            return
 
-        pretty_print("STEP 3 — OPEN FIRST LOT (NEW TAB)", "Clicking first Tax Sale...")
-        with context.expect_page() as pop:
-            links.nth(0).click()
-        lot_page = pop.value
-        lot_page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+        n = min(total, MAX_LOTS)
+        log.info("Processing %d lot(s)...", n)
 
-        pretty_print("LOT PAGE URL", lot_page.url)
+        for i in range(n):
+            log.info("----- LOT %d/%d -----", i + 1, n)
 
-        lot_html = lot_page.content()
-        lot_data = extract_from_lot_html(lot_html)
-        pretty_print("LOT DATA (FROM HTML)", lot_data)
+            # Open lot in new page to avoid history issues
+            with context.expect_page() as pop:
+                tax_links.nth(i).click()
+            lot_page = pop.value
+            lot_page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            wait_network(lot_page)
 
-        # Abrir viewer "View Property Information"
-        vpi = lot_page.locator("a:has-text('View Property Information'), button:has-text('View Property Information')")
-        vpi_count = vpi.count()
-        pretty_print("FOUND 'View Property Information' BUTTON/LINKS", vpi_count)
+            lot_url = lot_page.url
+            log.info("Lot URL: %s", lot_url)
 
-        if vpi_count == 0:
-            pretty_print("ERROR", "Não achei 'View Property Information' no lote.")
-            lot_page.close()
-            browser.close()
-            sys.exit(1)
+            lot_html = lot_page.content()
+            if DEBUG_HTML:
+                log.info("Lot HTML length: %d", len(lot_html))
 
-        pretty_print("STEP 4 — OPEN VIEWER (NEW TAB)", "Clicking VPI...")
-        with context.expect_page() as vpop:
-            vpi.first.click()
-        viewer = vpop.value
-        viewer.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            lot_data = extract_lot_fields_from_html(lot_html)
 
-        pretty_print("VIEWER URL", viewer.url)
+            # Open viewer
+            vpi = lot_page.locator("a:has-text('View Property Information'), button:has-text('View Property Information')")
+            if vpi.count() == 0:
+                log.error("No 'View Property Information' found for lot %d.", i + 1)
+                lot_page.close()
+                continue
 
-        # Captura link real do PDF dentro do viewer
-        pdf_a = viewer.locator("a[href*='Property_Information.pdf']")
-        count_pdf_links = pdf_a.count()
-        pretty_print("FOUND PDF LINKS IN VIEWER", count_pdf_links)
+            with context.expect_page() as vpop:
+                vpi.first.click()
+            viewer = vpop.value
+            viewer.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+            wait_network(viewer)
 
-        href = pdf_a.first.get_attribute("href") if count_pdf_links else None
+            log.info("Viewer URL: %s", viewer.url)
 
-        # fallback regex
-        if not href:
-            viewer_html = viewer.content()
-            m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
-            href = m.group(1) if m else None
+            # Find PDF link inside viewer
+            pdf_a = viewer.locator("a[href*='Property_Information.pdf']")
+            href = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
-        pretty_print("PDF HREF (RAW)", href)
+            if not href:
+                # fallback search in html
+                viewer_html = viewer.content()
+                m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
+                href = m.group(1) if m else None
 
-        if not href:
-            pretty_print("ERROR", "Não foi possível capturar o href do Property_Information.pdf dentro do viewer.")
+            if not href:
+                log.error("PDF link not found in viewer for lot %d.", i + 1)
+                viewer.close()
+                lot_page.close()
+                continue
+
+            pdf_url = urljoin(viewer.url, href)
+            log.info("PDF URL: %s", pdf_url)
+
+            # Download PDF using same session/cookies
+            pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
+
+            log.info("PDF HTTP status: %s", pdf_resp.status)
+            if not pdf_resp.ok:
+                body_preview = (pdf_resp.text() or "")[:600]
+                log.error("PDF download failed. Body preview:\n%s", body_preview)
+                viewer.close()
+                lot_page.close()
+                continue
+
+            # Validate content-type as PDF
+            if not must_be_pdf(pdf_resp):
+                preview = (pdf_resp.text() or "")[:800]
+                log.error("PDF response is not application/pdf. Content preview:\n%s", preview)
+                viewer.close()
+                lot_page.close()
+                continue
+
+            pdf_bytes = pdf_resp.body()
+            addr = parse_address_from_pdf_bytes(pdf_bytes)
+
+            payload = {
+                "county": "Orange",
+                "state": "FL",
+                "parcel_number": lot_data.get("parcel_number"),
+                "sale_date": lot_data.get("sale_date"),
+                "opening_bid": lot_data.get("opening_bid"),
+                "application_number": lot_data.get("application_number"),
+                "deed_status": lot_data.get("deed_status"),
+                "homestead": lot_data.get("homestead"),
+                "pdf_url": pdf_url,
+                "address": addr.get("address"),
+                "city": addr.get("city"),
+                "state": addr.get("state") or "FL",
+                "zip": addr.get("zip"),
+            }
+
+            # Print result to Actions logs (terminal)
+            print("\n" + "=" * 100)
+            print(f"RESULT LOT {i+1}")
+            print("=" * 100)
+            print(json.dumps(payload, indent=2))
+
+            if not addr.get("marker_found"):
+                log.warning("Marker not found in PDF. Snippet:\n%s", addr.get("text_snippet"))
+
+            # Optional: post to your app
+            if APP_API_ENDPOINT:
+                status, body = post_to_app(payload)
+                if status and 200 <= status < 300:
+                    log.info("✅ Posted to app: HTTP %d", status)
+                else:
+                    log.warning("⚠️ App response: %s | %s", status, body)
+
             viewer.close()
             lot_page.close()
-            browser.close()
-            sys.exit(1)
 
-        pdf_url = urljoin(viewer.url, href)
-        pretty_print("PDF URL (RESOLVED)", pdf_url)
+            # Rate limit small delay
+            time.sleep(1.2)
 
-        # Baixar PDF via sessão do Playwright (cookies OK)
-        pretty_print("STEP 5 — DOWNLOAD PDF (SESSION REQUEST)", "Downloading...")
-        resp = context.request.get(pdf_url, timeout=MAX_WAIT)
-        pretty_print("PDF RESPONSE STATUS", resp.status)
-
-        # Se não for 200, geralmente você caiu no disclaimer novamente
-        if not resp.ok:
-            body_preview = (resp.text() or "")[:800]
-            pretty_print("PDF DOWNLOAD FAILED — BODY PREVIEW", body_preview)
-            viewer.close()
-            lot_page.close()
-            browser.close()
-            sys.exit(1)
-
-        pdf_bytes = resp.body()
-        pretty_print("PDF BYTES LENGTH", len(pdf_bytes))
-
-        # Extrair endereço
-        pretty_print("STEP 6 — PARSE PDF (ADDRESS)", "Parsing text...")
-        addr = parse_address_from_pdf_bytes(pdf_bytes)
-        pretty_print("ADDRESS PARSE RESULT", addr)
-
-        # Resultado final
-        final = {**lot_data, **{
-            "pdf_url": pdf_url,
-            "address": addr.get("address"),
-            "city": addr.get("city"),
-            "state": addr.get("state"),
-            "zip": addr.get("zip"),
-        }}
-        pretty_print("✅ FINAL RESULT (ONE LOT)", final)
-
-        # Fecha tudo
-        viewer.close()
-        lot_page.close()
         browser.close()
+        log.info("DONE.")
 
 
 if __name__ == "__main__":
-    main()
+    run()
