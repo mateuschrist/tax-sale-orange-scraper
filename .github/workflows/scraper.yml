@@ -6,6 +6,12 @@ on:
     - cron: "0 11 * * *" # todo dia 11:00 UTC (ajuste depois)
 
 jobs:
+
+- name: Install Tesseract OCR
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y tesseract-ocr
+
   run-scraper:
     runs-on: ubuntu-latest
     timeout-minutes: 30
