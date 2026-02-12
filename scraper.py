@@ -6,6 +6,23 @@ import logging
 from io import BytesIO
 from urllib.parse import urljoin, urlparse, parse_qs
 
+import pytesseract
+import pypdfium2
+from PIL import Image
+
+
+def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
+    pdf = pypdfium2.PdfDocument(pdf_bytes)
+    pages = pdf.render(scale=2)  # melhora OCR
+    full_text = ""
+
+    for page in pages:
+        img = Image.fromarray(page.to_numpy())
+        txt = pytesseract.image_to_string(img)
+        full_text += "\n" + txt
+
+    return full_text
+    
 import pdfplumber
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
