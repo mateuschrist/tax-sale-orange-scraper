@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 import pdfplumber
 import pytesseract
 import pypdfium2
+import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
@@ -21,6 +22,11 @@ SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 MAX_LOTS = int(os.getenv("MAX_LOTS", "3"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
+
+# App/API (Vercel)
+APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").rstrip("/")
+APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
+SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
 MAX_WAIT = 60_000
 
@@ -58,6 +64,52 @@ def norm_ws(s: str) -> str:
 def must_be_pdf(headers: dict) -> bool:
     ct = (headers.get("content-type") or "").lower()
     return "application/pdf" in ct or ct.endswith("/pdf")
+
+
+def normalize_bid_for_payload(v):
+    """Send as string (no commas) or number; backend normalizes anyway."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    # keep digits and dot
+    cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
+    return cleaned if cleaned else None
+
+
+def post_to_app(payload: dict) -> dict | None:
+    """POST payload to Vercel ingest endpoint. Retries lightly."""
+    if not SEND_TO_APP:
+        log.info("APP_API_BASE / APP_API_TOKEN not set → skipping send to app.")
+        return None
+
+    url = f"{APP_API_BASE}/api/ingest"
+    headers = {"Authorization": f"Bearer {APP_API_TOKEN}"}
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            log.info("INGEST attempt %d: %s", attempt, r.status_code)
+            # print small snippet for debugging
+            snippet = (r.text or "")[:250].replace("\n", " ")
+            log.info("INGEST response snippet: %s", snippet)
+
+            if r.status_code in (200, 201):
+                return r.json()
+            if r.status_code == 401:
+                log.error("INGEST unauthorized (check APP_API_TOKEN matches Vercel INGEST_API_TOKEN).")
+                return None
+
+            last_err = f"HTTP {r.status_code}: {r.text[:500]}"
+        except Exception as e:
+            last_err = str(e)
+
+        time.sleep(1.0 * attempt)
+
+    log.error("INGEST failed after retries: %s", last_err)
+    return None
 
 
 # =========================
@@ -177,7 +229,6 @@ def parse_best_address_from_text(text: str) -> dict:
             "marker_used": None, "marker_found": False, "snippet": ""
         }
 
-    # markers em ordem de prioridade
     markers = [
         ("ADDRESS_ON_RECORD", r"ADDRESS\s+ON\s+RECORD\s+ON\s+CURRENT\s+TAX\s+ROLL\s*[:\-]?"),
         ("PHYSICAL_ADDRESS", r"PHYSICAL\s+ADDRESS\s*[:\-]?"),
@@ -207,10 +258,9 @@ def parse_best_address_from_text(text: str) -> dict:
             "zip": zipc,
             "marker_used": marker_name,
             "marker_found": True,
-            "snippet": after[:500]
+            "snippet": after[:700]
         }
 
-    # fallback final: primeiro City, ST ZIP no documento
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
@@ -234,6 +284,8 @@ def parse_best_address_from_text(text: str) -> dict:
 # MAIN
 # =========================
 def run():
+    log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE if APP_API_BASE else "(empty)")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         context = browser.new_context()
@@ -315,90 +367,110 @@ def run():
             log.info("----- LOT %d/%d node=%s -----", idx, len(selected), node)
             log.info("Row text: %s", row_text[:220])
 
-            # 4) Open viewer
-            page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-            wait_network(page)
-            viewer_url = page.url
-            log.info("Viewer URL: %s", viewer_url)
+            try:
+                # 4) Open viewer
+                page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page)
+                viewer_url = page.url
+                log.info("Viewer URL: %s", viewer_url)
 
-            # 5) Find PDF link inside viewer
-            pdf_a = page.locator("a[href*='Property_Information.pdf']")
-            href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
+                # 5) Find PDF link inside viewer
+                pdf_a = page.locator("a[href*='Property_Information.pdf']")
+                href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
-            if not href_pdf:
-                viewer_html = page.content()
-                m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
-                href_pdf = m.group(1) if m else None
+                if not href_pdf:
+                    viewer_html = page.content()
+                    m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
+                    href_pdf = m.group(1) if m else None
 
-            if not href_pdf:
-                log.error("PDF link not found in viewer for node=%s", node)
-                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page, 30_000)
-                continue
+                if not href_pdf:
+                    log.error("PDF link not found in viewer for node=%s", node)
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
+                    continue
 
-            pdf_url = urljoin(viewer_url, href_pdf)
-            log.info("PDF URL: %s", pdf_url)
+                pdf_url = urljoin(viewer_url, href_pdf)
+                log.info("PDF URL: %s", pdf_url)
 
-            # 6) Download PDF
-            pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
-            log.info("PDF HTTP status: %s", pdf_resp.status)
-            log.info("PDF content-type: %s", pdf_resp.headers.get("content-type"))
+                # 6) Download PDF
+                pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
+                log.info("PDF HTTP status: %s", pdf_resp.status)
+                log.info("PDF content-type: %s", pdf_resp.headers.get("content-type"))
 
-            if not pdf_resp.ok:
-                preview = (pdf_resp.text() or "")[:600]
-                log.error("PDF download failed preview:\n%s", preview)
-                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page, 30_000)
-                continue
+                if not pdf_resp.ok:
+                    preview = (pdf_resp.text() or "")[:600]
+                    log.error("PDF download failed preview:\n%s", preview)
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
+                    continue
 
-            if not must_be_pdf(pdf_resp.headers):
-                preview = (pdf_resp.text() or "")[:800]
-                log.error("Response is not PDF preview:\n%s", preview)
-                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page, 30_000)
-                continue
+                if not must_be_pdf(pdf_resp.headers):
+                    preview = (pdf_resp.text() or "")[:800]
+                    log.error("Response is not PDF preview:\n%s", preview)
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
+                    continue
 
-            pdf_bytes = pdf_resp.body()
-            log.info("PDF bytes: %d", len(pdf_bytes))
+                pdf_bytes = pdf_resp.body()
+                log.info("PDF bytes: %d", len(pdf_bytes))
 
-            # 7) Extract address: text -> OCR (3 pages)
-            text = try_pdfplumber_text(pdf_bytes)
-            if text:
-                log.info("pdfplumber text length: %d (using text parse)", len(text))
-                addr = parse_best_address_from_text(text)
-            else:
-                log.info("pdfplumber returned empty. Running OCR on FIRST 3 pages...")
-                ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=3, scale=2.2)
-                log.info("OCR text length: %d", len(ocr_text))
-                addr = parse_best_address_from_text(ocr_text)
+                # 7) Extract address: text -> OCR (3 pages)
+                text = try_pdfplumber_text(pdf_bytes)
+                if text:
+                    log.info("pdfplumber text length: %d (using text parse)", len(text))
+                    addr = parse_best_address_from_text(text)
+                    raw_text_for_debug = text
+                else:
+                    log.info("pdfplumber returned empty. Running OCR on FIRST 3 pages...")
+                    ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=3, scale=2.2)
+                    log.info("OCR text length: %d", len(ocr_text))
+                    addr = parse_best_address_from_text(ocr_text)
+                    raw_text_for_debug = ocr_text
 
-            payload = {
-                "county": "Orange",
-                "state": "FL",
-                "node": node,
+                notes = None
+                if not addr.get("marker_found"):
+                    notes = "Address marker not found via OCR first 3 pages."
 
-                "tax_sale_id": fields.get("tax_sale_id", ""),
-                "parcel_number": fields.get("parcel_number", ""),
-                "sale_date": fields.get("sale_date", ""),
-                "opening_bid": fields.get("opening_bid", ""),
-                "deed_status": fields.get("deed_status", ""),
-                "applicant_name": fields.get("applicant_name", ""),
+                payload = {
+                    "county": "Orange",
+                    "state": "FL",
+                    "node": node,
 
-                "pdf_url": pdf_url,
-                "address": addr.get("address"),
-                "city": addr.get("city"),
-                "state_address": addr.get("state"),
-                "zip": addr.get("zip"),
-                "address_source_marker": addr.get("marker_used"),
-            }
+                    "tax_sale_id": fields.get("tax_sale_id") or None,
+                    "parcel_number": fields.get("parcel_number") or None,
+                    "sale_date": fields.get("sale_date") or None,
+                    "opening_bid": normalize_bid_for_payload(fields.get("opening_bid")),
+                    "deed_status": fields.get("deed_status") or None,
+                    "applicant_name": fields.get("applicant_name") or None,
 
-            print("\n" + "=" * 100)
-            print(f"RESULT LOT {idx}")
-            print("=" * 100)
-            print(json.dumps(payload, indent=2))
+                    "pdf_url": pdf_url,
+                    "address": addr.get("address"),
+                    "city": addr.get("city"),
+                    "state_address": addr.get("state"),
+                    "zip": addr.get("zip"),
+                    "address_source_marker": addr.get("marker_used"),
 
-            if not addr.get("marker_found"):
-                log.warning("Address marker not found. Snippet:\n%s", addr.get("snippet", "")[:900])
+                    "status": "new",
+                    "notes": notes,
+                    # Se quiser guardar OCR no banco no futuro, você pode enviar aqui:
+                    # "raw_ocr_text": raw_text_for_debug
+                }
+
+                print("\n" + "=" * 100)
+                print(f"RESULT LOT {idx}")
+                print("=" * 100)
+                print(json.dumps(payload, indent=2))
+
+                if not addr.get("marker_found"):
+                    log.warning("Address marker not found. Snippet:\n%s", addr.get("snippet", "")[:900])
+
+                # 8) Send to app (optional)
+                ingest_result = post_to_app(payload)
+                if ingest_result:
+                    log.info("INGEST OK: %s", ingest_result)
+
+            except Exception as e:
+                log.exception("LOT FAILED node=%s error=%s", node, str(e))
 
             # back to printable
             page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
