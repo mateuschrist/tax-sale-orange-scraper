@@ -4,13 +4,13 @@ import json
 import time
 import logging
 from io import BytesIO
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 
-import requests
 import pdfplumber
 import pytesseract
 import pypdfium2
+import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # =========================
@@ -21,57 +21,40 @@ LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
-
+MAX_LOTS = int(os.getenv("MAX_LOTS", "99999"))  # agora é "limite de captura" (a lista), mas batch controla o processado
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
-MAX_TOTAL = int(os.getenv("MAX_TOTAL", "0"))  # 0 = unlimited
-CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_orange.json")
+PAUSE_HOURS_ON_DONE = int(os.getenv("PAUSE_HOURS_ON_DONE", "20"))
+MARK_REMOVED = os.getenv("MARK_REMOVED", "true").lower() == "true"
+
+DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
+MAX_WAIT = 60_000
 
 # App/API (Vercel)
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
-# Advanced sync options
-MARK_REMOVED = os.getenv("MARK_REMOVED", "false").lower() == "true"
-FETCH_EXISTING = os.getenv("FETCH_EXISTING", "true").lower() == "true"
-
-MAX_WAIT = 60_000
+SCRAPER_NAME = os.getenv("SCRAPER_NAME", "orange_taxdeed")
+COUNTY = os.getenv("COUNTY", "Orange")
+STATE = os.getenv("STATE", "FL")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("orange-taxdeed-scraper")
-
-
-# =========================
-# CHECKPOINT
-# =========================
-def load_checkpoint() -> Dict:
-    if not os.path.exists(CHECKPOINT_FILE):
-        return {"cursor": 0, "last_run_at": None}
-    try:
-        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"cursor": 0, "last_run_at": None}
-
-
-def save_checkpoint(cp: Dict):
-    cp["last_run_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(cp, f, indent=2)
+log = logging.getLogger("taxdeed-scraper-batch")
 
 
 # =========================
 # HELPERS
 # =========================
+def now_utc():
+    return datetime.now(timezone.utc)
+
 def wait_network(page, timeout=20_000):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PWTimeout:
         pass
 
-
-def click_any(page, selectors: List[str], label: str) -> bool:
+def click_any(page, selectors: list[str], label: str) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -83,15 +66,12 @@ def click_any(page, selectors: List[str], label: str) -> bool:
             continue
     return False
 
-
 def norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
-
 
 def must_be_pdf(headers: dict) -> bool:
     ct = (headers.get("content-type") or "").lower()
     return "application/pdf" in ct or ct.endswith("/pdf")
-
 
 def normalize_bid_for_payload(v):
     if v is None:
@@ -102,93 +82,90 @@ def normalize_bid_for_payload(v):
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
     return cleaned if cleaned else None
 
+def api_headers():
+    return {"Authorization": f"Bearer {APP_API_TOKEN}"}
 
-# =========================
-# APP API HELPERS
-# =========================
-def app_headers():
-    return {"Authorization": f"Bearer {APP_API_TOKEN}"} if APP_API_TOKEN else {}
-
-
-def post_to_app_ingest(payload: dict) -> Optional[dict]:
+def api_post(path: str, payload: dict, timeout=30):
     if not SEND_TO_APP:
-        log.info("APP_API_BASE / APP_API_TOKEN not set → skipping send to app.")
-        return None
+        raise RuntimeError("APP_API_BASE / APP_API_TOKEN not set")
+    url = f"{APP_API_BASE}{path}"
+    r = requests.post(url, json=payload, headers=api_headers(), timeout=timeout)
+    return r
 
+def api_get(path: str, timeout=30):
+    if not SEND_TO_APP:
+        raise RuntimeError("APP_API_BASE / APP_API_TOKEN not set")
+    url = f"{APP_API_BASE}{path}"
+    r = requests.get(url, headers=api_headers(), timeout=timeout)
+    return r
+
+
+# =========================
+# APP INTEGRATIONS
+# =========================
+def get_state():
+    r = api_get(f"/api/scraper-state?scraper={SCRAPER_NAME}")
+    if r.status_code != 200:
+        raise RuntimeError(f"GET scraper-state failed: {r.status_code} {r.text[:200]}")
+    return r.json().get("data")
+
+def set_state(**kwargs):
+    payload = {"scraper": SCRAPER_NAME, **kwargs}
+    r = api_post("/api/scraper-state", payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"POST scraper-state failed: {r.status_code} {r.text[:200]}")
+    return r.json().get("data")
+
+def run_start(run_id: str, found_total: int):
+    payload = {"mode": "start", "scraper_name": SCRAPER_NAME, "run_id": run_id, "found_total": found_total}
+    r = api_post("/api/scraper-run", payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"run start failed: {r.status_code} {r.text[:200]}")
+
+def run_finish(run_id: str, **stats):
+    payload = {"mode": "finish", "scraper_name": SCRAPER_NAME, "run_id": run_id, **stats}
+    r = api_post("/api/scraper-run", payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"run finish failed: {r.status_code} {r.text[:200]}")
+
+def existence_check(nodes: list[str]) -> set[str]:
+    payload = {"county": COUNTY, "state": STATE, "nodes": nodes}
+    r = api_post("/api/existence-check", payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"existence-check failed: {r.status_code} {r.text[:200]}")
+    existing = r.json().get("existing") or []
+    return set(existing)
+
+def mark_removed(current_nodes: list[str]) -> int:
+    payload = {"county": COUNTY, "state": STATE, "current_nodes": current_nodes}
+    r = api_post("/api/mark-removed", payload)
+    if r.status_code != 200:
+        raise RuntimeError(f"mark-removed failed: {r.status_code} {r.text[:200]}")
+    return int(r.json().get("removed_marked") or 0)
+
+def post_to_ingest(payload: dict) -> dict | None:
     url = f"{APP_API_BASE}/api/ingest"
+    headers = api_headers()
     last_err = None
-
     for attempt in range(1, 4):
         try:
-            r = requests.post(url, json=payload, headers=app_headers(), timeout=40)
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
             log.info("INGEST attempt %d: %s", attempt, r.status_code)
-            snippet = (r.text or "")[:250].replace("\n", " ")
-            log.info("INGEST response: %s", snippet)
-
             if r.status_code in (200, 201):
                 return r.json()
-
             if r.status_code == 401:
-                log.error("INGEST unauthorized. Check APP_API_TOKEN == INGEST_API_TOKEN in Vercel.")
+                log.error("INGEST unauthorized (check APP_API_TOKEN matches Vercel INGEST_API_TOKEN).")
                 return None
-
             last_err = f"HTTP {r.status_code}: {r.text[:500]}"
         except Exception as e:
             last_err = str(e)
-
         time.sleep(1.0 * attempt)
-
     log.error("INGEST failed after retries: %s", last_err)
     return None
 
 
-def fetch_existing_nodes(limit=5000) -> List[str]:
-    """
-    Puxa lista de nodes do app para poder:
-    - não ficar reprocessando tudo
-    - marcar removidos (se MARK_REMOVED=true)
-    """
-    if not (APP_API_BASE and APP_API_TOKEN):
-        return []
-
-    url = f"{APP_API_BASE}/api/properties?limit={limit}"
-    try:
-        r = requests.get(url, headers=app_headers(), timeout=40)
-        if r.status_code != 200:
-            log.warning("fetch_existing_nodes HTTP %s", r.status_code)
-            return []
-        j = r.json()
-        items = j.get("data") or []
-        nodes = [it.get("node") for it in items if it.get("node")]
-        return nodes
-    except Exception as e:
-        log.warning("fetch_existing_nodes failed: %s", e)
-        return []
-
-
-def mark_removed_nodes(nodes_to_mark: List[str]):
-    """
-    Marca nós como status='removed' (precisa seu backend aceitar update por node ou ter endpoint).
-    Se você NÃO tiver endpoint pra isso, eu te passo abaixo a forma certa.
-    """
-    if not nodes_to_mark:
-        return
-
-    # Opção simples: reusar ingest com status=removed
-    # (porque o /api/ingest upsert por node)
-    for node in nodes_to_mark:
-        payload = {
-            "county": "Orange",
-            "state": "FL",
-            "node": node,
-            "status": "removed",
-            "notes": "Removed from source list (not found on latest scrape)."
-        }
-        post_to_app_ingest(payload)
-
-
 # =========================
-# TABLE PARSE
+# TABLE PARSE (Printable row text)
 # =========================
 def parse_fields_from_row_text(row_text: str) -> dict:
     txt = row_text
@@ -213,8 +190,7 @@ def parse_fields_from_row_text(row_text: str) -> dict:
         "applicant_name": applicant or None,
     }
 
-
-def extract_lots_from_printable(page) -> List[dict]:
+def extract_lots_from_printable(page) -> list[dict]:
     lots = []
     links = page.locator("a:has-text('Tax Sale')")
     total = links.count()
@@ -235,18 +211,17 @@ def extract_lots_from_printable(page) -> List[dict]:
         except Exception:
             row_text = ""
 
-        if node:
-            lots.append({
-                "node": node,
-                "tax_sale_url": full,
-                "row_text": norm_ws(row_text),
-            })
+        lots.append({
+            "node": node,
+            "tax_sale_url": full,
+            "row_text": norm_ws(row_text),
+        })
 
     return lots
 
 
 # =========================
-# PDF TEXT + OCR
+# PDF TEXT (fallback) + OCR
 # =========================
 def try_pdfplumber_text(pdf_bytes: bytes) -> str:
     try:
@@ -260,12 +235,10 @@ def try_pdfplumber_text(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
-
 def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> str:
     pdf = pypdfium2.PdfDocument(pdf_bytes)
     n_pages = len(pdf)
     pages_to_do = min(n_pages, max_pages)
-
     full_text = []
     for i in range(pages_to_do):
         page = pdf[i]
@@ -274,22 +247,16 @@ def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> s
         txt = pytesseract.image_to_string(img, config="--psm 6")
         if txt:
             full_text.append(txt)
-
     return "\n".join(full_text).strip()
 
-
-def _extract_street_before_city(block: str, city_match_start: int) -> Optional[str]:
+def _extract_street_before_city(block: str, city_match_start: int) -> str | None:
     before = block[:city_match_start]
     lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
     return lines[-1] if lines else None
 
-
 def parse_best_address_from_text(text: str) -> dict:
     if not text:
-        return {
-            "address": None, "city": None, "state": None, "zip": None,
-            "marker_used": None, "marker_found": False, "snippet": ""
-        }
+        return {"address": None, "city": None, "state": None, "zip": None, "marker_used": None, "marker_found": False, "snippet": ""}
 
     markers = [
         ("ADDRESS_ON_RECORD", r"ADDRESS\s+ON\s+RECORD\s+ON\s+CURRENT\s+TAX\s+ROLL\s*[:\-]?"),
@@ -303,7 +270,6 @@ def parse_best_address_from_text(text: str) -> dict:
             continue
 
         after = text[mm.end():].strip()
-
         mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", after, re.I)
         if not mcity:
             continue
@@ -316,15 +282,12 @@ def parse_best_address_from_text(text: str) -> dict:
             "zip": mcity.group(3),
             "marker_used": marker_name,
             "marker_found": True,
-            "snippet": after[:700]
+            "snippet": after[:700],
         }
 
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
-        return {
-            "address": None, "city": None, "state": None, "zip": None,
-            "marker_used": None, "marker_found": False, "snippet": text[:900]
-        }
+        return {"address": None, "city": None, "state": None, "zip": None, "marker_used": None, "marker_found": False, "snippet": text[:900]}
 
     street = _extract_street_before_city(text, mcity.start())
     return {
@@ -334,7 +297,7 @@ def parse_best_address_from_text(text: str) -> dict:
         "zip": mcity.group(3),
         "marker_used": "FALLBACK_FIRST_MATCH",
         "marker_found": True,
-        "snippet": text[max(0, mcity.start()-250):mcity.end()+250]
+        "snippet": text[max(0, mcity.start()-250):mcity.end()+250],
     }
 
 
@@ -342,16 +305,22 @@ def parse_best_address_from_text(text: str) -> dict:
 # MAIN
 # =========================
 def run():
-    cp = load_checkpoint()
-    cursor = int(cp.get("cursor", 0))
+    log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE if APP_API_BASE else "(empty)")
+    if not SEND_TO_APP:
+        raise RuntimeError("Set APP_API_BASE + APP_API_TOKEN in GitHub Secrets to enable app sync.")
 
-    log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE or "(empty)")
-    log.info("Checkpoint cursor=%s BATCH_SIZE=%s MAX_TOTAL=%s", cursor, BATCH_SIZE, MAX_TOTAL)
+    # 0) Check memory (pause logic)
+    state = get_state()
+    if state:
+        done = bool(state.get("done_for_today"))
+        resume_after = state.get("resume_after")
+        if done and resume_after:
+            ra = datetime.fromisoformat(resume_after.replace("Z", "+00:00"))
+            if now_utc() < ra:
+                log.info("Done for today. Resume after: %s. Exiting.", resume_after)
+                return
 
-    existing_nodes = []
-    if FETCH_EXISTING:
-        existing_nodes = fetch_existing_nodes()
-        log.info("Existing nodes fetched from app: %d", len(existing_nodes))
+    run_id = f"{SCRAPER_NAME}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -370,7 +339,7 @@ def run():
         ], "I Acknowledge")
         wait_network(page)
 
-        # 2) Search
+        # 2) Search page
         log.info("OPEN SEARCH: %s", SEARCH_URL)
         page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
         wait_network(page)
@@ -413,38 +382,64 @@ def run():
         if DEBUG_HTML:
             log.info("Printable HTML length: %d", len(page.content()))
 
-        # 3) Extract ALL lots
+        # 3) Extract all lots on printable
         lots = extract_lots_from_printable(page)
+        lots = [l for l in lots if l.get("node")]
         if not lots:
             log.error("No lots found on printable page.")
             browser.close()
             return
 
-        # Optional: compare for removed nodes
-        current_nodes = [l["node"] for l in lots if l.get("node")]
-        if MARK_REMOVED and existing_nodes:
-            removed = sorted(list(set(existing_nodes) - set(current_nodes)))
-            log.info("Nodes removed from source (will mark removed): %d", len(removed))
-            # cuidado: isso pode ser muito grande. Recomendo limitar por batch em produção.
-            mark_removed_nodes(removed)
+        # Apply MAX_LOTS cap only to the list (optional)
+        if MAX_LOTS and len(lots) > MAX_LOTS:
+            lots = lots[:MAX_LOTS]
 
-        total_lots = len(lots)
-        log.info("Total lots available: %d", total_lots)
+        found_total = len(lots)
+        run_start(run_id, found_total=found_total)
 
-        # 4) Select batch by cursor
-        start = cursor
-        end = min(cursor + BATCH_SIZE, total_lots)
-        batch = lots[start:end]
+        # 4) mark removed (optional) using full current node list
+        removed_marked = 0
+        if MARK_REMOVED:
+            try:
+                current_nodes = [l["node"] for l in lots if l.get("node")]
+                removed_marked = mark_removed(current_nodes)
+                log.info("Removed marked: %d", removed_marked)
+            except Exception as e:
+                log.warning("mark_removed failed (non-fatal): %s", str(e))
 
+        # 5) Determine which nodes already exist
+        all_nodes = [l["node"] for l in lots]
+        existing = existence_check(all_nodes)
+
+        new_lots = [l for l in lots if l["node"] not in existing]
+        log.info("Existing: %d | New candidates: %d", len(existing), len(new_lots))
+
+        # 6) Batch select (BATCH_SIZE)
+        batch = new_lots[:BATCH_SIZE]
         if not batch:
-            log.info("No batch to process (cursor beyond end). Resetting cursor to 0.")
-            cp["cursor"] = 0
-            save_checkpoint(cp)
+            # DONE: no new items
+            resume_after = (now_utc() + timedelta(hours=PAUSE_HOURS_ON_DONE)).isoformat()
+            set_state(
+                last_run_id=run_id,
+                last_run_at=now_utc().isoformat(),
+                done_for_today=True,
+                resume_after=resume_after,
+                last_tax_sale_id=None,
+                last_node=None,
+            )
+            run_finish(run_id, status="done", message="No new lots. Pausing.", processed=0, inserted=0, updated=0, skipped=0, removed_marked=removed_marked, found_total=found_total)
+            log.info("No new lots. Pause until %s", resume_after)
             browser.close()
             return
 
-        # Limit total processing if MAX_TOTAL set
-        processed_total = 0
+        # 7) Process batch
+        inserted = 0
+        updated = 0
+        skipped = 0
+        processed = 0
+
+        last_tax_sale_id = None
+        last_node = None
 
         for idx, lot in enumerate(batch, start=1):
             node = lot["node"]
@@ -454,6 +449,7 @@ def run():
             fields = parse_fields_from_row_text(row_text)
 
             log.info("----- BATCH LOT %d/%d node=%s -----", idx, len(batch), node)
+            log.info("Row text: %s", row_text[:220])
 
             try:
                 # Open viewer
@@ -470,21 +466,22 @@ def run():
                     href_pdf = m.group(1) if m else None
 
                 if not href_pdf:
-                    log.error("PDF link not found for node=%s", node)
+                    log.error("PDF link not found in viewer for node=%s", node)
+                    skipped += 1
                     continue
 
                 pdf_url = urljoin(viewer_url, href_pdf)
 
-                # Download PDF (Playwright request)
+                # Download PDF
                 pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
-
                 if not pdf_resp.ok or not must_be_pdf(pdf_resp.headers):
-                    log.error("PDF download failed node=%s status=%s", node, pdf_resp.status)
+                    log.error("PDF download failed or not PDF for node=%s status=%s", node, pdf_resp.status)
+                    skipped += 1
                     continue
 
                 pdf_bytes = pdf_resp.body()
 
-                # Extract address
+                # Extract address: text -> OCR (3 pages)
                 text = try_pdfplumber_text(pdf_bytes)
                 if text:
                     addr = parse_best_address_from_text(text)
@@ -497,54 +494,76 @@ def run():
                     notes = "Address marker not found via OCR first 3 pages."
 
                 payload = {
-                    "county": "Orange",
-                    "state": "FL",
+                    "county": COUNTY,
+                    "state": STATE,
                     "node": node,
+
                     "tax_sale_id": fields.get("tax_sale_id"),
                     "parcel_number": fields.get("parcel_number"),
                     "sale_date": fields.get("sale_date"),
                     "opening_bid": normalize_bid_for_payload(fields.get("opening_bid")),
                     "deed_status": fields.get("deed_status"),
                     "applicant_name": fields.get("applicant_name"),
+
                     "pdf_url": pdf_url,
                     "address": addr.get("address"),
                     "city": addr.get("city"),
                     "state_address": addr.get("state"),
                     "zip": addr.get("zip"),
                     "address_source_marker": addr.get("marker_used"),
+
                     "status": "new",
                     "notes": notes,
                 }
 
-                # Send
-                ingest_result = post_to_app_ingest(payload)
-                if ingest_result:
-                    log.info("INGEST OK node=%s => %s", node, ingest_result)
+                # Send to app ingest
+                ingest_result = post_to_ingest(payload)
+                processed += 1
+
+                if ingest_result and ingest_result.get("action") == "created":
+                    inserted += 1
+                elif ingest_result and ingest_result.get("action") == "updated":
+                    updated += 1
+
+                # update checkpoint (memory)
+                last_tax_sale_id = fields.get("tax_sale_id")
+                last_node = node
 
             except Exception as e:
                 log.exception("LOT FAILED node=%s error=%s", node, str(e))
+                skipped += 1
 
             finally:
-                # back to printable (stability)
+                # return printable to keep session stable
                 page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                 wait_network(page, 30_000)
-                time.sleep(0.8)
+                time.sleep(1.0)
 
-            processed_total += 1
-            if MAX_TOTAL and processed_total >= MAX_TOTAL:
-                log.info("Reached MAX_TOTAL=%d; stopping early.", MAX_TOTAL)
-                break
+        # 8) Save memory / state
+        set_state(
+            last_tax_sale_id=last_tax_sale_id,
+            last_node=last_node,
+            last_run_id=run_id,
+            last_run_at=now_utc().isoformat(),
+            done_for_today=False,
+            resume_after=None,
+        )
 
-        # 5) Advance cursor and save checkpoint
-        new_cursor = end
-        if new_cursor >= total_lots:
-            # done: reset cursor to 0 for next cycle
-            new_cursor = 0
+        run_finish(
+            run_id,
+            status="ok",
+            message=f"Processed batch={len(batch)}",
+            found_total=found_total,
+            processed=processed,
+            inserted=inserted,
+            updated=updated,
+            skipped=skipped,
+            removed_marked=removed_marked,
+        )
 
-        cp["cursor"] = new_cursor
-        save_checkpoint(cp)
+        log.info("DONE batch. processed=%d inserted=%d updated=%d skipped=%d removed_marked=%d",
+                 processed, inserted, updated, skipped, removed_marked)
 
-        log.info("DONE batch. cursor moved %d -> %d", cursor, new_cursor)
         browser.close()
 
 
