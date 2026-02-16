@@ -1,6 +1,11 @@
 playwright==1.50.0
-pdfplumber==0.11.5
+
 requests==2.32.3
+
+pdfplumber==0.11.5
 pypdfium2==4.30.0
-pytesseract==0.3.10
-pillow==10.2.0
+
+pillow==10.3.0
+pytesseract==0.3.13
+
+python-dotenv==1.0.1
