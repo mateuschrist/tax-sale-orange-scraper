@@ -1,14 +1,32 @@
-name: Run TaxDeed Scraper
+name: Run TaxDeed Scraper (Orange)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      max_lots:
+        description: "How many lots to process this run"
+        required: false
+        default: "10"
+      headless:
+        description: "Run browser headless"
+        required: false
+        default: "true"
+      debug_html:
+        description: "Save debug HTML logs"
+        required: false
+        default: "false"
+
   schedule:
-    - cron: "0 11 * * *" # todo dia 11:00 UTC (ajuste depois)
+    - cron: "*/10 * * * *" # every 10 minutes (UTC)
+
+concurrency:
+  group: taxdeed-scraper-orange
+  cancel-in-progress: true
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repo
@@ -34,11 +52,24 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper
+      - name: Run scraper (save logs)
         env:
-          HEADLESS: "true"
-          MAX_LOTS: "3"
+          HEADLESS: ${{ github.event.inputs.headless || 'true' }}
+          MAX_LOTS: ${{ github.event.inputs.max_lots || '10' }}
+          DEBUG_HTML: ${{ github.event.inputs.debug_html || 'false' }}
+
+          # App/API (Vercel)
           APP_API_BASE: ${{ secrets.APP_API_BASE }}
           APP_API_TOKEN: ${{ secrets.APP_API_TOKEN }}
+
         run: |
-          python scraper.py
+          mkdir -p logs
+          python scraper.py 2>&1 | tee logs/run-$(date -u +"%Y%m%d-%H%M%S").log
+
+      - name: Upload logs (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-logs
+          path: logs/*.log
+          retention-days: 7
