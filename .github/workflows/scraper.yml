@@ -37,7 +37,7 @@ jobs:
       - name: Run scraper
         env:
           HEADLESS: "true"
-          MAX_LOTS: "100"
+          MAX_LOTS: "3"
           APP_API_BASE: ${{ secrets.APP_API_BASE }}
           APP_API_TOKEN: ${{ secrets.APP_API_TOKEN }}
         run: |
