@@ -523,6 +523,8 @@ def run():
                     "state": "FL",
                     "node": node,
 
+                    "auction_source_url": viewer_url,
+
                     "tax_sale_id": fields.get("tax_sale_id") or None,
                     "parcel_number": fields.get("parcel_number") or None,
                     "sale_date": fields.get("sale_date") or None,
