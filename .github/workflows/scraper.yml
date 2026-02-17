@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "*/10 * * * *" # a cada 10 min (UTC)
 
+concurrency:
+  group: taxdeed-scraper
+  cancel-in-progress: true
+
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
@@ -37,13 +41,29 @@ jobs:
       - name: Run scraper
         env:
           HEADLESS: "true"
+
+          # batching / throttling
           BATCH_SIZE: "10"
           PAUSE_HOURS_ON_DONE: "20"
+
+          # change detection
           MARK_REMOVED: "true"
+
+          # identity / scope
           SCRAPER_NAME: "orange_taxdeed"
           COUNTY: "Orange"
           STATE: "FL"
+
+          # App ingest (Vercel)
           APP_API_BASE: ${{ secrets.APP_API_BASE }}
           APP_API_TOKEN: ${{ secrets.APP_API_TOKEN }}
+
+          # State storage (Supabase) - necessário p/ "memória"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          # opcional (se seu scraper usar uma chave pra state por county)
+          STATE_KEY: "orange_taxdeed"
+
         run: |
           python scraper.py
