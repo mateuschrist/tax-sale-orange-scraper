@@ -4,7 +4,6 @@ import json
 import time
 import logging
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import pdfplumber
@@ -21,38 +20,40 @@ LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-MAX_LOTS = int(os.getenv("MAX_LOTS", "99999"))  # agora é "limite de captura" (a lista), mas batch controla o processado
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
-PAUSE_HOURS_ON_DONE = int(os.getenv("PAUSE_HOURS_ON_DONE", "20"))
-MARK_REMOVED = os.getenv("MARK_REMOVED", "true").lower() == "true"
-
+MAX_LOTS = int(os.getenv("MAX_LOTS", "10"))  # pode aumentar
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
-MAX_WAIT = 60_000
 
-# App/API (Vercel)
+# App/API (Vercel) ingest
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
-SCRAPER_NAME = os.getenv("SCRAPER_NAME", "orange_taxdeed")
-COUNTY = os.getenv("COUNTY", "Orange")
-STATE = os.getenv("STATE", "FL")
+# Supabase state (memory)
+SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+STATE_KEY = (os.getenv("STATE_KEY", "orange_taxdeed") or "orange_taxdeed").strip()
+USE_STATE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+# Behavior
+START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "true").lower() == "true"
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "3"))
+OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
+
+MAX_WAIT = 60_000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("taxdeed-scraper-batch")
+log = logging.getLogger("taxdeed-orange-scraper")
 
 
 # =========================
-# HELPERS
+# PLAYWRIGHT HELPERS
 # =========================
-def now_utc():
-    return datetime.now(timezone.utc)
-
 def wait_network(page, timeout=20_000):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PWTimeout:
         pass
+
 
 def click_any(page, selectors: list[str], label: str) -> bool:
     for sel in selectors:
@@ -66,14 +67,77 @@ def click_any(page, selectors: list[str], label: str) -> bool:
             continue
     return False
 
+
 def norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
 
 def must_be_pdf(headers: dict) -> bool:
     ct = (headers.get("content-type") or "").lower()
     return "application/pdf" in ct or ct.endswith("/pdf")
 
+
+# =========================
+# SUPABASE STATE (memory)
+# =========================
+def _sb_headers():
+    if not USE_STATE:
+        raise RuntimeError("Supabase state disabled (missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY).")
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation,resolution=merge-duplicates",
+    }
+
+
+def get_state_last_node() -> str | None:
+    """
+    Reads last_node from scraper_state table.
+    Table schema:
+      id text primary key,
+      last_node text,
+      updated_at timestamptz default now()
+    """
+    if not USE_STATE:
+        return None
+
+    url = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}&select=last_node"
+    r = requests.get(url, headers=_sb_headers(), timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"GET scraper_state failed: {r.status_code} {r.text[:200]}")
+    arr = r.json()
+    if not arr:
+        return None
+    return arr[0].get("last_node")
+
+
+def set_state_last_node(last_node: str | None) -> None:
+    """Upserts last_node in scraper_state."""
+    if not USE_STATE:
+        return
+
+    # POST upsert into scraper_state
+    url = f"{SUPABASE_URL}/rest/v1/scraper_state"
+    payload = {"id": STATE_KEY, "last_node": last_node}
+    r = requests.post(url, headers=_sb_headers(), json=payload, timeout=30)
+
+    # Supabase REST returns 201/200 for insert/upsert; some projects may return 204 for upsert
+    if r.status_code in (200, 201, 204):
+        return
+
+    # fallback: PATCH by id
+    url2 = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}"
+    r2 = requests.patch(url2, headers=_sb_headers(), json={"last_node": last_node}, timeout=30)
+    if r2.status_code not in (200, 204):
+        raise RuntimeError(f"SET scraper_state failed: {r.status_code} {r.text[:200]} / PATCH {r2.status_code} {r2.text[:200]}")
+
+
+# =========================
+# APP INGEST (Vercel)
+# =========================
 def normalize_bid_for_payload(v):
+    """Send as string without commas (backend normalizes too)."""
     if v is None:
         return None
     s = str(v).strip()
@@ -82,84 +146,38 @@ def normalize_bid_for_payload(v):
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
     return cleaned if cleaned else None
 
-def api_headers():
-    return {"Authorization": f"Bearer {APP_API_TOKEN}"}
 
-def api_post(path: str, payload: dict, timeout=30):
+def post_to_app(payload: dict) -> dict | None:
+    """POST payload to Vercel ingest endpoint. Retries lightly."""
     if not SEND_TO_APP:
-        raise RuntimeError("APP_API_BASE / APP_API_TOKEN not set")
-    url = f"{APP_API_BASE}{path}"
-    r = requests.post(url, json=payload, headers=api_headers(), timeout=timeout)
-    return r
+        log.info("APP_API_BASE / APP_API_TOKEN not set → skipping send to app.")
+        return None
 
-def api_get(path: str, timeout=30):
-    if not SEND_TO_APP:
-        raise RuntimeError("APP_API_BASE / APP_API_TOKEN not set")
-    url = f"{APP_API_BASE}{path}"
-    r = requests.get(url, headers=api_headers(), timeout=timeout)
-    return r
-
-
-# =========================
-# APP INTEGRATIONS
-# =========================
-def get_state():
-    r = api_get(f"/api/scraper-state?scraper={SCRAPER_NAME}")
-    if r.status_code != 200:
-        raise RuntimeError(f"GET scraper-state failed: {r.status_code} {r.text[:200]}")
-    return r.json().get("data")
-
-def set_state(**kwargs):
-    payload = {"scraper": SCRAPER_NAME, **kwargs}
-    r = api_post("/api/scraper-state", payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"POST scraper-state failed: {r.status_code} {r.text[:200]}")
-    return r.json().get("data")
-
-def run_start(run_id: str, found_total: int):
-    payload = {"mode": "start", "scraper_name": SCRAPER_NAME, "run_id": run_id, "found_total": found_total}
-    r = api_post("/api/scraper-run", payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"run start failed: {r.status_code} {r.text[:200]}")
-
-def run_finish(run_id: str, **stats):
-    payload = {"mode": "finish", "scraper_name": SCRAPER_NAME, "run_id": run_id, **stats}
-    r = api_post("/api/scraper-run", payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"run finish failed: {r.status_code} {r.text[:200]}")
-
-def existence_check(nodes: list[str]) -> set[str]:
-    payload = {"county": COUNTY, "state": STATE, "nodes": nodes}
-    r = api_post("/api/existence-check", payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"existence-check failed: {r.status_code} {r.text[:200]}")
-    existing = r.json().get("existing") or []
-    return set(existing)
-
-def mark_removed(current_nodes: list[str]) -> int:
-    payload = {"county": COUNTY, "state": STATE, "current_nodes": current_nodes}
-    r = api_post("/api/mark-removed", payload)
-    if r.status_code != 200:
-        raise RuntimeError(f"mark-removed failed: {r.status_code} {r.text[:200]}")
-    return int(r.json().get("removed_marked") or 0)
-
-def post_to_ingest(payload: dict) -> dict | None:
     url = f"{APP_API_BASE}/api/ingest"
-    headers = api_headers()
+    headers = {"Authorization": f"Bearer {APP_API_TOKEN}"}
+
     last_err = None
     for attempt in range(1, 4):
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=30)
             log.info("INGEST attempt %d: %s", attempt, r.status_code)
+
+            snippet = (r.text or "")[:250].replace("\n", " ")
+            log.info("INGEST response snippet: %s", snippet)
+
             if r.status_code in (200, 201):
                 return r.json()
+
             if r.status_code == 401:
-                log.error("INGEST unauthorized (check APP_API_TOKEN matches Vercel INGEST_API_TOKEN).")
+                log.error("INGEST unauthorized → check APP_API_TOKEN == Vercel INGEST_API_TOKEN.")
                 return None
+
             last_err = f"HTTP {r.status_code}: {r.text[:500]}"
         except Exception as e:
             last_err = str(e)
+
         time.sleep(1.0 * attempt)
+
     log.error("INGEST failed after retries: %s", last_err)
     return None
 
@@ -182,13 +200,14 @@ def parse_fields_from_row_text(row_text: str) -> dict:
     applicant = pick(r"Applicant Name:\s*(.+?)(?:\s+Status:|$)")
 
     return {
-        "tax_sale_id": tax_sale_id or None,
-        "sale_date": sale_date or None,
-        "deed_status": status or None,
-        "parcel_number": parcel or None,
-        "opening_bid": min_bid or None,
-        "applicant_name": applicant or None,
+        "tax_sale_id": tax_sale_id,
+        "sale_date": sale_date,
+        "deed_status": status,
+        "parcel_number": parcel,
+        "opening_bid": min_bid,
+        "applicant_name": applicant,
     }
+
 
 def extract_lots_from_printable(page) -> list[dict]:
     lots = []
@@ -217,13 +236,14 @@ def extract_lots_from_printable(page) -> list[dict]:
             "row_text": norm_ws(row_text),
         })
 
-    return lots
+    return [l for l in lots if l.get("node")]
 
 
 # =========================
-# PDF TEXT (fallback) + OCR
+# PDF TEXT + OCR (first N pages)
 # =========================
 def try_pdfplumber_text(pdf_bytes: bytes) -> str:
+    """If PDF has embedded text, extract it."""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             parts = []
@@ -235,10 +255,16 @@ def try_pdfplumber_text(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
+
 def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> str:
+    """
+    OCR first N pages using pypdfium2.page.render() (compatible).
+    Some lots have the address on page 2 or 3.
+    """
     pdf = pypdfium2.PdfDocument(pdf_bytes)
     n_pages = len(pdf)
     pages_to_do = min(n_pages, max_pages)
+
     full_text = []
     for i in range(pages_to_do):
         page = pdf[i]
@@ -247,16 +273,29 @@ def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> s
         txt = pytesseract.image_to_string(img, config="--psm 6")
         if txt:
             full_text.append(txt)
+
     return "\n".join(full_text).strip()
+
 
 def _extract_street_before_city(block: str, city_match_start: int) -> str | None:
     before = block[:city_match_start]
     lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
     return lines[-1] if lines else None
 
+
 def parse_best_address_from_text(text: str) -> dict:
+    """
+    Priority markers:
+    1) ADDRESS ON RECORD ON CURRENT TAX ROLL (physical property address)
+    2) PHYSICAL ADDRESS
+    3) TITLE HOLDER AND ADDRESS OF RECORD (owner mailing)
+    Fallback: first City, ST ZIP found.
+    """
     if not text:
-        return {"address": None, "city": None, "state": None, "zip": None, "marker_used": None, "marker_found": False, "snippet": ""}
+        return {
+            "address": None, "city": None, "state": None, "zip": None,
+            "marker_used": None, "marker_found": False, "snippet": ""
+        }
 
     markers = [
         ("ADDRESS_ON_RECORD", r"ADDRESS\s+ON\s+RECORD\s+ON\s+CURRENT\s+TAX\s+ROLL\s*[:\-]?"),
@@ -270,24 +309,33 @@ def parse_best_address_from_text(text: str) -> dict:
             continue
 
         after = text[mm.end():].strip()
+
         mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", after, re.I)
         if not mcity:
             continue
 
         street = _extract_street_before_city(after, mcity.start())
+        city = mcity.group(1).title().strip()
+        state = mcity.group(2).upper()
+        zipc = mcity.group(3)
+
         return {
             "address": street,
-            "city": mcity.group(1).title().strip(),
-            "state": mcity.group(2).upper(),
-            "zip": mcity.group(3),
+            "city": city,
+            "state": state,
+            "zip": zipc,
             "marker_used": marker_name,
             "marker_found": True,
-            "snippet": after[:700],
+            "snippet": after[:700]
         }
 
+    # Fallback: first City, ST ZIP anywhere
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
-        return {"address": None, "city": None, "state": None, "zip": None, "marker_used": None, "marker_found": False, "snippet": text[:900]}
+        return {
+            "address": None, "city": None, "state": None, "zip": None,
+            "marker_used": None, "marker_found": False, "snippet": text[:900]
+        }
 
     street = _extract_street_before_city(text, mcity.start())
     return {
@@ -297,7 +345,7 @@ def parse_best_address_from_text(text: str) -> dict:
         "zip": mcity.group(3),
         "marker_used": "FALLBACK_FIRST_MATCH",
         "marker_found": True,
-        "snippet": text[max(0, mcity.start()-250):mcity.end()+250],
+        "snippet": text[max(0, mcity.start()-250):mcity.end()+250]
     }
 
 
@@ -306,21 +354,15 @@ def parse_best_address_from_text(text: str) -> dict:
 # =========================
 def run():
     log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE if APP_API_BASE else "(empty)")
-    if not SEND_TO_APP:
-        raise RuntimeError("Set APP_API_BASE + APP_API_TOKEN in GitHub Secrets to enable app sync.")
+    log.info("USE_STATE=%s STATE_KEY=%s", USE_STATE, STATE_KEY)
 
-    # 0) Check memory (pause logic)
-    state = get_state()
-    if state:
-        done = bool(state.get("done_for_today"))
-        resume_after = state.get("resume_after")
-        if done and resume_after:
-            ra = datetime.fromisoformat(resume_after.replace("Z", "+00:00"))
-            if now_utc() < ra:
-                log.info("Done for today. Resume after: %s. Exiting.", resume_after)
-                return
-
-    run_id = f"{SCRAPER_NAME}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
+    last_node = None
+    if USE_STATE:
+        try:
+            last_node = get_state_last_node()
+            log.info("STATE last_node=%s", last_node)
+        except Exception as e:
+            log.warning("STATE read failed (continuing without state): %s", str(e))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -382,84 +424,45 @@ def run():
         if DEBUG_HTML:
             log.info("Printable HTML length: %d", len(page.content()))
 
-        # 3) Extract all lots on printable
+        # 3) Capture lots once (avoid stale locators)
         lots = extract_lots_from_printable(page)
-        lots = [l for l in lots if l.get("node")]
         if not lots:
             log.error("No lots found on printable page.")
             browser.close()
             return
 
-        # Apply MAX_LOTS cap only to the list (optional)
-        if MAX_LOTS and len(lots) > MAX_LOTS:
-            lots = lots[:MAX_LOTS]
+        # If we have last_node and want to continue after it, slice list
+        if START_AFTER_LAST_NODE and last_node:
+            pos = next((i for i, l in enumerate(lots) if l["node"] == last_node), None)
+            if pos is not None:
+                lots = lots[pos + 1 :]
+                log.info("Continuing AFTER last_node. Remaining lots=%d", len(lots))
+            else:
+                log.info("last_node not found in current list → processing from top.")
 
-        found_total = len(lots)
-        run_start(run_id, found_total=found_total)
+        selected = lots[:MAX_LOTS]
+        log.info("Selected lots: %s", [l["node"] for l in selected])
 
-        # 4) mark removed (optional) using full current node list
-        removed_marked = 0
-        if MARK_REMOVED:
-            try:
-                current_nodes = [l["node"] for l in lots if l.get("node")]
-                removed_marked = mark_removed(current_nodes)
-                log.info("Removed marked: %d", removed_marked)
-            except Exception as e:
-                log.warning("mark_removed failed (non-fatal): %s", str(e))
-
-        # 5) Determine which nodes already exist
-        all_nodes = [l["node"] for l in lots]
-        existing = existence_check(all_nodes)
-
-        new_lots = [l for l in lots if l["node"] not in existing]
-        log.info("Existing: %d | New candidates: %d", len(existing), len(new_lots))
-
-        # 6) Batch select (BATCH_SIZE)
-        batch = new_lots[:BATCH_SIZE]
-        if not batch:
-            # DONE: no new items
-            resume_after = (now_utc() + timedelta(hours=PAUSE_HOURS_ON_DONE)).isoformat()
-            set_state(
-                last_run_id=run_id,
-                last_run_at=now_utc().isoformat(),
-                done_for_today=True,
-                resume_after=resume_after,
-                last_tax_sale_id=None,
-                last_node=None,
-            )
-            run_finish(run_id, status="done", message="No new lots. Pausing.", processed=0, inserted=0, updated=0, skipped=0, removed_marked=removed_marked, found_total=found_total)
-            log.info("No new lots. Pause until %s", resume_after)
-            browser.close()
-            return
-
-        # 7) Process batch
-        inserted = 0
-        updated = 0
-        skipped = 0
-        processed = 0
-
-        last_tax_sale_id = None
-        last_node = None
-
-        for idx, lot in enumerate(batch, start=1):
+        for idx, lot in enumerate(selected, start=1):
             node = lot["node"]
             row_text = lot["row_text"]
             tax_sale_url = lot["tax_sale_url"]
-
             fields = parse_fields_from_row_text(row_text)
 
-            log.info("----- BATCH LOT %d/%d node=%s -----", idx, len(batch), node)
+            log.info("----- LOT %d/%d node=%s -----", idx, len(selected), node)
             log.info("Row text: %s", row_text[:220])
 
             try:
-                # Open viewer
+                # 4) Open viewer
                 page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                 wait_network(page)
                 viewer_url = page.url
+                log.info("Viewer URL: %s", viewer_url)
 
-                # Find PDF link
+                # 5) Find PDF link inside viewer
                 pdf_a = page.locator("a[href*='Property_Information.pdf']")
                 href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
+
                 if not href_pdf:
                     viewer_html = page.content()
                     m = re.search(r'href="([^"]*Property_Information\.pdf[^"]*)"', viewer_html, re.I)
@@ -467,43 +470,65 @@ def run():
 
                 if not href_pdf:
                     log.error("PDF link not found in viewer for node=%s", node)
-                    skipped += 1
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
                     continue
 
                 pdf_url = urljoin(viewer_url, href_pdf)
+                log.info("PDF URL: %s", pdf_url)
 
-                # Download PDF
+                # 6) Download PDF
                 pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
-                if not pdf_resp.ok or not must_be_pdf(pdf_resp.headers):
-                    log.error("PDF download failed or not PDF for node=%s status=%s", node, pdf_resp.status)
-                    skipped += 1
+                log.info("PDF HTTP status: %s", pdf_resp.status)
+                log.info("PDF content-type: %s", pdf_resp.headers.get("content-type"))
+
+                if not pdf_resp.ok:
+                    preview = (pdf_resp.text() or "")[:600]
+                    log.error("PDF download failed preview:\n%s", preview)
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
+                    continue
+
+                if not must_be_pdf(pdf_resp.headers):
+                    preview = (pdf_resp.text() or "")[:800]
+                    log.error("Response is not PDF preview:\n%s", preview)
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
                     continue
 
                 pdf_bytes = pdf_resp.body()
+                log.info("PDF bytes: %d", len(pdf_bytes))
 
-                # Extract address: text -> OCR (3 pages)
+                # 7) Extract address: text -> OCR (first N pages)
                 text = try_pdfplumber_text(pdf_bytes)
+                raw_text_for_debug = None
+
                 if text:
+                    log.info("pdfplumber text length: %d (using text parse)", len(text))
                     addr = parse_best_address_from_text(text)
+                    raw_text_for_debug = text
                 else:
-                    ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=3, scale=2.2)
+                    log.info("pdfplumber returned empty. Running OCR on FIRST %d pages...", OCR_MAX_PAGES)
+                    ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
+                    log.info("OCR text length: %d", len(ocr_text))
                     addr = parse_best_address_from_text(ocr_text)
+                    raw_text_for_debug = ocr_text
 
                 notes = None
                 if not addr.get("marker_found"):
-                    notes = "Address marker not found via OCR first 3 pages."
+                    notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
 
                 payload = {
-                    "county": COUNTY,
-                    "state": STATE,
+                    "county": "Orange",
+                    "state": "FL",
                     "node": node,
 
-                    "tax_sale_id": fields.get("tax_sale_id"),
-                    "parcel_number": fields.get("parcel_number"),
-                    "sale_date": fields.get("sale_date"),
+                    "tax_sale_id": fields.get("tax_sale_id") or None,
+                    "parcel_number": fields.get("parcel_number") or None,
+                    "sale_date": fields.get("sale_date") or None,
                     "opening_bid": normalize_bid_for_payload(fields.get("opening_bid")),
-                    "deed_status": fields.get("deed_status"),
-                    "applicant_name": fields.get("applicant_name"),
+                    "deed_status": fields.get("deed_status") or None,
+                    "applicant_name": fields.get("applicant_name") or None,
 
                     "pdf_url": pdf_url,
                     "address": addr.get("address"),
@@ -514,56 +539,45 @@ def run():
 
                     "status": "new",
                     "notes": notes,
+                    # opcional futuro:
+                    # "raw_ocr_text": raw_text_for_debug
                 }
 
-                # Send to app ingest
-                ingest_result = post_to_ingest(payload)
-                processed += 1
+                print("\n" + "=" * 100)
+                print(f"RESULT LOT {idx}")
+                print("=" * 100)
+                print(json.dumps(payload, indent=2))
 
-                if ingest_result and ingest_result.get("action") == "created":
-                    inserted += 1
-                elif ingest_result and ingest_result.get("action") == "updated":
-                    updated += 1
+                if not addr.get("marker_found"):
+                    log.warning("Address marker not found. Snippet:\n%s", addr.get("snippet", "")[:900])
 
-                # update checkpoint (memory)
-                last_tax_sale_id = fields.get("tax_sale_id")
-                last_node = node
+                # 8) Send to app
+                ingest_ok = True
+                ingest_result = None
+                if SEND_TO_APP:
+                    ingest_result = post_to_app(payload)
+                    ingest_ok = bool(ingest_result)
+
+                if ingest_result:
+                    log.info("INGEST OK: %s", ingest_result)
+
+                # 9) Update state only when ingest ok (or when SEND_TO_APP disabled)
+                if ingest_ok:
+                    try:
+                        set_state_last_node(node)
+                        log.info("STATE updated last_node=%s", node)
+                    except Exception as e:
+                        log.warning("STATE write failed: %s", str(e))
 
             except Exception as e:
                 log.exception("LOT FAILED node=%s error=%s", node, str(e))
-                skipped += 1
 
-            finally:
-                # return printable to keep session stable
-                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page, 30_000)
-                time.sleep(1.0)
+            # back to printable
+            page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+            wait_network(page, 30_000)
+            time.sleep(1.0)
 
-        # 8) Save memory / state
-        set_state(
-            last_tax_sale_id=last_tax_sale_id,
-            last_node=last_node,
-            last_run_id=run_id,
-            last_run_at=now_utc().isoformat(),
-            done_for_today=False,
-            resume_after=None,
-        )
-
-        run_finish(
-            run_id,
-            status="ok",
-            message=f"Processed batch={len(batch)}",
-            found_total=found_total,
-            processed=processed,
-            inserted=inserted,
-            updated=updated,
-            skipped=skipped,
-            removed_marked=removed_marked,
-        )
-
-        log.info("DONE batch. processed=%d inserted=%d updated=%d skipped=%d removed_marked=%d",
-                 processed, inserted, updated, skipped, removed_marked)
-
+        log.info("DONE.")
         browser.close()
 
 
