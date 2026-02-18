@@ -3,7 +3,7 @@ name: Run TaxDeed Scraper
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 11 * * *" # 11:00 UTC todo dia
+    - cron: "0 11 * * *" # 11:00 UTC todo dia (6am Orlando no inverno; 7am no verão)
 
 concurrency:
   group: taxdeed-scraper
@@ -41,29 +41,24 @@ jobs:
       - name: Run scraper
         env:
           HEADLESS: "true"
-          
-          SKIP_IF_ADDRESS_NOT_NUMBERED: "true" 
 
-          # batching / throttling
-          BATCH_SIZE: "100"
-          PAUSE_HOURS_ON_DONE: "0"   # não precisa pausar, pq roda 1x/dia
-
-          # change detection
-          MARK_REMOVED: "true"
+          # ✅ important knobs (match scraper.py)
+          MAX_LOTS: "100"
+          SKIP_IF_ADDRESS_NOT_NUMBERED: "true"
 
           # identity / scope
           SCRAPER_NAME: "orange_taxdeed"
           COUNTY: "Orange"
           STATE: "FL"
+          STATE_KEY: "orange_taxdeed"
 
           # App ingest (Vercel)
           APP_API_BASE: ${{ secrets.APP_API_BASE }}
           APP_API_TOKEN: ${{ secrets.APP_API_TOKEN }}
 
-          # State storage (Supabase) - necessário p/ "memória"
+          # State storage (Supabase) - memória
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          STATE_KEY: "orange_taxdeed"
         run: |
           python scraper.py
