@@ -41,6 +41,8 @@ jobs:
       - name: Run scraper
         env:
           HEADLESS: "true"
+          
+          SKIP_IF_ADDRESS_NOT_NUMBERED: "true" 
 
           # batching / throttling
           BATCH_SIZE: "100"
