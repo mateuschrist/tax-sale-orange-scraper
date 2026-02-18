@@ -145,6 +145,14 @@ def normalize_bid_for_payload(v):
         return None
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
     return cleaned if cleaned else None
+    SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
+
+def is_numbered_street_address(addr: str | None) -> bool:
+    if not addr:
+        return False
+    a = addr.strip()
+    # Ex: 123 Main St, 12-34 (não comum), mas vamos ser diretos: só números no começo.
+    return re.match(r"^\d{1,6}\s+\S", a) is not None
 
 
 def post_to_app(payload: dict) -> dict | None:
@@ -514,6 +522,16 @@ def run():
                     addr = parse_best_address_from_text(ocr_text)
                     raw_text_for_debug = ocr_text
 
+# ✅ Address filter: ignore "street-only" addresses (no house number)
+if SKIP_IF_ADDRESS_NOT_NUMBERED:
+    if not is_numbered_street_address(addr.get("address")):
+        log.warning("Skipping node=%s because address is not numbered: %r", node, addr.get("address"))
+        # volta pro printable e segue o próximo
+        page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        wait_network(page, 30_000)
+        time.sleep(1.0)
+        continue
+        
                 notes = None
                 if not addr.get("marker_found"):
                     notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
