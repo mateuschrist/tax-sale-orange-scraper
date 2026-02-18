@@ -20,7 +20,7 @@ LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-MAX_LOTS = int(os.getenv("MAX_LOTS", "10"))  # pode aumentar
+MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))  # pode aumentar
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
 # App/API (Vercel) ingest
