@@ -20,15 +20,15 @@ LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))  # pode aumentar
+MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
 # App/API (Vercel) ingest
-APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").rstrip("/")
+APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
-# Supabase state (memory)
+# Supabase state (memory) via REST
 SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip()
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 STATE_KEY = (os.getenv("STATE_KEY", "orange_taxdeed") or "orange_taxdeed").strip()
@@ -38,6 +38,9 @@ USE_STATE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "true").lower() == "true"
 OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "3"))
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
+
+# ✅ Address filter (skip street-only without house number)
+SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
 
 MAX_WAIT = 60_000
 
@@ -78,7 +81,28 @@ def must_be_pdf(headers: dict) -> bool:
 
 
 # =========================
-# SUPABASE STATE (memory)
+# ADDRESS FILTER
+# =========================
+def is_numbered_street_address(addr: str | None) -> bool:
+    """
+    True only if address begins with a house number, e.g.:
+      "109 E Church St"
+      "407 Dill Rd"
+    False for street-only:
+      "Dill Rd"
+      "Forest City Rd"
+    """
+    if not addr:
+        return False
+    a = addr.strip()
+    return re.match(r"^\d{1,6}\s+\S", a) is not None
+
+
+# =========================
+# SUPABASE STATE (memory) - REST
+# Supports BOTH schemas:
+#   A) scraper_state(scraper_name PK, last_node, updated_at...)
+#   B) scraper_state(id PK, last_node, updated_at...)
 # =========================
 def _sb_headers():
     if not USE_STATE:
@@ -91,46 +115,75 @@ def _sb_headers():
     }
 
 
+def _sb_get(url: str):
+    return requests.get(url, headers=_sb_headers(), timeout=30)
+
+
+def _sb_post(url: str, payload: dict):
+    return requests.post(url, headers=_sb_headers(), json=payload, timeout=30)
+
+
+def _sb_patch(url: str, payload: dict):
+    return requests.patch(url, headers=_sb_headers(), json=payload, timeout=30)
+
+
 def get_state_last_node() -> str | None:
-    """
-    Reads last_node from scraper_state table.
-    Table schema:
-      id text primary key,
-      last_node text,
-      updated_at timestamptz default now()
-    """
     if not USE_STATE:
         return None
 
-    url = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}&select=last_node"
-    r = requests.get(url, headers=_sb_headers(), timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"GET scraper_state failed: {r.status_code} {r.text[:200]}")
-    arr = r.json()
+    # Try schema A: scraper_name
+    url_a = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}&select=last_node"
+    r = _sb_get(url_a)
+    if r.status_code == 200:
+        arr = r.json()
+        if not arr:
+            return None
+        return arr[0].get("last_node")
+
+    # If schema mismatch, try schema B: id
+    url_b = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}&select=last_node"
+    r2 = _sb_get(url_b)
+    if r2.status_code != 200:
+        raise RuntimeError(f"GET scraper_state failed: {r2.status_code} {r2.text[:200]}")
+    arr = r2.json()
     if not arr:
         return None
     return arr[0].get("last_node")
 
 
 def set_state_last_node(last_node: str | None) -> None:
-    """Upserts last_node in scraper_state."""
     if not USE_STATE:
         return
 
-    # POST upsert into scraper_state
+    # Prefer schema A: scraper_name (your current app design)
     url = f"{SUPABASE_URL}/rest/v1/scraper_state"
-    payload = {"id": STATE_KEY, "last_node": last_node}
-    r = requests.post(url, headers=_sb_headers(), json=payload, timeout=30)
+    payload_a = {"scraper_name": STATE_KEY, "last_node": last_node}
 
-    # Supabase REST returns 201/200 for insert/upsert; some projects may return 204 for upsert
+    r = _sb_post(url, payload_a)
     if r.status_code in (200, 201, 204):
         return
 
-    # fallback: PATCH by id
-    url2 = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}"
-    r2 = requests.patch(url2, headers=_sb_headers(), json={"last_node": last_node}, timeout=30)
-    if r2.status_code not in (200, 204):
-        raise RuntimeError(f"SET scraper_state failed: {r.status_code} {r.text[:200]} / PATCH {r2.status_code} {r2.text[:200]}")
+    # Fallback patch schema A
+    url_pa = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}"
+    rpa = _sb_patch(url_pa, {"last_node": last_node})
+    if rpa.status_code in (200, 204):
+        return
+
+    # Try schema B: id (older)
+    payload_b = {"id": STATE_KEY, "last_node": last_node}
+    r2 = _sb_post(url, payload_b)
+    if r2.status_code in (200, 201, 204):
+        return
+
+    url_pb = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}"
+    rpb = _sb_patch(url_pb, {"last_node": last_node})
+    if rpb.status_code not in (200, 204):
+        raise RuntimeError(
+            f"SET scraper_state failed: POST {r.status_code} {r.text[:200]} / "
+            f"PATCHA {rpa.status_code} {rpa.text[:200]} / "
+            f"POSTB {r2.status_code} {r2.text[:200]} / "
+            f"PATCHB {rpb.status_code} {rpb.text[:200]}"
+        )
 
 
 # =========================
@@ -145,18 +198,9 @@ def normalize_bid_for_payload(v):
         return None
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
     return cleaned if cleaned else None
-    SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
-
-def is_numbered_street_address(addr: str | None) -> bool:
-    if not addr:
-        return False
-    a = addr.strip()
-    # Ex: 123 Main St, 12-34 (não comum), mas vamos ser diretos: só números no começo.
-    return re.match(r"^\d{1,6}\s+\S", a) is not None
 
 
 def post_to_app(payload: dict) -> dict | None:
-    """POST payload to Vercel ingest endpoint. Retries lightly."""
     if not SEND_TO_APP:
         log.info("APP_API_BASE / APP_API_TOKEN not set → skipping send to app.")
         return None
@@ -169,7 +213,6 @@ def post_to_app(payload: dict) -> dict | None:
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=30)
             log.info("INGEST attempt %d: %s", attempt, r.status_code)
-
             snippet = (r.text or "")[:250].replace("\n", " ")
             log.info("INGEST response snippet: %s", snippet)
 
@@ -251,7 +294,6 @@ def extract_lots_from_printable(page) -> list[dict]:
 # PDF TEXT + OCR (first N pages)
 # =========================
 def try_pdfplumber_text(pdf_bytes: bytes) -> str:
-    """If PDF has embedded text, extract it."""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             parts = []
@@ -265,10 +307,6 @@ def try_pdfplumber_text(pdf_bytes: bytes) -> str:
 
 
 def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 3, scale: float = 2.2) -> str:
-    """
-    OCR first N pages using pypdfium2.page.render() (compatible).
-    Some lots have the address on page 2 or 3.
-    """
     pdf = pypdfium2.PdfDocument(pdf_bytes)
     n_pages = len(pdf)
     pages_to_do = min(n_pages, max_pages)
@@ -292,13 +330,6 @@ def _extract_street_before_city(block: str, city_match_start: int) -> str | None
 
 
 def parse_best_address_from_text(text: str) -> dict:
-    """
-    Priority markers:
-    1) ADDRESS ON RECORD ON CURRENT TAX ROLL (physical property address)
-    2) PHYSICAL ADDRESS
-    3) TITLE HOLDER AND ADDRESS OF RECORD (owner mailing)
-    Fallback: first City, ST ZIP found.
-    """
     if not text:
         return {
             "address": None, "city": None, "state": None, "zip": None,
@@ -337,7 +368,6 @@ def parse_best_address_from_text(text: str) -> dict:
             "snippet": after[:700]
         }
 
-    # Fallback: first City, ST ZIP anywhere
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
@@ -363,6 +393,8 @@ def parse_best_address_from_text(text: str) -> dict:
 def run():
     log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE if APP_API_BASE else "(empty)")
     log.info("USE_STATE=%s STATE_KEY=%s", USE_STATE, STATE_KEY)
+    log.info("MAX_LOTS=%s OCR_MAX_PAGES=%s SKIP_IF_ADDRESS_NOT_NUMBERED=%s",
+             MAX_LOTS, OCR_MAX_PAGES, SKIP_IF_ADDRESS_NOT_NUMBERED)
 
     last_node = None
     if USE_STATE:
@@ -432,24 +464,25 @@ def run():
         if DEBUG_HTML:
             log.info("Printable HTML length: %d", len(page.content()))
 
-        # 3) Capture lots once (avoid stale locators)
+        # 3) Capture lots once
         lots = extract_lots_from_printable(page)
         if not lots:
             log.error("No lots found on printable page.")
             browser.close()
             return
 
-        # If we have last_node and want to continue after it, slice list
+        # Continue after last_node if configured
         if START_AFTER_LAST_NODE and last_node:
             pos = next((i for i, l in enumerate(lots) if l["node"] == last_node), None)
             if pos is not None:
-                lots = lots[pos + 1 :]
+                lots = lots[pos + 1:]
                 log.info("Continuing AFTER last_node. Remaining lots=%d", len(lots))
             else:
                 log.info("last_node not found in current list → processing from top.")
 
         selected = lots[:MAX_LOTS]
-        log.info("Selected lots: %s", [l["node"] for l in selected])
+        log.info("Selected lots count=%d", len(selected))
+        log.info("First nodes: %s", [l["node"] for l in selected[:10]])
 
         for idx, lot in enumerate(selected, start=1):
             node = lot["node"]
@@ -507,31 +540,26 @@ def run():
                 pdf_bytes = pdf_resp.body()
                 log.info("PDF bytes: %d", len(pdf_bytes))
 
-                # 7) Extract address: text -> OCR (first N pages)
+                # 7) Extract address: text -> OCR
                 text = try_pdfplumber_text(pdf_bytes)
-                raw_text_for_debug = None
-
                 if text:
                     log.info("pdfplumber text length: %d (using text parse)", len(text))
                     addr = parse_best_address_from_text(text)
-                    raw_text_for_debug = text
                 else:
-                    log.info("pdfplumber returned empty. Running OCR on FIRST %d pages...", OCR_MAX_PAGES)
+                    log.info("pdfplumber empty. OCR first %d pages...", OCR_MAX_PAGES)
                     ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
                     log.info("OCR text length: %d", len(ocr_text))
                     addr = parse_best_address_from_text(ocr_text)
-                    raw_text_for_debug = ocr_text
 
-# ✅ Address filter: ignore "street-only" addresses (no house number)
-if SKIP_IF_ADDRESS_NOT_NUMBERED:
-    if not is_numbered_street_address(addr.get("address")):
-        log.warning("Skipping node=%s because address is not numbered: %r", node, addr.get("address"))
-        # volta pro printable e segue o próximo
-        page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-        wait_network(page, 30_000)
-        time.sleep(1.0)
-        continue
-        
+                # ✅ Address filter: ignore street-only addresses
+                if SKIP_IF_ADDRESS_NOT_NUMBERED:
+                    if not is_numbered_street_address(addr.get("address")):
+                        log.warning("Skipping node=%s because address is not numbered: %r", node, addr.get("address"))
+                        page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                        wait_network(page, 30_000)
+                        time.sleep(1.0)
+                        continue
+
                 notes = None
                 if not addr.get("marker_found"):
                     notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
@@ -541,6 +569,7 @@ if SKIP_IF_ADDRESS_NOT_NUMBERED:
                     "state": "FL",
                     "node": node,
 
+                    # useful link for your Details
                     "auction_source_url": viewer_url,
 
                     "tax_sale_id": fields.get("tax_sale_id") or None,
@@ -559,17 +588,12 @@ if SKIP_IF_ADDRESS_NOT_NUMBERED:
 
                     "status": "new",
                     "notes": notes,
-                    # opcional futuro:
-                    # "raw_ocr_text": raw_text_for_debug
                 }
 
                 print("\n" + "=" * 100)
                 print(f"RESULT LOT {idx}")
                 print("=" * 100)
                 print(json.dumps(payload, indent=2))
-
-                if not addr.get("marker_found"):
-                    log.warning("Address marker not found. Snippet:\n%s", addr.get("snippet", "")[:900])
 
                 # 8) Send to app
                 ingest_ok = True
