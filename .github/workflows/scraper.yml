@@ -3,7 +3,7 @@ name: Run TaxDeed Scraper
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *" # a cada 10 min (UTC)
+    - cron: "0 11 * * *" # 11:00 UTC todo dia
 
 concurrency:
   group: taxdeed-scraper
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
@@ -43,8 +43,8 @@ jobs:
           HEADLESS: "true"
 
           # batching / throttling
-          BATCH_SIZE: "10"
-          PAUSE_HOURS_ON_DONE: "20"
+          BATCH_SIZE: "100"
+          PAUSE_HOURS_ON_DONE: "0"   # não precisa pausar, pq roda 1x/dia
 
           # change detection
           MARK_REMOVED: "true"
@@ -62,8 +62,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
-          # opcional (se seu scraper usar uma chave pra state por county)
           STATE_KEY: "orange_taxdeed"
-
         run: |
           python scraper.py
