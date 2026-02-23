@@ -623,7 +623,7 @@ def run():
 
         log.info("DONE.")
         browser.close()
-
+from adapters.orange import run as run_orange
 
 if __name__ == "__main__":
-    run()
+    run_orange()
