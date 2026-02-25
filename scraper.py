@@ -2,18 +2,20 @@ import os
 import re
 import json
 import time
+import random
 import logging
 from io import BytesIO
 from urllib.parse import urljoin, urlparse, parse_qs
 
-import pdfplumber
-import pytesseract
-import pypdfium2
 import requests
+import pdfplumber
+import pypdfium2
+import pytesseract
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+
 # =========================
-# CONFIG
+# CONFIG (ENV)
 # =========================
 BASE_URL = "https://or.occompt.com"
 LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
@@ -23,26 +25,38 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
-# App/API (Vercel) ingest
-APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
-APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
-SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
+# Restart browser every N lots (hard reset session)
+RESTART_BROWSER_EVERY = int(os.getenv("RESTART_BROWSER_EVERY", "20"))
 
-# Supabase state (memory) via REST
-SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip()
+# Anti-bot
+MAX_VIEWER_RETRIES = int(os.getenv("MAX_VIEWER_RETRIES", "3"))
+MAX_WAIT = 60_000
+
+# OCR
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "3"))
+OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
+
+# Address filter (skip street-only)
+SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
+
+# State behavior
+START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "true").lower() == "true"
+
+# Supabase state via REST (optional)
+SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 STATE_KEY = (os.getenv("STATE_KEY", "orange_taxdeed") or "orange_taxdeed").strip()
 USE_STATE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
-# Behavior
-START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "true").lower() == "true"
-OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "3"))
-OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
+# App/API ingest (Vercel) - IMPORTANT: base must be Vercel domain, no /api at end
+APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
+APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
+SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
-# ✅ Address filter (skip street-only without house number)
-SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
-
-MAX_WAIT = 60_000
+# Optional: set tesseract executable explicitly if PATH issues
+TESSERACT_CMD = (os.getenv("TESSERACT_CMD", "") or "").strip()
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("taxdeed-orange-scraper")
@@ -80,6 +94,18 @@ def must_be_pdf(headers: dict) -> bool:
     return "application/pdf" in ct or ct.endswith("/pdf")
 
 
+def is_check_human(url: str) -> bool:
+    return "/recorder/web/checkHuman.jsp" in (url or "")
+
+
+def human_backoff(idx: int, attempt: int):
+    # pausa crescente + aleatória
+    base = min(5 + idx * 0.15 + attempt * 2.0, 22)
+    sleep_s = base + random.uniform(0.6, 3.0)
+    log.warning("Backoff %.1fs (idx=%d attempt=%d)", sleep_s, idx, attempt)
+    time.sleep(sleep_s)
+
+
 # =========================
 # ADDRESS FILTER
 # =========================
@@ -99,14 +125,11 @@ def is_numbered_street_address(addr: str | None) -> bool:
 
 
 # =========================
-# SUPABASE STATE (memory) - REST
-# Supports BOTH schemas:
-#   A) scraper_state(scraper_name PK, last_node, updated_at...)
-#   B) scraper_state(id PK, last_node, updated_at...)
+# SUPABASE STATE (optional)
 # =========================
 def _sb_headers():
     if not USE_STATE:
-        raise RuntimeError("Supabase state disabled (missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY).")
+        raise RuntimeError("Supabase state disabled.")
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -131,7 +154,7 @@ def get_state_last_node() -> str | None:
     if not USE_STATE:
         return None
 
-    # Try schema A: scraper_name
+    # schema A: scraper_name
     url_a = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}&select=last_node"
     r = _sb_get(url_a)
     if r.status_code == 200:
@@ -140,7 +163,7 @@ def get_state_last_node() -> str | None:
             return None
         return arr[0].get("last_node")
 
-    # If schema mismatch, try schema B: id
+    # schema B: id
     url_b = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}&select=last_node"
     r2 = _sb_get(url_b)
     if r2.status_code != 200:
@@ -155,7 +178,6 @@ def set_state_last_node(last_node: str | None) -> None:
     if not USE_STATE:
         return
 
-    # Prefer schema A: scraper_name (your current app design)
     url = f"{SUPABASE_URL}/rest/v1/scraper_state"
     payload_a = {"scraper_name": STATE_KEY, "last_node": last_node}
 
@@ -163,13 +185,13 @@ def set_state_last_node(last_node: str | None) -> None:
     if r.status_code in (200, 201, 204):
         return
 
-    # Fallback patch schema A
+    # fallback patch schema A
     url_pa = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}"
     rpa = _sb_patch(url_pa, {"last_node": last_node})
     if rpa.status_code in (200, 204):
         return
 
-    # Try schema B: id (older)
+    # schema B
     payload_b = {"id": STATE_KEY, "last_node": last_node}
     r2 = _sb_post(url, payload_b)
     if r2.status_code in (200, 201, 204):
@@ -190,7 +212,6 @@ def set_state_last_node(last_node: str | None) -> None:
 # APP INGEST (Vercel)
 # =========================
 def normalize_bid_for_payload(v):
-    """Send as string without commas (backend normalizes too)."""
     if v is None:
         return None
     s = str(v).strip()
@@ -202,7 +223,7 @@ def normalize_bid_for_payload(v):
 
 def post_to_app(payload: dict) -> dict | None:
     if not SEND_TO_APP:
-        log.info("APP_API_BASE / APP_API_TOKEN not set → skipping send to app.")
+        log.info("SEND_TO_APP=False → skipping ingest")
         return None
 
     url = f"{APP_API_BASE}/api/ingest"
@@ -217,10 +238,13 @@ def post_to_app(payload: dict) -> dict | None:
             log.info("INGEST response snippet: %s", snippet)
 
             if r.status_code in (200, 201):
-                return r.json()
+                try:
+                    return r.json()
+                except Exception:
+                    return {"ok": True, "raw": r.text}
 
             if r.status_code == 401:
-                log.error("INGEST unauthorized → check APP_API_TOKEN == Vercel INGEST_API_TOKEN.")
+                log.error("INGEST unauthorized (401) → check APP_API_TOKEN")
                 return None
 
             last_err = f"HTTP {r.status_code}: {r.text[:500]}"
@@ -234,7 +258,7 @@ def post_to_app(payload: dict) -> dict | None:
 
 
 # =========================
-# TABLE PARSE (Printable row text)
+# TABLE PARSE
 # =========================
 def parse_fields_from_row_text(row_text: str) -> dict:
     txt = row_text
@@ -291,7 +315,7 @@ def extract_lots_from_printable(page) -> list[dict]:
 
 
 # =========================
-# PDF TEXT + OCR (first N pages)
+# PDF TEXT + OCR
 # =========================
 def try_pdfplumber_text(pdf_bytes: bytes) -> str:
     try:
@@ -348,26 +372,22 @@ def parse_best_address_from_text(text: str) -> dict:
             continue
 
         after = text[mm.end():].strip()
-
         mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", after, re.I)
         if not mcity:
             continue
 
         street = _extract_street_before_city(after, mcity.start())
-        city = mcity.group(1).title().strip()
-        state = mcity.group(2).upper()
-        zipc = mcity.group(3)
-
         return {
             "address": street,
-            "city": city,
-            "state": state,
-            "zip": zipc,
+            "city": mcity.group(1).title().strip(),
+            "state": mcity.group(2).upper(),
+            "zip": mcity.group(3),
             "marker_used": marker_name,
             "marker_found": True,
-            "snippet": after[:700]
+            "snippet": after[:700],
         }
 
+    # fallback: first match anywhere
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
@@ -383,8 +403,115 @@ def parse_best_address_from_text(text: str) -> dict:
         "zip": mcity.group(3),
         "marker_used": "FALLBACK_FIRST_MATCH",
         "marker_found": True,
-        "snippet": text[max(0, mcity.start()-250):mcity.end()+250]
+        "snippet": text[max(0, mcity.start()-250):mcity.end()+250],
     }
+
+
+# =========================
+# BOOTSTRAP (fresh session)
+# =========================
+def bootstrap_to_printable(p, headless: bool):
+    """
+    Opens a brand new browser+context+page and navigates:
+    login -> acknowledge -> search -> printable
+    Returns: (browser, context, page, printable_url)
+    """
+    browser = p.chromium.launch(headless=headless)
+    context = browser.new_context()
+    page = context.new_page()
+
+    log.info("OPEN: %s", LOGIN_URL)
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
+
+    click_any(page, [
+        "text=I Acknowledge",
+        "button:has-text('I Acknowledge')",
+        "a:has-text('I Acknowledge')",
+        "input[value='I Acknowledge']",
+    ], "I Acknowledge")
+    wait_network(page)
+
+    log.info("OPEN SEARCH: %s", SEARCH_URL)
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
+    wait_network(page)
+
+    if page.locator("select[name='DeedStatusID']").count() > 0:
+        page.select_option("select[name='DeedStatusID']", value="AS")
+        log.info("Set DeedStatusID=AS")
+    else:
+        log.warning("Dropdown DeedStatusID not found; selector may need update.")
+
+    ok = click_any(page, [
+        "input[type='submit'][value='Search']",
+        "button:has-text('Search')",
+        "text=Search"
+    ], "Search")
+    if not ok:
+        raise RuntimeError("Could not click Search")
+
+    page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+    wait_network(page, 30_000)
+
+    ok = click_any(page, [
+        "text=Printable Version",
+        "a:has-text('Printable Version')",
+        "button:has-text('Printable Version')"
+    ], "Printable Version")
+    if not ok:
+        raise RuntimeError("Could not click Printable Version")
+
+    page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
+    wait_network(page, 30_000)
+
+    printable_url = page.url
+    log.info("After Printable URL: %s", printable_url)
+
+    if DEBUG_HTML:
+        log.info("Printable HTML length: %d", len(page.content()))
+
+    return browser, context, page, printable_url
+
+
+def safe_close(browser=None, context=None, page=None):
+    try:
+        if page:
+            page.close()
+    except Exception:
+        pass
+    try:
+        if context:
+            context.close()
+    except Exception:
+        pass
+    try:
+        if browser:
+            browser.close()
+    except Exception:
+        pass
+
+
+# =========================
+# VIEWER OPEN WITH RETRY
+# =========================
+def open_viewer_with_retry(page, printable_url: str, tax_sale_url: str, idx: int) -> str:
+    viewer_url = ""
+    for attempt in range(1, MAX_VIEWER_RETRIES + 1):
+        page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        wait_network(page)
+        viewer_url = page.url
+        log.info("Viewer URL: %s", viewer_url)
+
+        if not is_check_human(viewer_url):
+            return viewer_url
+
+        log.warning("Hit checkHuman.jsp (attempt %d/%d).", attempt, MAX_VIEWER_RETRIES)
+        human_backoff(idx, attempt)
+
+        # reset by returning to printable
+        page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        wait_network(page, 30_000)
+
+    return viewer_url
 
 
 # =========================
@@ -392,10 +519,11 @@ def parse_best_address_from_text(text: str) -> dict:
 # =========================
 def run():
     log.info("SEND_TO_APP=%s APP_API_BASE=%s", SEND_TO_APP, APP_API_BASE if APP_API_BASE else "(empty)")
-    log.info("USE_STATE=%s STATE_KEY=%s", USE_STATE, STATE_KEY)
-    log.info("MAX_LOTS=%s OCR_MAX_PAGES=%s SKIP_IF_ADDRESS_NOT_NUMBERED=%s",
-             MAX_LOTS, OCR_MAX_PAGES, SKIP_IF_ADDRESS_NOT_NUMBERED)
+    log.info("USE_STATE=%s STATE_KEY=%s START_AFTER_LAST_NODE=%s", USE_STATE, STATE_KEY, START_AFTER_LAST_NODE)
+    log.info("MAX_LOTS=%s RESTART_BROWSER_EVERY=%s HEADLESS=%s", MAX_LOTS, RESTART_BROWSER_EVERY, HEADLESS)
+    log.info("OCR_MAX_PAGES=%s OCR_SCALE=%s", OCR_MAX_PAGES, OCR_SCALE)
 
+    # State
     last_node = None
     if USE_STATE:
         try:
@@ -405,73 +533,19 @@ def run():
             log.warning("STATE read failed (continuing without state): %s", str(e))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context()
-        page = context.new_page()
+        browser = context = page = None
+        printable_url = ""
 
-        # 1) Login / Disclaimer
-        log.info("OPEN: %s", LOGIN_URL)
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
+        # Start fresh
+        browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
 
-        click_any(page, [
-            "text=I Acknowledge",
-            "button:has-text('I Acknowledge')",
-            "a:has-text('I Acknowledge')",
-            "input[value='I Acknowledge']",
-        ], "I Acknowledge")
-        wait_network(page)
-
-        # 2) Search page
-        log.info("OPEN SEARCH: %s", SEARCH_URL)
-        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
-        wait_network(page)
-
-        if page.locator("select[name='DeedStatusID']").count() > 0:
-            page.select_option("select[name='DeedStatusID']", value="AS")
-            log.info("Set DeedStatusID=AS")
-        else:
-            log.warning("Dropdown DeedStatusID not found; selector may need update.")
-
-        ok = click_any(page, [
-            "input[type='submit'][value='Search']",
-            "button:has-text('Search')",
-            "text=Search"
-        ], "Search")
-        if not ok:
-            log.error("Could not click Search.")
-            browser.close()
-            return
-
-        page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-        wait_network(page, 30_000)
-        log.info("After Search URL: %s", page.url)
-
-        ok = click_any(page, [
-            "text=Printable Version",
-            "a:has-text('Printable Version')",
-            "button:has-text('Printable Version')"
-        ], "Printable Version")
-        if not ok:
-            log.error("Could not click Printable Version.")
-            browser.close()
-            return
-
-        page.wait_for_load_state("domcontentloaded", timeout=MAX_WAIT)
-        wait_network(page, 30_000)
-        printable_url = page.url
-        log.info("After Printable URL: %s", printable_url)
-
-        if DEBUG_HTML:
-            log.info("Printable HTML length: %d", len(page.content()))
-
-        # 3) Capture lots once
+        # Load lots
         lots = extract_lots_from_printable(page)
         if not lots:
-            log.error("No lots found on printable page.")
-            browser.close()
-            return
+            safe_close(browser, context, page)
+            raise RuntimeError("No lots found on printable page.")
 
-        # Continue after last_node if configured
+        # Continue after last_node?
         if START_AFTER_LAST_NODE and last_node:
             pos = next((i for i, l in enumerate(lots) if l["node"] == last_node), None)
             if pos is not None:
@@ -485,6 +559,13 @@ def run():
         log.info("First nodes: %s", [l["node"] for l in selected[:10]])
 
         for idx, lot in enumerate(selected, start=1):
+
+            # Restart browser every N lots
+            if RESTART_BROWSER_EVERY > 0 and idx > 1 and (idx - 1) % RESTART_BROWSER_EVERY == 0:
+                log.warning("Restarting browser after %d lots (hard reset session)...", idx - 1)
+                safe_close(browser, context, page)
+                browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
+
             node = lot["node"]
             row_text = lot["row_text"]
             tax_sale_url = lot["tax_sale_url"]
@@ -494,13 +575,17 @@ def run():
             log.info("Row text: %s", row_text[:220])
 
             try:
-                # 4) Open viewer
-                page.goto(tax_sale_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page)
-                viewer_url = page.url
-                log.info("Viewer URL: %s", viewer_url)
+                # Open viewer with retry
+                viewer_url = open_viewer_with_retry(page, printable_url, tax_sale_url, idx)
+                if is_check_human(viewer_url):
+                    log.error("Blocked by checkHuman.jsp after retries. Skipping node=%s", node)
+                    # reset to printable and continue
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
+                    time.sleep(1.0)
+                    continue
 
-                # 5) Find PDF link inside viewer
+                # Find PDF link
                 pdf_a = page.locator("a[href*='Property_Information.pdf']")
                 href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
@@ -513,12 +598,13 @@ def run():
                     log.error("PDF link not found in viewer for node=%s", node)
                     page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                     wait_network(page, 30_000)
+                    time.sleep(1.0)
                     continue
 
                 pdf_url = urljoin(viewer_url, href_pdf)
                 log.info("PDF URL: %s", pdf_url)
 
-                # 6) Download PDF
+                # Download PDF
                 pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
                 log.info("PDF HTTP status: %s", pdf_resp.status)
                 log.info("PDF content-type: %s", pdf_resp.headers.get("content-type"))
@@ -528,6 +614,7 @@ def run():
                     log.error("PDF download failed preview:\n%s", preview)
                     page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                     wait_network(page, 30_000)
+                    time.sleep(1.0)
                     continue
 
                 if not must_be_pdf(pdf_resp.headers):
@@ -535,23 +622,31 @@ def run():
                     log.error("Response is not PDF preview:\n%s", preview)
                     page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                     wait_network(page, 30_000)
+                    time.sleep(1.0)
                     continue
 
                 pdf_bytes = pdf_resp.body()
                 log.info("PDF bytes: %d", len(pdf_bytes))
 
-                # 7) Extract address: text -> OCR
+                # Extract address
                 text = try_pdfplumber_text(pdf_bytes)
                 if text:
                     log.info("pdfplumber text length: %d (using text parse)", len(text))
                     addr = parse_best_address_from_text(text)
                 else:
                     log.info("pdfplumber empty. OCR first %d pages...", OCR_MAX_PAGES)
-                    ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
-                    log.info("OCR text length: %d", len(ocr_text))
-                    addr = parse_best_address_from_text(ocr_text)
+                    try:
+                        ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
+                        log.info("OCR text length: %d", len(ocr_text))
+                        addr = parse_best_address_from_text(ocr_text)
+                    except Exception as e:
+                        log.error("OCR failed: %s", str(e))
+                        addr = {
+                            "address": None, "city": None, "state": None, "zip": None,
+                            "marker_used": None, "marker_found": False, "snippet": ""
+                        }
 
-                # ✅ Address filter: ignore street-only addresses
+                # Address filter
                 if SKIP_IF_ADDRESS_NOT_NUMBERED:
                     if not is_numbered_street_address(addr.get("address")):
                         log.warning("Skipping node=%s because address is not numbered: %r", node, addr.get("address"))
@@ -569,7 +664,6 @@ def run():
                     "state": "FL",
                     "node": node,
 
-                    # useful link for your Details
                     "auction_source_url": viewer_url,
 
                     "tax_sale_id": fields.get("tax_sale_id") or None,
@@ -595,7 +689,7 @@ def run():
                 print("=" * 100)
                 print(json.dumps(payload, indent=2))
 
-                # 8) Send to app
+                # Send to app
                 ingest_ok = True
                 ingest_result = None
                 if SEND_TO_APP:
@@ -605,7 +699,7 @@ def run():
                 if ingest_result:
                     log.info("INGEST OK: %s", ingest_result)
 
-                # 9) Update state only when ingest ok (or when SEND_TO_APP disabled)
+                # Update state only if ingest ok OR ingest disabled
                 if ingest_ok:
                     try:
                         set_state_last_node(node)
@@ -616,14 +710,21 @@ def run():
             except Exception as e:
                 log.exception("LOT FAILED node=%s error=%s", node, str(e))
 
-            # back to printable
-            page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-            wait_network(page, 30_000)
+            # Back to printable
+            try:
+                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                wait_network(page, 30_000)
+            except Exception:
+                # if navigation fails, hard reset session
+                log.warning("Failed to return printable. Hard reset session.")
+                safe_close(browser, context, page)
+                browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
+
             time.sleep(1.0)
 
         log.info("DONE.")
-        browser.close()
-from adapters.orange import run as run_orange
+        safe_close(browser, context, page)
+
 
 if __name__ == "__main__":
-    run_orange()
+    run()
