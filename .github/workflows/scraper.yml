@@ -3,7 +3,7 @@ name: Run TaxDeed Scraper
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 11 * * *" # 11:00 UTC todo dia (6am Orlando no inverno; 7am no verão)
+    - cron: "0 * * * *" # 11:00 UTC todo dia (6am Orlando no inverno; 7am no verão)
 
 concurrency:
   group: taxdeed-scraper
