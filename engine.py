@@ -1,5 +1,5 @@
 import json
-from scraper import run_orange
+from scraper import run
 
 COUNTY_RUNNERS = {
     "Orange": run_orange,
