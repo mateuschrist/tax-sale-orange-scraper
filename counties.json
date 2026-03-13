@@ -2,6 +2,9 @@
   {
     "name": "Orange",
     "enabled": true
+  },
+  {
+    "name": "PalmBeach",
+    "enabled": false
   }
-
 ]
