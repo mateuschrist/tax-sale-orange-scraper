@@ -5,7 +5,6 @@ import time
 import logging
 from io import BytesIO
 from urllib.parse import urljoin
-from datetime import date, timedelta
 
 import requests
 import pdfplumber
@@ -13,21 +12,29 @@ import pypdfium2
 import pytesseract
 from bs4 import BeautifulSoup
 
+log = logging.getLogger("taxdeed-palmbeach")
 
-log = logging.getLogger("taxdeed-palm-beach")
-
-BASE_URL = "https://taxdeed.mypalmbeachclerk.com/"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-}
+BASE_URL = "https://taxdeed.mypalmbeachclerk.com"
+DETAILS_URL = BASE_URL + "/Home/Details?id={id}"
 
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
-PB_PRIMARY_PAGES = [10, 11, 12, 13]   # páginas humanas
+
+# Páginas humanas observadas no PDF
+PB_PRIMARY_PAGES = [10, 11, 12, 13]
 PB_FALLBACK_PAGES = [9, 14]
+
+# Controles do crawler por ID
+PALM_BEACH_START_ID = int(os.getenv("PALM_BEACH_START_ID", "64000"))
+PALM_BEACH_MAX_IDS = int(os.getenv("PALM_BEACH_MAX_IDS", "50"))
+PALM_BEACH_STATE_FILE = os.getenv("PALM_BEACH_STATE_FILE", "state_palm_beach.json")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+}
 
 
 def normalize_ws(s: str) -> str:
@@ -42,6 +49,34 @@ def normalize_bid_for_payload(v):
         return None
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
     return cleaned if cleaned else None
+
+
+def load_state() -> dict:
+    try:
+        with open(PALM_BEACH_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(data: dict):
+    tmp = PALM_BEACH_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PALM_BEACH_STATE_FILE)
+
+
+def get_last_pb_id() -> int | None:
+    st = load_state()
+    v = st.get("last_pb_id")
+    return int(v) if v is not None else None
+
+
+def set_last_pb_id(pb_id: int):
+    st = load_state()
+    st["last_pb_id"] = pb_id
+    st["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(st)
 
 
 def post_to_app(payload: dict) -> dict | None:
@@ -77,15 +112,9 @@ def post_to_app(payload: dict) -> dict | None:
     return None
 
 
-def build_date_range():
-    today = date.today()
-    one_year = today + timedelta(days=365)
-    return today.strftime("%m/%d/%Y"), one_year.strftime("%m/%d/%Y")
-
-
 def extract_text_from_pdf_pages(pdf_bytes: bytes, human_pages: list[int]) -> str:
     """
-    human_pages usa número humano: 1,2,3...
+    human_pages usa numeração humana: 1,2,3...
     """
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
@@ -219,11 +248,20 @@ def extract_address_from_tax_certificate(pdf_bytes: bytes) -> dict:
     }
 
 
-def extract_case_fields_from_html(html: str) -> dict:
+def looks_like_case_page(html: str) -> bool:
     """
-    Parser genérico da tela de detalhes, com estrutura:
-    Label | Value
+    Página válida de Case Details.
     """
+    t = html.lower()
+    return (
+        "case details" in t
+        or "case number" in t
+        or "certificate" in t
+        or "auction date" in t
+    )
+
+
+def extract_case_fields_from_html(html: str, current_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
 
@@ -231,6 +269,27 @@ def extract_case_fields_from_html(html: str) -> dict:
         pattern = rf"{re.escape(label)}\s*\n?\s*(.+)"
         m = re.search(pattern, text, re.I)
         return normalize_ws(m.group(1)) if m else None
+
+    tax_collector_url = None
+    tax_certificate_url = None
+
+    for a in soup.find_all("a", href=True):
+        label = normalize_ws(a.get_text(" ", strip=True)).lower()
+        href = urljoin(current_url, a["href"])
+
+        if "click here to access the tax collector site" in label or "tax collector site" in label:
+            tax_collector_url = href
+
+        if "tax certificate" in label:
+            tax_certificate_url = href
+
+    # fallback pro PDF por href
+    if not tax_certificate_url:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].lower()
+            if ".pdf" in href or "certificate" in href:
+                tax_certificate_url = urljoin(current_url, a["href"])
+                break
 
     return {
         "case_number": pick("Case Number"),
@@ -246,48 +305,9 @@ def extract_case_fields_from_html(html: str) -> dict:
         "assessed_as": pick("Assessed As"),
         "opening_bid": pick("Opening Bid"),
         "high_bid": pick("High Bid"),
+        "tax_collector_url": tax_collector_url,
+        "tax_certificate_url": tax_certificate_url,
     }
-
-
-def find_tax_certificate_link(case_html: str, current_url: str) -> str | None:
-    soup = BeautifulSoup(case_html, "html.parser")
-
-    # Procura link com texto "Tax Certificate"
-    for a in soup.find_all("a", href=True):
-        label = normalize_ws(a.get_text(" ", strip=True))
-        if "tax certificate" in label.lower():
-            return urljoin(current_url, a["href"])
-
-    # fallback por href contendo certificate/pdf
-    for a in soup.find_all("a", href=True):
-        href = a["href"].lower()
-        if "certificate" in href or ".pdf" in href:
-            return urljoin(current_url, a["href"])
-
-    return None
-
-
-def parse_search_results_for_case_links(html: str, current_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        full = urljoin(current_url, href)
-        txt = normalize_ws(a.get_text(" ", strip=True))
-
-        # Ajuste isso se o site usar outro padrão
-        if "case" in txt.lower() or "details" in txt.lower() or "auction" in href.lower():
-            links.append(full)
-
-    # remove duplicados preservando ordem
-    seen = set()
-    out = []
-    for x in links:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
 
 
 def build_payload(case_fields: dict, address_data: dict, case_url: str, pdf_url: str | None) -> dict:
@@ -296,7 +316,9 @@ def build_payload(case_fields: dict, address_data: dict, case_url: str, pdf_url:
         "state": "FL",
         "node": case_fields.get("case_number"),
 
-        "auction_source_url": case_url,
+        # conforme você pediu:
+        # auction_source_url = link "Click here to access the Tax Collector site"
+        "auction_source_url": case_fields.get("tax_collector_url"),
 
         "tax_sale_id": case_fields.get("case_number"),
         "parcel_number": case_fields.get("parcel_id"),
@@ -317,32 +339,17 @@ def build_payload(case_fields: dict, address_data: dict, case_url: str, pdf_url:
     }
 
 
-def search_cases(session: requests.Session) -> list[str]:
-    """
-    Aqui está o único ponto que provavelmente vai precisar de ajuste fino
-    depois que você me mandar o HTML real do form / submit.
-    """
-    from_date, to_date = build_date_range()
+def fetch_case(session: requests.Session, pb_id: int) -> tuple[str, str] | tuple[None, None]:
+    url = DETAILS_URL.format(id=pb_id)
+    r = session.get(url, timeout=60)
 
-    # Primeiro GET na home
-    r = session.get(BASE_URL, timeout=60)
-    r.raise_for_status()
+    if r.status_code != 200:
+        return None, None
 
-    # Payload genérico baseado no seu fluxo manual
-    payload = {
-        "status": "sale",
-        "from": from_date,
-        "to": to_date,
-    }
+    if not looks_like_case_page(r.text):
+        return None, None
 
-    # ⚠️ Muito provavelmente esses nomes de campos terão que ser ajustados
-    # depois que você me mandar o HTML real do formulário.
-    r2 = session.post(BASE_URL, data=payload, timeout=60)
-    r2.raise_for_status()
-
-    links = parse_search_results_for_case_links(r2.text, r2.url)
-    log.info("Palm Beach case links found: %d", len(links))
-    return links
+    return r.url, r.text
 
 
 def run_palm_beach():
@@ -351,21 +358,29 @@ def run_palm_beach():
     s = requests.Session()
     s.headers.update(HEADERS)
 
-    case_links = search_cases(s)
-    if not case_links:
-        log.warning("No Palm Beach case links found.")
-        return
+    last_id = get_last_pb_id()
+    start_id = (last_id + 1) if last_id else PALM_BEACH_START_ID
+    end_id = start_id + PALM_BEACH_MAX_IDS
 
-    for idx, case_url in enumerate(case_links, start=1):
-        log.info("Palm Beach case %d/%d: %s", idx, len(case_links), case_url)
+    log.info("Palm Beach scanning IDs from %s to %s", start_id, end_id - 1)
+
+    for pb_id in range(start_id, end_id):
+        log.info("Palm Beach id=%s", pb_id)
 
         try:
-            r = s.get(case_url, timeout=60)
-            r.raise_for_status()
+            case_url, html = fetch_case(s, pb_id)
+            if not case_url or not html:
+                log.info("Palm Beach id=%s not a valid case page", pb_id)
+                continue
 
-            case_fields = extract_case_fields_from_html(r.text)
-            pdf_link = find_tax_certificate_link(r.text, r.url)
+            case_fields = extract_case_fields_from_html(html, case_url)
 
+            # Sem case number, não vale processar
+            if not case_fields.get("case_number"):
+                log.info("Palm Beach id=%s missing case number, skipping", pb_id)
+                continue
+
+            pdf_url = case_fields.get("tax_certificate_url")
             address_data = {
                 "address": None,
                 "city": None,
@@ -374,9 +389,9 @@ def run_palm_beach():
                 "source": None,
             }
 
-            if pdf_link:
-                log.info("Tax Certificate PDF found: %s", pdf_link)
-                pdf_resp = s.get(pdf_link, timeout=120)
+            if pdf_url:
+                log.info("Tax Certificate PDF found: %s", pdf_url)
+                pdf_resp = s.get(pdf_url, timeout=120)
                 pdf_resp.raise_for_status()
 
                 content_type = (pdf_resp.headers.get("content-type") or "").lower()
@@ -387,10 +402,10 @@ def run_palm_beach():
             else:
                 log.warning("Tax Certificate PDF link not found for %s", case_url)
 
-            payload = build_payload(case_fields, address_data, r.url, pdf_link)
+            payload = build_payload(case_fields, address_data, case_url, pdf_url)
 
             print("\n" + "=" * 100)
-            print(f"PALM BEACH RESULT {idx}")
+            print(f"PALM BEACH RESULT ID {pb_id}")
             print("=" * 100)
             print(json.dumps(payload, indent=2))
 
@@ -398,8 +413,14 @@ def run_palm_beach():
                 ingest_result = post_to_app(payload)
                 if ingest_result:
                     log.info("INGEST OK: %s", ingest_result)
+                    set_last_pb_id(pb_id)
+                else:
+                    log.warning("INGEST failed for Palm Beach id=%s", pb_id)
+            else:
+                # mesmo sem ingest, salva progresso local
+                set_last_pb_id(pb_id)
 
             time.sleep(2.0)
 
         except Exception as e:
-            log.exception("Palm Beach case failed: %s", str(e))
+            log.exception("Palm Beach case failed for id=%s: %s", pb_id, str(e))
