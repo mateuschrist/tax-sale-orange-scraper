@@ -1,8 +1,10 @@
 import json
 from scraper import run
+from adapters.palm_beach import run_palm_beach
 
 COUNTY_RUNNERS = {
     "Orange": run,
+    "PalmBeach": run_palm_beach,
 }
 
 def main():
