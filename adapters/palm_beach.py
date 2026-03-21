@@ -86,6 +86,95 @@ def empty_addr():
     }
 
 
+def normalize_property_address(addr: str) -> str:
+    return norm(addr).replace(" ,", ",")
+
+
+def is_po_box(addr: str) -> bool:
+    if not addr:
+        return False
+    a = addr.upper().replace(".", "").replace("  ", " ")
+    return "PO BOX" in a or "P O BOX" in a or "POST OFFICE BOX" in a
+
+
+def looks_like_garbage_address(addr: str) -> bool:
+    if not addr:
+        return True
+
+    a = norm(addr)
+    upper = a.upper()
+
+    if len(a) < 4 or len(a) > 80:
+        return True
+
+    if is_po_box(a):
+        return True
+
+    bad_markers = [
+        "NOTE:",
+        "LEGAL DESCRIPTION",
+        "PCN",
+        "PARCEL",
+        "NAME LAST ASSESSED",
+        "OFFICIAL RECORDS",
+        "TAX ASSESSMENT",
+        "BOOK/PAGE",
+        "SALE DATE",
+        "OWNER INFORMATION",
+        "MAILING ADDRESS",
+        "MUNICIPALITY",
+        "SUBDIVISION",
+    ]
+
+    for marker in bad_markers:
+        if marker in upper:
+            return True
+
+    # muito "falado" para ser endereço
+    if upper.count(" ") > 12:
+        return True
+
+    return False
+
+
+def is_valid_property_address(addr: str) -> bool:
+    if not addr:
+        return False
+
+    a = normalize_property_address(addr)
+
+    if looks_like_garbage_address(a):
+        return False
+
+    # aceita endereços com número
+    if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
+        return True
+
+    # aceita alguns endereços de unidade/lote sem número clássico
+    # ex.: 18 BURGUNDY A
+    if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
+        return True
+
+    return False
+
+
+def sanitize_address_payload(addr: dict) -> dict:
+    if not addr:
+        return empty_addr()
+
+    street = addr.get("address")
+    if not is_valid_property_address(street):
+        return empty_addr()
+
+    return {
+        "address": normalize_property_address(addr.get("address")),
+        "city": norm(addr.get("city")) if addr.get("city") else None,
+        "state": addr.get("state"),
+        "zip": addr.get("zip"),
+        "source": addr.get("source"),
+    }
+
+
 def payload_quality_score(payload: dict) -> int:
     fields = [
         "address",
@@ -282,6 +371,9 @@ def parse_case(html: str, url: str) -> dict:
 # PDF EXTRACTION
 # =========================
 def build_adaptive_page_order(total_pages: int) -> list[int]:
+    """
+    Começa em 10 e 11, depois expande.
+    """
     preferred = [10, 11]
     seen = set()
     order = []
@@ -332,7 +424,12 @@ def ocr_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
     return ""
 
 
-def parse_address_from_pdf_text(text: str) -> dict:
+def parse_location_or_mailing_address(text: str) -> dict:
+    """
+    Parser principal:
+    1) Location Address
+    2) Mailing Address
+    """
     if not text:
         return empty_addr()
 
@@ -341,33 +438,34 @@ def parse_address_from_pdf_text(text: str) -> dict:
     # 1) PRIORIDADE: Location Address
     m_loc = re.search(r"Location Address\s*:\s*(.+)", t, re.I)
     if m_loc:
-        street = norm(m_loc.group(1))
+        street = normalize_property_address(m_loc.group(1))
 
-        m_muni = re.search(r"Municipality\s*:\s*([A-Z][A-Z .'-]+)", t, re.I)
-        municipality = norm(m_muni.group(1)).title() if m_muni else None
+        if is_valid_property_address(street):
+            m_muni = re.search(r"Municipality\s*:\s*([A-Z][A-Z .'-]+)", t, re.I)
+            municipality = norm(m_muni.group(1)).title() if m_muni else None
 
-        m_city_zip = re.search(
-            r"([A-Z][A-Z .'-]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
-            t,
-            re.I
-        )
+            m_city_zip = re.search(
+                r"([A-Z][A-Z .'-]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
+                t,
+                re.I
+            )
 
-        if m_city_zip:
+            if m_city_zip:
+                return {
+                    "address": street,
+                    "city": norm(m_city_zip.group(1)).title(),
+                    "state": "FL",
+                    "zip": m_city_zip.group(2),
+                    "source": "PDF_LOCATION_ADDRESS",
+                }
+
             return {
                 "address": street,
-                "city": norm(m_city_zip.group(1)).title(),
-                "state": "FL",
-                "zip": m_city_zip.group(2),
+                "city": municipality,
+                "state": "FL" if municipality else None,
+                "zip": None,
                 "source": "PDF_LOCATION_ADDRESS",
             }
-
-        return {
-            "address": street,
-            "city": municipality,
-            "state": "FL",
-            "zip": None,
-            "source": "PDF_LOCATION_ADDRESS",
-        }
 
     # 2) FALLBACK: Mailing Address
     m_mail = re.search(
@@ -376,13 +474,86 @@ def parse_address_from_pdf_text(text: str) -> dict:
         re.I | re.S,
     )
     if m_mail:
-        return {
-            "address": norm(m_mail.group(1)),
-            "city": norm(m_mail.group(2)).title(),
-            "state": "FL",
-            "zip": m_mail.group(3),
-            "source": "PDF_MAILING_ADDRESS",
-        }
+        street = normalize_property_address(m_mail.group(1))
+        city = norm(m_mail.group(2)).title()
+        zip_code = m_mail.group(3)
+
+        if is_valid_property_address(street):
+            return {
+                "address": street,
+                "city": city,
+                "state": "FL",
+                "zip": zip_code,
+                "source": "PDF_MAILING_ADDRESS",
+            }
+
+    return empty_addr()
+
+
+def parse_you_entered_address(text: str) -> dict:
+    """
+    Fallback opcional:
+    procura bloco USPS "You entered" só quando o modo principal falhar.
+    """
+    if not text:
+        return empty_addr()
+
+    lines = [norm(x) for x in text.replace("\r", "\n").splitlines() if norm(x)]
+
+    for i, line in enumerate(lines):
+        if "you entered" in line.lower():
+            window = lines[i:i+12]
+
+            # procura a última dupla válida address + city FL ZIP
+            for j in range(len(window) - 2, -1, -1):
+                addr_line = window[j]
+                if j + 1 >= len(window):
+                    continue
+
+                city_line = window[j + 1]
+
+                m_city = re.search(
+                    r"^([A-Z][A-Z .'-]+)\s+FL\s+(\d{5})(?:-\d{4})?$",
+                    city_line,
+                    re.I
+                )
+                if not m_city:
+                    continue
+
+                addr_line = normalize_property_address(addr_line)
+                if not is_valid_property_address(addr_line):
+                    continue
+
+                return {
+                    "address": addr_line,
+                    "city": norm(m_city.group(1)).title(),
+                    "state": "FL",
+                    "zip": m_city.group(2),
+                    "source": "PDF_USPS_YOU_ENTERED",
+                }
+
+    return empty_addr()
+
+
+def parse_address_from_pdf_text(text: str) -> dict:
+    """
+    Estratégia:
+    1) parser principal
+    2) se falhar, fallback "You entered"
+    3) valida tudo antes de aceitar
+    """
+    if not text:
+        return empty_addr()
+
+    addr = parse_location_or_mailing_address(text)
+    addr = sanitize_address_payload(addr)
+    if addr.get("address"):
+        return addr
+
+    addr = parse_you_entered_address(text)
+    addr = sanitize_address_payload(addr)
+    if addr.get("address"):
+        return addr
 
     return empty_addr()
 
@@ -425,7 +596,7 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach PDF-only adaptive mode + dedup V5 ===")
+    log.info("=== Palm Beach PDF-only adaptive mode + dedup V5.1 ===")
 
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -466,6 +637,9 @@ def run_palm_beach():
                         )
                 except Exception as e:
                     log.warning("PDF read failed for id=%s: %s", i, str(e))
+
+            # proteção final contra lixo
+            addr = sanitize_address_payload(addr)
 
             payload = {
                 "county": "PalmBeach",
