@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 log = logging.getLogger("taxdeed-palmbeach")
 
 BASE_URL = "https://taxdeed.mypalmbeachclerk.com"
+STATUS_URL = "https://taxdeed.mypalmbeachclerk.com/#tabs-7"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -160,7 +161,6 @@ def is_valid_property_address(addr: str) -> bool:
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
-    # ex.: 18 BURGUNDY A
     if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
         return True
 
@@ -688,35 +688,16 @@ def fetch_address_from_property_appraiser_url(browser, url: str) -> dict:
 # =========================
 # SEARCH FLOW
 # =========================
-def click_status_like_human(page):
-    candidates = [
-        page.locator("a:has-text('Status')"),
-        page.locator("text=Status"),
-        page.locator("button:has-text('Status')"),
-    ]
-
-    chosen = None
-    for loc in candidates:
-        items = visible_elements(loc)
-        if items:
-            chosen = items[0]
-            break
-
-    if chosen is None:
-        raise RuntimeError("Could not locate Status")
-
-    human_click(chosen)
-    wait_network_quiet(page, 8000)
-    page.wait_for_timeout(1200)
-
-
 def find_search_for_select(page):
-    # prioridade: select com opção SALE
+    """
+    Abre direto na aba #tabs-7.
+    Procura o select que contém a opção SALE.
+    """
     selects = visible_elements(page.locator("select"))
     for sel in selects:
         try:
-            options_text = sel.locator("option").all_inner_texts()
-            joined = " | ".join(options_text).upper()
+            options = sel.locator("option").all_inner_texts()
+            joined = " | ".join(options).upper()
             if "SALE" in joined:
                 return sel
         except Exception:
@@ -725,7 +706,9 @@ def find_search_for_select(page):
 
 
 def find_from_to_inputs(page):
-    # primeiro tenta pelos ids reais
+    """
+    Prioridade para os ids reais dos campos.
+    """
     from_loc = page.locator("#SearchSaleDateFrom, [name='SearchSaleDateFrom']")
     to_loc = page.locator("#SearchSaleDateTo, [name='SearchSaleDateTo']")
 
@@ -735,7 +718,7 @@ def find_from_to_inputs(page):
     if from_items and to_items:
         return from_items[0], to_items[0]
 
-    # fallback: dois inputs de texto visíveis
+    # fallback
     text_inputs = visible_elements(page.locator("input[type='text']"))
     if len(text_inputs) >= 2:
         return text_inputs[0], text_inputs[1]
@@ -762,11 +745,9 @@ def do_status_search_like_human(page):
     from_date, to_date = build_search_dates()
     log.info("Palm Beach search window: %s -> %s", from_date, to_date)
 
-    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+    page.goto(STATUS_URL, wait_until="domcontentloaded", timeout=30000)
     wait_network_quiet(page, 10000)
-    page.wait_for_timeout(1600)
-
-    click_status_like_human(page)
+    page.wait_for_timeout(1800)
 
     search_for_select = find_search_for_select(page)
     if search_for_select is None:
@@ -926,7 +907,7 @@ def parse_case(html: str, url: str) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.3 exact human flow SALE-only + Property Appraiser fallback ===")
+    log.info("=== Palm Beach V6.4 direct-status-url SALE-only + Property Appraiser fallback ===")
 
     seen_cases = get_seen_cases()
 
