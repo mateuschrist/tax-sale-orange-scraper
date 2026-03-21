@@ -77,23 +77,12 @@ def debug_snapshot(page, label):
                 parentid: el.getAttribute("data-parentid") || ""
             }));
 
-            const tables = Array.from(document.querySelectorAll("table")).map(el => ({
-                id: el.id || "",
-                cls: el.className || ""
-            }));
-
-            const iframes = Array.from(document.querySelectorAll("iframe")).map(el => ({
-                id: el.id || "",
-                cls: el.className || "",
-                src: el.getAttribute("src") || ""
-            }));
-
-            const caseRows = Array.from(document.querySelectorAll("[data-caseid]")).map(el => ({
-                tag: el.tagName.toLowerCase(),
-                text: (el.innerText || "").trim().slice(0, 250),
-                id: el.id || "",
-                cls: el.className || "",
-                caseid: el.getAttribute("data-caseid") || ""
+            const selectedActive = Array.from(
+                document.querySelectorAll('a.filter-status-nosub.status-sub.selected[data-parentid="2"]')
+            ).map(el => ({
+                text: (el.innerText || "").trim(),
+                statusid: el.getAttribute("data-statusid") || "",
+                parentid: el.getAttribute("data-parentid") || ""
             }));
 
             return {
@@ -108,16 +97,15 @@ def debug_snapshot(page, label):
                 exists: {
                     filterButtonStatus: !!document.querySelector("#filterButtonStatus"),
                     caseStatus2: !!document.querySelector("#caseStatus2"),
-                    activeChild: !!document.querySelector('a[data-statusid="192"][data-parentid="2"]'),
+                    activeChild192: !!document.querySelector('a[data-statusid="192"][data-parentid="2"]'),
                     filtersSubmit: !!document.querySelector("button.filters-submit"),
-                    propertyAppraiserLink: !!document.querySelector("#propertyAppraiserLink"),
+                    filtersReset: !!document.querySelector("a.filters-reset"),
                     caseRowsExact: document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length
                 },
-                first_tables: tables.slice(0, 20),
-                first_rows: rows.slice(0, 30),
-                first_links: links.slice(0, 40),
-                first_iframes: iframes.slice(0, 10),
-                case_rows: caseRows.slice(0, 30)
+                status_label: (document.querySelector("#filterCaseStatusLabel")?.innerText || "").trim(),
+                selected_active_children: selectedActive,
+                first_rows: rows.slice(0, 20),
+                first_links: links.slice(0, 40)
             };
         }
         """
@@ -137,44 +125,112 @@ def debug_snapshot(page, label):
     log.info("HTML_SNIPPET: %s", snippet[:2000])
     log.info("DOM_COUNTS: %s", data["counts"])
     log.info("DOM_EXISTS: %s", data["exists"])
-    log.info("FIRST_TABLES: %s", data["first_tables"])
+    log.info("STATUS_LABEL: %s", data["status_label"])
+    log.info("SELECTED_ACTIVE_CHILDREN: %s", data["selected_active_children"])
     log.info("FIRST_ROWS: %s", data["first_rows"])
     log.info("FIRST_LINKS: %s", data["first_links"])
-    log.info("FIRST_IFRAMES: %s", data["first_iframes"])
-    log.info("CASE_ROWS: %s", data["case_rows"])
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def force_exact_active_192(page):
+    page.evaluate(
+        """
+        () => {
+            // Reset visual state for all Active children
+            document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]').forEach(el => {
+                el.classList.remove('selected');
+                const icon = el.querySelector('i');
+                if (icon) {
+                    icon.classList.remove('icon-ok-sign');
+                    icon.classList.add('icon-circle-blank');
+                }
+            });
+
+            // Reset parent visual state
+            const parent = document.querySelector('#caseStatus2');
+            if (parent) {
+                parent.classList.remove('selected');
+                const icon = parent.querySelector('i');
+                if (icon) {
+                    icon.classList.remove('icon-ok-sign');
+                    icon.classList.add('icon-circle-blank');
+                }
+            }
+
+            // Select only Active 192
+            const target = document.querySelector('a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]');
+            if (!target) throw new Error('Active 192 target not found');
+
+            target.classList.add('selected');
+            const targetIcon = target.querySelector('i');
+            if (targetIcon) {
+                targetIcon.classList.remove('icon-circle-blank');
+                targetIcon.classList.add('icon-ok-sign');
+            }
+
+            // Parent should show selected too
+            if (parent) {
+                parent.classList.add('selected');
+                const parentIcon = parent.querySelector('i');
+                if (parentIcon) {
+                    parentIcon.classList.remove('icon-circle-blank');
+                    parentIcon.classList.add('icon-ok-sign');
+                }
+            }
+
+            // Update visible label
+            const label = document.querySelector('#filterCaseStatusLabel');
+            if (label) label.textContent = '1 Selected';
+
+            // Try triggering common events
+            ['change', 'input', 'click'].forEach(evtName => {
+                try {
+                    target.dispatchEvent(new Event(evtName, { bubbles: true }));
+                } catch (e) {}
+            });
+
+            // Close dropdown if open
+            const group = document.querySelector('#caseFiltersStatus');
+            if (group) group.classList.remove('open');
+        }
+        """
+    )
+    log.info("Forced exact status selection: only 192")
+
+
 def run_filters(page):
-    log.info("Running Miami filters...")
+    log.info("Running Miami exact-192 filter flow...")
 
     page.wait_for_timeout(8000)
 
-    if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
-        raise RuntimeError("Could not click filter button")
-
+    # Reset first
+    click_safe(page, "a.filters-reset", "RESET FILTERS")
     page.wait_for_timeout(2000)
 
-    if not click_safe(page, "#caseStatus2", "ACTIVE PARENT"):
-        raise RuntimeError("Could not click active parent")
-
+    # Open dropdown
+    click_safe(page, "#filterButtonStatus", "FILTER BUTTON")
     page.wait_for_timeout(1500)
 
-    if not click_safe(page, 'a[data-statusid="192"][data-parentid="2"]', "ACTIVE CHILD"):
-        raise RuntimeError("Could not click active child")
+    # Parent open
+    click_safe(page, "#caseStatus2", "ACTIVE PARENT")
+    page.wait_for_timeout(1000)
 
-    page.wait_for_timeout(1500)
+    # Force exact only 192
+    force_exact_active_192(page)
+    page.wait_for_timeout(2000)
 
-    if not click_safe(page, "button.filters-submit", "SEARCH BUTTON"):
-        raise RuntimeError("Could not click search button")
+    # Snapshot before search to verify exact selection
+    debug_snapshot(page, "MIAMI AFTER EXACT 192 SELECTION")
 
+    # Search
+    click_safe(page, "button.filters-submit", "SEARCH BUTTON")
     log.info("Sleeping 40 seconds to let results load...")
     page.wait_for_timeout(40000)
 
 
 def run_miami():
-    log.info("=== MIAMI POST-SEARCH TEST MODE ===")
+    log.info("=== MIAMI EXACT 192 TEST MODE ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
