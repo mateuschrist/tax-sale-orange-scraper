@@ -1,14 +1,5 @@
 [
-  {
-    "name": "Orange",
-    "enabled": false
-  },
-  {
-    "name": "PalmBeach",
-    "enabled": false
-  },
-  {
-    "name": "MiamiDade",
-    "enabled" true
-  }
+  { "name": "Orange", "enabled": false },
+  { "name": "PalmBeach", "enabled": false },
+  { "name": "MiamiDade", "enabled": true }
 ]
