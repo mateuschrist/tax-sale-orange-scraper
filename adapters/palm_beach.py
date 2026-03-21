@@ -233,6 +233,31 @@ def build_search_dates():
     return today.strftime("%m/%d/%Y"), future.strftime("%m/%d/%Y")
 
 
+def wait_network_quiet(page, timeout=10000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass
+
+
+def click_first_matching(page, candidates) -> bool:
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                for i in range(loc.count()):
+                    item = loc.nth(i)
+                    try:
+                        if item.is_visible() and item.is_enabled():
+                            item.click()
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return False
+
+
 # =========================
 # SUPABASE DEDUP
 # =========================
@@ -548,13 +573,9 @@ def parse_address_from_property_appraiser_page(text: str) -> dict:
     t = text.replace("\r", "\n")
     lines = [norm(x) for x in t.splitlines() if norm(x)]
 
-    # formato típico:
-    # LOCATION ADDRESS
-    # 4054 MARIGOLD RD
-    # MUNICIPALITY
-    # UNINCORPORATED
     address = None
     municipality = None
+    zip_code = None
 
     for i, line in enumerate(lines):
         upper = line.upper()
@@ -567,16 +588,20 @@ def parse_address_from_property_appraiser_page(text: str) -> dict:
         if upper == "MUNICIPALITY" and i + 1 < len(lines):
             municipality = norm(lines[i + 1]).title()
 
+        if upper == "ZIP" and i + 1 < len(lines):
+            m = re.search(r"(\d{5})", lines[i + 1])
+            if m:
+                zip_code = m.group(1)
+
     if address:
         return {
             "address": address,
             "city": municipality,
             "state": "FL",
-            "zip": None,
+            "zip": zip_code,
             "source": "PROPERTY_APPRAISER_LOCATION_ADDRESS",
         }
 
-    # fallback regex mais permissivo
     m = re.search(
         r"LOCATION ADDRESS\s*\n+\s*(.+?)\s*\n+\s*MUNICIPALITY\s*\n+\s*(.+?)\s*\n",
         t,
@@ -636,55 +661,103 @@ def fetch_address_from_property_appraiser_url(browser, url: str) -> dict:
 # =========================
 # SEARCH-DRIVEN SALE LIST
 # =========================
-def wait_network_quiet(page, timeout=10000):
-    try:
-        page.wait_for_load_state("networkidle", timeout=timeout)
-    except PWTimeout:
-        pass
+def fill_status_date_inputs(page, from_date: str, to_date: str) -> bool:
+    """
+    Na aba Status, os 2 campos visíveis de texto são:
+    1º = from
+    2º = to
+    """
+    selectors = [
+        "input[type='text']",
+        "input",
+    ]
 
-
-def fill_first_matching_input(page, candidates, value) -> bool:
-    for sel in candidates:
+    for sel in selectors:
         try:
             loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.fill("")
-                loc.first.fill(value)
+            visible_inputs = []
+
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                try:
+                    if item.is_visible() and item.is_enabled():
+                        visible_inputs.append(item)
+                except Exception:
+                    continue
+
+            if len(visible_inputs) >= 2:
+                visible_inputs[0].click()
+                visible_inputs[0].fill("")
+                visible_inputs[0].type(from_date, delay=20)
+
+                visible_inputs[1].click()
+                visible_inputs[1].fill("")
+                visible_inputs[1].type(to_date, delay=20)
+
                 return True
         except Exception:
             continue
+
     return False
 
 
-def select_first_matching(page, candidates, label_or_value) -> bool:
-    for sel in candidates:
+def select_status_sale(page) -> bool:
+    """
+    Seleciona SALE no select visível da aba Status.
+    """
+    selectors = [
+        "select",
+    ]
+
+    for sel in selectors:
         try:
             loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
+            for i in range(loc.count()):
+                item = loc.nth(i)
                 try:
-                    loc.first.select_option(label=label_or_value)
-                    return True
+                    if not item.is_visible() or not item.is_enabled():
+                        continue
+
+                    try:
+                        item.select_option(label="SALE")
+                        return True
+                    except Exception:
+                        pass
+
+                    try:
+                        item.select_option(value="SALE")
+                        return True
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
-                try:
-                    loc.first.select_option(value=label_or_value)
-                    return True
-                except Exception:
-                    pass
+                    continue
         except Exception:
             continue
+
     return False
 
 
-def click_first_matching(page, candidates) -> bool:
-    for sel in candidates:
+def click_search_for_status(page) -> bool:
+    selectors = [
+        "input[type='submit'][value='Search for Status']",
+        "button:has-text('Search for Status')",
+        "text=Search for Status",
+    ]
+
+    for sel in selectors:
         try:
             loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click()
-                return True
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                try:
+                    if item.is_visible() and item.is_enabled():
+                        item.click()
+                        return True
+                except Exception:
+                    continue
         except Exception:
             continue
+
     return False
 
 
@@ -714,7 +787,6 @@ def goto_next_results_page(page) -> bool:
     candidates = [
         "a[title='Next Page']",
         "a[aria-label='Next Page']",
-        "td[id$='_pager_right'] a.ui-pg-button:has-text('Next')",
         "a:has-text('Next')",
         "span.ui-icon-seek-next",
     ]
@@ -730,10 +802,11 @@ def goto_next_results_page(page) -> bool:
                         aria = (item.get_attribute("aria-disabled") or "").lower()
                         if "disabled" in cls or aria == "true":
                             continue
-                        item.click()
-                        wait_network_quiet(page, 12000)
-                        page.wait_for_timeout(1500)
-                        return True
+                        if item.is_visible() and item.is_enabled():
+                            item.click()
+                            wait_network_quiet(page, 12000)
+                            page.wait_for_timeout(1500)
+                            return True
                     except Exception:
                         continue
         except Exception:
@@ -750,45 +823,23 @@ def discover_sale_case_links(page) -> list[str]:
     wait_network_quiet(page, 10000)
     page.wait_for_timeout(1500)
 
-    click_first_matching(page, [
+    opened = click_first_matching(page, [
         "text=Status",
         "a:has-text('Status')",
         "button:has-text('Status')",
     ])
-    page.wait_for_timeout(1000)
+    if not opened:
+        raise RuntimeError("Could not open Status tab")
 
-    selected = select_first_matching(page, [
-        "select[name*='status' i]",
-        "select[id*='status' i]",
-        "select",
-    ], "SALE")
+    page.wait_for_timeout(1200)
 
-    if not selected:
+    if not select_status_sale(page):
         raise RuntimeError("Could not select SALE in Status search")
 
-    ok_from = fill_first_matching_input(page, [
-        "input[name*='from' i]",
-        "input[id*='from' i]",
-        "input[placeholder*='from' i]",
-    ], from_date)
-
-    ok_to = fill_first_matching_input(page, [
-        "input[name*='to' i]",
-        "input[id*='to' i]",
-        "input[placeholder*='to' i]",
-    ], to_date)
-
-    if not ok_from or not ok_to:
+    if not fill_status_date_inputs(page, from_date, to_date):
         raise RuntimeError("Could not fill from/to dates in Status search")
 
-    clicked = click_first_matching(page, [
-        "input[type='submit'][value*='Status']",
-        "button:has-text('Search for Status')",
-        "text=Search for Status",
-        "input[value='Search for Status']",
-    ])
-
-    if not clicked:
+    if not click_search_for_status(page):
         raise RuntimeError("Could not click Search for Status")
 
     wait_network_quiet(page, 15000)
@@ -869,7 +920,7 @@ def parse_case(html: str, url: str) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.1 search-driven SALE-only + Property Appraiser fallback ===")
+    log.info("=== Palm Beach V6.2 search-driven SALE-only + Property Appraiser fallback ===")
 
     seen_cases = get_seen_cases()
 
