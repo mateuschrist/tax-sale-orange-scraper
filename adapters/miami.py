@@ -5,7 +5,7 @@ import time
 import logging
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 log = logging.getLogger("miami")
 
@@ -61,59 +61,134 @@ def wait(page, ms=1500):
 
 
 # =========================
-# FILTER FLOW (EXATO)
+# 🔍 DOM SCANNER
+# =========================
+def scan_dom(page):
+    data = page.evaluate("""
+    () => {
+        const result = {
+            filter: null,
+            parent: null,
+            child: null,
+            search: null
+        };
+
+        // FILTER BUTTON
+        document.querySelectorAll("button").forEach(el => {
+            const text = (el.innerText || "").trim();
+            const cls = el.className || "";
+            const id = el.id || "";
+
+            if (
+                id === "filterButtonStatus" ||
+                cls.includes("filter-case-status") ||
+                text.includes("Select Case Status")
+            ) {
+                result.filter = id ? "#" + id : el.tagName.toLowerCase();
+            }
+        });
+
+        // ACTIVE PARENT
+        document.querySelectorAll("a").forEach(el => {
+            const id = el.id || "";
+            const status = el.getAttribute("data-statusid") || "";
+
+            if (id === "caseStatus2" || status === "2") {
+                result.parent = id ? "#" + id : el.tagName.toLowerCase();
+            }
+        });
+
+        // ACTIVE CHILD
+        document.querySelectorAll("a").forEach(el => {
+            const status = el.getAttribute("data-statusid") || "";
+            const parent = el.getAttribute("data-parentid") || "";
+
+            if (status === "192" && parent === "2") {
+                result.child = el.tagName.toLowerCase() + '[data-statusid="192"]';
+            }
+        });
+
+        // SEARCH BUTTON
+        document.querySelectorAll("button").forEach(el => {
+            const text = (el.innerText || "").trim();
+            const cls = el.className || "";
+
+            if (cls.includes("filters-submit") || text.includes("Search")) {
+                result.search = el.tagName.toLowerCase() + ".filters-submit";
+            }
+        });
+
+        return result;
+    }
+    """)
+    return data
+
+
+# =========================
+# CLICK ENGINE
+# =========================
+def click_safe(page, selector, name):
+    if not selector:
+        raise Exception(f"{name} selector missing")
+
+    log.info(f"Clicking {name}: {selector}")
+
+    try:
+        page.locator(selector).first.click(timeout=5000)
+        return
+    except:
+        pass
+
+    try:
+        page.locator(selector).first.click(force=True)
+        return
+    except:
+        pass
+
+    page.evaluate(f"""
+        (() => {{
+            const el = document.querySelector("{selector}");
+            if (el) el.click();
+        }})()
+    """)
+
+
+# =========================
+# FILTER FLOW
 # =========================
 def run_filters(page):
-    log.info("Opening Miami site...")
-    page.goto(LIST_URL, timeout=30000)
+    log.info("Opening Miami...")
+    page.goto(LIST_URL)
 
-    # esperar site carregar bem
     page.wait_for_load_state("networkidle")
-    wait(page, 4000)
+    wait(page, 5000)
 
-    # =====================
-    # STEP 1: abrir dropdown
-    # =====================
-    page.wait_for_selector("#filterButtonStatus", timeout=20000)
-    page.locator("#filterButtonStatus").click()
-    wait(page, 1200)
+    scan = scan_dom(page)
+    log.info(f"SCAN RESULT: {scan}")
 
-    # =====================
-    # STEP 2: active parent
-    # =====================
-    page.wait_for_selector("#caseStatus2", timeout=20000)
-    page.locator("#caseStatus2").click()
-    wait(page, 800)
+    click_safe(page, scan["filter"], "FILTER")
+    wait(page, 1500)
 
-    # =====================
-    # STEP 3: active child
-    # =====================
-    page.wait_for_selector('a[data-statusid="192"][data-parentid="2"]', timeout=20000)
-    page.locator('a[data-statusid="192"][data-parentid="2"]').click()
-    wait(page, 800)
+    click_safe(page, scan["parent"], "ACTIVE PARENT")
+    wait(page, 1000)
 
-    # =====================
-    # STEP 4: search
-    # =====================
-    page.wait_for_selector("button.filters-submit", timeout=20000)
-    page.locator("button.filters-submit").click()
+    click_safe(page, scan["child"], "ACTIVE CHILD")
+    wait(page, 1000)
 
-    log.info("Search executed, waiting results...")
+    click_safe(page, scan["search"], "SEARCH")
 
-    # site é lento — respeitar isso
-    page.wait_for_load_state("networkidle")
-    wait(page, 6000)
+    log.info("Waiting results...")
+    wait(page, 7000)
 
 
 # =========================
 # LIST EXTRACTION
 # =========================
-def extract_case_links(page):
+def extract_links(page):
     links = []
-
     rows = page.locator("tr.load-case.table-row.link[data-caseid]")
-    count = rows.count()
 
+    count = rows.count()
     log.info(f"Rows found: {count}")
 
     for i in range(count):
@@ -141,27 +216,26 @@ def parse_case(html, url):
     pa = soup.select_one("#propertyAppraiserLink")
 
     return {
-        "case_number": pick(text, "Case Number"),
+        "case": pick(text, "Case Number"),
         "status": pick(text, "Case Status"),
-        "opening_bid": pick(text, "Opening Bid"),
-        "sale_date": pick(text, "Sale Date"),
+        "bid": pick(text, "Opening Bid"),
+        "date": pick(text, "Sale Date"),
         "address": pick(text, "Property Address"),
         "parcel": norm(pa.get_text()) if pa else None,
         "pa_url": pa["href"] if pa else None,
-        "url": url,
+        "url": url
     }
 
 
-def valid_case(html):
-    t = html.upper()
-    return "CASE SUMMARY" in t
+def valid(html):
+    return "CASE SUMMARY" in html.upper()
 
 
 # =========================
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI V3 EXACT FLOW ===")
+    log.info("=== MIAMI V4 SCAN ENGINE ===")
 
     seen = get_seen()
 
@@ -171,18 +245,18 @@ def run_miami():
 
         run_filters(page)
 
-        case_links = extract_case_links(page)
-        log.info(f"Cases found: {len(case_links)}")
+        links = extract_links(page)
+        log.info(f"Cases found: {len(links)}")
 
         s = requests.Session()
 
-        for i, link in enumerate(case_links):
+        for i, link in enumerate(links):
             log.info(f"[{i+1}] {link}")
 
             try:
                 r = s.get(link, timeout=20)
 
-                if r.status_code != 200 or not valid_case(r.text):
+                if r.status_code != 200 or not valid(r.text):
                     continue
 
                 data = parse_case(r.text, link)
@@ -190,30 +264,30 @@ def run_miami():
                 if data["status"] != "ACTIVE":
                     continue
 
-                if data["case_number"] in seen:
+                if data["case"] in seen:
                     continue
 
                 payload = {
                     "county": "MiamiDade",
                     "state": "FL",
-                    "node": data["case_number"],
+                    "node": data["case"],
                     "auction_source_url": data["url"],
                     "parcel_number": data["parcel"],
-                    "sale_date": data["sale_date"],
-                    "opening_bid": clean_money(data["opening_bid"]),
+                    "sale_date": data["date"],
+                    "opening_bid": clean_money(data["bid"]),
                     "deed_status": data["status"],
                     "address": data["address"],
-                    "property_appraiser_url": data["pa_url"],
+                    "property_appraiser_url": data["pa_url"]
                 }
 
                 print(json.dumps(payload, indent=2))
 
-                add_seen(data["case_number"])
-                seen.add(data["case_number"])
+                add_seen(data["case"])
+                seen.add(data["case"])
 
                 time.sleep(0.8)
 
             except Exception as e:
-                log.error(f"ERROR: {e}")
+                log.error(e)
 
         browser.close()
