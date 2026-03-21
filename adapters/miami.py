@@ -5,11 +5,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 log = logging.getLogger("miami")
 
-BASE_URL = "https://miamidade.realtdm.com"
-LIST_URL = f"{BASE_URL}/public/cases/list"
+LIST_URL = "https://miamidade.realtdm.com/public/cases/list"
 
 
-def wait_network_quiet(page, timeout=15000):
+def wait_network_quiet(page, timeout=20000):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PWTimeout:
@@ -32,7 +31,7 @@ def debug_dom_snapshot(page):
     except Exception:
         html = ""
 
-    snippet = re.sub(r"\s+", " ", html[:5000])
+    snippet = re.sub(r"\s+", " ", html[:6000])
 
     data = page.evaluate(
         """
@@ -63,6 +62,13 @@ def debug_dom_snapshot(page):
             }));
 
             return {
+                navigator: {
+                    userAgent: navigator.userAgent,
+                    language: navigator.language,
+                    languages: navigator.languages,
+                    platform: navigator.platform,
+                    webdriver: navigator.webdriver
+                },
                 counts: {
                     buttons: buttons.length,
                     links: links.length,
@@ -91,10 +97,11 @@ def debug_dom_snapshot(page):
         "dom_scan": data,
     }
 
-    log.info("===== MIAMI TEST SNAPSHOT =====")
+    log.info("===== MIAMI HUMAN TEST SNAPSHOT =====")
     log.info("TITLE: %s", title)
     log.info("URL: %s", url)
     log.info("HTML_SNIPPET: %s", snippet[:1500])
+    log.info("NAVIGATOR: %s", data["navigator"])
     log.info("DOM_COUNTS: %s", data["counts"])
     log.info("DOM_EXISTS: %s", data["exists"])
     log.info("FIRST_BUTTONS: %s", data["first_buttons"])
@@ -105,15 +112,49 @@ def debug_dom_snapshot(page):
 
 
 def run_miami():
-    log.info("=== MIAMI TEST ONLY MODE ===")
+    log.info("=== MIAMI HUMAN TEST MODE ===")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
 
-        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=30000)
-        wait_network_quiet(page, 15000)
-        page.wait_for_timeout(8000)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            screen={"width": 1366, "height": 768},
+            locale="en-US",
+            timezone_id="America/New_York",
+            color_scheme="light",
+            device_scale_factor=1,
+            has_touch=False,
+            is_mobile=False,
+        )
+
+        page = context.new_page()
+
+        # Some sites react better when common headers are set explicitly
+        page.set_extra_http_headers(
+            {
+                "Accept-Language": "en-US,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1",
+                "DNT": "1",
+            }
+        )
+
+        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=45000)
+        wait_network_quiet(page, 20000)
+        page.wait_for_timeout(10000)
 
         debug_dom_snapshot(page)
 
