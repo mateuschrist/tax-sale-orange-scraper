@@ -71,58 +71,79 @@ def log_status_debug(page, title):
     log.info("SELECTED BY ICON: %s", dbg["selected_by_icon"])
 
 
-def clear_all_active_children_by_click(page):
-    # abre o dropdown antes
-    children = page.locator('a.filter-status-nosub.status-sub[data-parentid="2"]')
-    count = children.count()
+def force_clear_all_active_statuses(page):
+    page.evaluate(
+        """
+        () => {
+            const children = document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]');
 
-    for i in range(count):
-        child = children.nth(i)
-        try:
-            statusid = child.get_attribute("data-statusid")
-            cls = child.get_attribute("class") or ""
-            icon_cls = ""
-            try:
-                icon_cls = child.locator("i").first.get_attribute("class") or ""
-            except Exception:
-                pass
+            children.forEach(el => {
+                el.classList.remove('selected');
 
-            # se estiver marcado por classe ou por ícone, clica para desmarcar
-            if "selected" in cls or "icon-ok-sign" in icon_cls:
-                try:
-                    child.click(timeout=3000)
-                    log.info(f"Unselected child status {statusid}")
-                    page.wait_for_timeout(400)
-                except Exception:
-                    try:
-                        child.click(force=True, timeout=3000)
-                        log.info(f"Unselected child status {statusid} (force)")
-                        page.wait_for_timeout(400)
-                    except Exception:
-                        log.warning(f"Could not unselect child status {statusid}")
-        except Exception:
-            continue
+                const icon = el.querySelector('i');
+                if (icon) {
+                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    if (!icon.className.includes('icon-circle-blank')) {
+                        icon.className = (icon.className + ' icon-circle-blank').trim();
+                    }
+                }
+            });
+
+            const parent = document.querySelector('#caseStatus2');
+            if (parent) {
+                parent.classList.remove('selected');
+                const icon = parent.querySelector('i');
+                if (icon) {
+                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    if (!icon.className.includes('icon-circle-blank')) {
+                        icon.className = (icon.className + ' icon-circle-blank').trim();
+                    }
+                }
+            }
+
+            const label = document.querySelector('#filterCaseStatusLabel');
+            if (label) label.innerText = 'None Selected';
+        }
+        """
+    )
+    log.info("Cleared all Active child statuses via JS")
 
 
-def ensure_only_192_selected(page):
-    # 1) abrir dropdown
-    if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
-        raise RuntimeError("Could not open filter dropdown")
-    page.wait_for_timeout(1500)
+def force_select_only_192(page):
+    page.evaluate(
+        """
+        () => {
+            const el = document.querySelector('a[data-statusid="192"][data-parentid="2"]');
+            if (!el) throw new Error("Status 192 not found");
 
-    # 2) NÃO clicar no parent
-    # 3) limpar o que estiver marcado no grupo Active
-    clear_all_active_children_by_click(page)
-    page.wait_for_timeout(1000)
+            el.classList.add('selected');
 
-    # 4) clicar somente no 192
-    target = 'a[data-statusid="192"][data-parentid="2"]'
-    if not click_safe(page, target, "ACTIVE CHILD 192"):
-        raise RuntimeError("Could not click status 192")
-    page.wait_for_timeout(1500)
+            const icon = el.querySelector('i');
+            if (icon) {
+                icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                if (!icon.className.includes('icon-ok-sign')) {
+                    icon.className = (icon.className + ' icon-ok-sign').trim();
+                }
+            }
 
-    # 5) log de verificação
-    log_status_debug(page, "AFTER CLICKING ONLY 192")
+            const parent = document.querySelector('#caseStatus2');
+            if (parent) {
+                parent.classList.add('selected');
+                const picon = parent.querySelector('i');
+                if (picon) {
+                    picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    if (!picon.className.includes('icon-ok-sign')) {
+                        picon.className = (picon.className + ' icon-ok-sign').trim();
+                    }
+                }
+            }
+
+            const label = document.querySelector('#filterCaseStatusLabel');
+            if (label) label.innerText = '1 Selected';
+        }
+        """
+    )
+    log.info("Forced only status 192 via JS")
 
 
 def run_search(page):
@@ -134,7 +155,17 @@ def run_search(page):
         raise RuntimeError("Could not reset filters")
     page.wait_for_timeout(2000)
 
-    ensure_only_192_selected(page)
+    if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
+        raise RuntimeError("Could not open filter button")
+    page.wait_for_timeout(1500)
+
+    force_clear_all_active_statuses(page)
+    page.wait_for_timeout(800)
+
+    force_select_only_192(page)
+    page.wait_for_timeout(1200)
+
+    log_status_debug(page, "AFTER FORCING ONLY 192")
 
     if not click_safe(page, "button.filters-submit", "SEARCH BUTTON"):
         raise RuntimeError("Could not click search")
@@ -148,21 +179,24 @@ def extract_rows_debug(page):
     count = rows.count()
     log.info(f"FOUND {count} CASE ROWS")
 
-    for i in range(min(count, 10)):
+    for i in range(min(count, 20)):
         row = rows.nth(i)
+
         try:
             caseid = row.get_attribute("data-caseid")
         except Exception:
             caseid = None
+
         try:
             text = row.inner_text().strip().replace("\n", " ")
         except Exception:
             text = ""
+
         log.info(f"ROW {i+1}: caseid={caseid} text={text}")
 
 
 def run_miami():
-    log.info("=== MIAMI FILTER-192 ONLY TEST ===")
+    log.info("=== MIAMI FILTER-192 CLEAN TEST ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -187,6 +221,7 @@ def run_miami():
         )
 
         page = context.new_page()
+
         page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
 
         run_search(page)
