@@ -5,6 +5,10 @@
   },
   {
     "name": "PalmBeach",
-    "enabled": true
+    "enabled": false
+  }
+  {
+    "name": "MiamiDade",
+    "enabled" true
   }
 ]
