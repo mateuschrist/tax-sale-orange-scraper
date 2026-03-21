@@ -4,6 +4,7 @@ import json
 import time
 import logging
 from io import BytesIO
+from datetime import date, timedelta
 from urllib.parse import urljoin, quote
 
 import requests
@@ -16,7 +17,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 log = logging.getLogger("taxdeed-palmbeach")
 
 BASE_URL = "https://taxdeed.mypalmbeachclerk.com"
-DETAILS_URL = BASE_URL + "/Home/Details?id={id}"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -31,10 +31,12 @@ SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").s
 CAN_CHECK_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
-
-PALM_BEACH_START_ID = int(os.getenv("PALM_BEACH_START_ID", "64600"))
-PALM_BEACH_MAX_IDS = int(os.getenv("PALM_BEACH_MAX_IDS", "150"))
 STATE_FILE = os.getenv("PALM_BEACH_STATE_FILE", "state_palm_beach.json")
+
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+PALM_BEACH_MAX_CASES = int(os.getenv("PALM_BEACH_MAX_CASES", "300"))
+PALM_BEACH_FROM_DATE = (os.getenv("PALM_BEACH_FROM_DATE", "") or "").strip()
+PALM_BEACH_TO_DATE = (os.getenv("PALM_BEACH_TO_DATE", "") or "").strip()
 
 
 # =========================
@@ -55,15 +57,23 @@ def save_state(data):
     os.replace(tmp, STATE_FILE)
 
 
-def get_last():
-    return load_state().get("last_pb_id")
+def get_seen_cases():
+    st = load_state()
+    seen = st.get("seen_case_numbers", [])
+    if isinstance(seen, list):
+        return set(str(x) for x in seen if x)
+    return set()
 
 
-def set_last(i: int):
-    s = load_state()
-    s["last_pb_id"] = i
-    s["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_state(s)
+def add_seen_case(case_number: str):
+    if not case_number:
+        return
+    st = load_state()
+    seen = set(st.get("seen_case_numbers", []))
+    seen.add(str(case_number))
+    st["seen_case_numbers"] = sorted(seen)
+    st["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(st)
 
 
 # =========================
@@ -149,7 +159,6 @@ def is_valid_property_address(addr: str) -> bool:
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
-    # aceita alguns formatos de unidade/lote sem padrão clássico
     if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
         return True
 
@@ -215,6 +224,15 @@ def send(payload):
         return False
 
 
+def build_search_dates():
+    if PALM_BEACH_FROM_DATE and PALM_BEACH_TO_DATE:
+        return PALM_BEACH_FROM_DATE, PALM_BEACH_TO_DATE
+
+    today = date.today()
+    future = today + timedelta(days=365)
+    return today.strftime("%m/%d/%Y"), future.strftime("%m/%d/%Y")
+
+
 # =========================
 # SUPABASE DEDUP
 # =========================
@@ -243,7 +261,6 @@ def supabase_find_existing_case(node: str):
         if r.status_code == 200:
             arr = r.json()
             return arr[0] if arr else None
-        log.warning("supabase_find_existing_case status=%s body=%s", r.status_code, r.text[:300])
     except Exception as e:
         log.warning("supabase_find_existing_case failed: %s", str(e))
 
@@ -268,7 +285,6 @@ def supabase_find_existing_property(parcel_number: str, sale_date: str):
         if r.status_code == 200:
             arr = r.json()
             return arr[0] if arr else None
-        log.warning("supabase_find_existing_property status=%s body=%s", r.status_code, r.text[:300])
     except Exception as e:
         log.warning("supabase_find_existing_property failed: %s", str(e))
 
@@ -318,51 +334,6 @@ def should_send_payload(payload: dict):
         return False, "duplicate parcel_number + sale_date already exists"
 
     return True, "new record"
-
-
-# =========================
-# CASE HTML
-# =========================
-def is_valid_case(html: str) -> bool:
-    t = html.lower()
-    return (
-        "case number" in t and
-        "parcel id" in t and
-        "auction date" in t
-    )
-
-
-def parse_case(html: str, url: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-
-    def pick(label):
-        m = re.search(rf"{re.escape(label)}\s*\n\s*(.+)", text, re.I)
-        return norm(m.group(1)) if m else None
-
-    tax_url = None
-    pdf_url = None
-
-    for a in soup.find_all("a", href=True):
-        label = norm(a.get_text()).lower()
-        href = urljoin(url, a["href"])
-
-        if "tax collector" in label:
-            tax_url = href
-
-        if "tax certificate" in label:
-            pdf_url = href
-
-    return {
-        "case": pick("Case Number"),
-        "parcel": pick("Parcel ID"),
-        "date": pick("Auction Date"),
-        "status": pick("Status"),
-        "bid": pick("Opening Bid"),
-        "applicant": pick("Applicant Names"),
-        "tax": tax_url,
-        "pdf": pdf_url,
-    }
 
 
 # =========================
@@ -425,7 +396,6 @@ def parse_location_or_mailing_address(text: str) -> dict:
 
     t = text.replace("\r", "\n")
 
-    # 1) PRIORIDADE: Location Address
     m_loc = re.search(r"Location Address\s*:\s*(.+)", t, re.I)
     if m_loc:
         street = normalize_property_address(m_loc.group(1))
@@ -457,7 +427,6 @@ def parse_location_or_mailing_address(text: str) -> dict:
                 "source": "PDF_LOCATION_ADDRESS",
             }
 
-    # 2) FALLBACK: Mailing Address
     m_mail = re.search(
         r"Mailing Address\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z ]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
         t,
@@ -550,7 +519,6 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
     page_order = build_adaptive_page_order(total_pages)
     log.info("Adaptive PDF page order: %s", page_order)
 
-    # 1) Texto primeiro
     for p in page_order:
         txt = read_single_pdf_page(pdf_bytes, p)
         if txt:
@@ -559,7 +527,6 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
                 log.info("Address found in PDF text on page %s (%s)", p, addr.get("source"))
                 return addr
 
-    # 2) OCR depois
     for p in page_order:
         txt = ocr_single_pdf_page(pdf_bytes, p)
         if txt:
@@ -572,59 +539,68 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
 
 
 # =========================
-# FINAL FALLBACK: TAX URL
+# PROPERTY APPRAISER FALLBACK
 # =========================
-def parse_address_from_tax_page(text: str) -> dict:
+def parse_address_from_property_appraiser_page(text: str) -> dict:
     if not text:
         return empty_addr()
 
     t = text.replace("\r", "\n")
-
-    patterns = [
-        r"Property Address\s*:?\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-        r"Property Address\s*:?\s*(.+?)\s+([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, t, re.I | re.S)
-        if m:
-            addr = normalize_property_address(m.group(1))
-            if is_valid_property_address(addr):
-                return {
-                    "address": addr,
-                    "city": norm(m.group(2)).title(),
-                    "state": "FL",
-                    "zip": m.group(3),
-                    "source": "TAX_PAGE_PROPERTY_ADDRESS",
-                }
-
     lines = [norm(x) for x in t.splitlines() if norm(x)]
+
+    # formato típico:
+    # LOCATION ADDRESS
+    # 4054 MARIGOLD RD
+    # MUNICIPALITY
+    # UNINCORPORATED
+    address = None
+    municipality = None
+
     for i, line in enumerate(lines):
-        if "property address" in line.lower():
-            window = "\n".join(lines[i:i+10])
-            m = re.search(
-                r"(\d{1,6}\s+[A-Z0-9 .'\-#/]+)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-                window,
-                re.I
-            )
-            if m:
-                addr = normalize_property_address(m.group(1))
-                if is_valid_property_address(addr):
-                    return {
-                        "address": addr,
-                        "city": norm(m.group(2)).title(),
-                        "state": "FL",
-                        "zip": m.group(3),
-                        "source": "TAX_PAGE_PROPERTY_ADDRESS",
-                    }
+        upper = line.upper()
+
+        if upper == "LOCATION ADDRESS" and i + 1 < len(lines):
+            cand = normalize_property_address(lines[i + 1])
+            if is_valid_property_address(cand):
+                address = cand
+
+        if upper == "MUNICIPALITY" and i + 1 < len(lines):
+            municipality = norm(lines[i + 1]).title()
+
+    if address:
+        return {
+            "address": address,
+            "city": municipality,
+            "state": "FL",
+            "zip": None,
+            "source": "PROPERTY_APPRAISER_LOCATION_ADDRESS",
+        }
+
+    # fallback regex mais permissivo
+    m = re.search(
+        r"LOCATION ADDRESS\s*\n+\s*(.+?)\s*\n+\s*MUNICIPALITY\s*\n+\s*(.+?)\s*\n",
+        t,
+        re.I | re.S
+    )
+    if m:
+        addr = normalize_property_address(m.group(1))
+        muni = norm(m.group(2)).title()
+        if is_valid_property_address(addr):
+            return {
+                "address": addr,
+                "city": muni,
+                "state": "FL",
+                "zip": None,
+                "source": "PROPERTY_APPRAISER_LOCATION_ADDRESS",
+            }
 
     return empty_addr()
 
 
-def fetch_address_from_taxdeed_url(browser, url: str) -> dict:
+def fetch_address_from_property_appraiser_url(browser, url: str) -> dict:
     page = browser.new_page()
     try:
-        log.info("Final fallback opening tax URL: %s", url)
+        log.info("Final fallback opening Property Appraiser URL: %s", url)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
         try:
@@ -633,22 +609,22 @@ def fetch_address_from_taxdeed_url(browser, url: str) -> dict:
             pass
 
         try:
-            page.locator("text=Property Address").first.wait_for(timeout=10000)
+            page.locator("text=LOCATION ADDRESS").first.wait_for(timeout=10000)
         except PWTimeout:
-            log.info("Property Address not explicitly found within 10s; parsing full body anyway")
+            log.info("LOCATION ADDRESS not explicitly found within 10s; parsing full body anyway")
 
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1200)
 
         body_text = page.locator("body").inner_text(timeout=10000)
-        addr = parse_address_from_tax_page(body_text)
+        addr = parse_address_from_property_appraiser_page(body_text)
 
         if not addr.get("address"):
-            log.info("Tax page snippet: %s", body_text[:1200].replace("\n", " "))
+            log.info("Property Appraiser snippet: %s", body_text[:1200].replace("\n", " "))
 
         return addr
 
     except Exception as e:
-        log.warning("Tax URL fallback failed: %s", str(e))
+        log.warning("Property Appraiser fallback failed: %s", str(e))
         return empty_addr()
     finally:
         try:
@@ -658,54 +634,298 @@ def fetch_address_from_taxdeed_url(browser, url: str) -> dict:
 
 
 # =========================
+# SEARCH-DRIVEN SALE LIST
+# =========================
+def wait_network_quiet(page, timeout=10000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass
+
+
+def fill_first_matching_input(page, candidates, value) -> bool:
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.fill("")
+                loc.first.fill(value)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def select_first_matching(page, candidates, label_or_value) -> bool:
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                try:
+                    loc.first.select_option(label=label_or_value)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    loc.first.select_option(value=label_or_value)
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return False
+
+
+def click_first_matching(page, candidates) -> bool:
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def extract_case_links_from_current_results(page) -> list[str]:
+    hrefs = []
+    anchors = page.locator("a[href*='/Home/Details?id=']")
+    count = anchors.count()
+
+    for i in range(count):
+        try:
+            href = anchors.nth(i).get_attribute("href")
+            if href:
+                hrefs.append(urljoin(BASE_URL, href))
+        except Exception:
+            continue
+
+    out = []
+    seen = set()
+    for h in hrefs:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def goto_next_results_page(page) -> bool:
+    candidates = [
+        "a[title='Next Page']",
+        "a[aria-label='Next Page']",
+        "td[id$='_pager_right'] a.ui-pg-button:has-text('Next')",
+        "a:has-text('Next')",
+        "span.ui-icon-seek-next",
+    ]
+
+    for sel in candidates:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                for i in range(loc.count()):
+                    item = loc.nth(i)
+                    try:
+                        cls = (item.get_attribute("class") or "").lower()
+                        aria = (item.get_attribute("aria-disabled") or "").lower()
+                        if "disabled" in cls or aria == "true":
+                            continue
+                        item.click()
+                        wait_network_quiet(page, 12000)
+                        page.wait_for_timeout(1500)
+                        return True
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+    return False
+
+
+def discover_sale_case_links(page) -> list[str]:
+    from_date, to_date = build_search_dates()
+    log.info("Palm Beach search window: %s -> %s", from_date, to_date)
+
+    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+    wait_network_quiet(page, 10000)
+    page.wait_for_timeout(1500)
+
+    click_first_matching(page, [
+        "text=Status",
+        "a:has-text('Status')",
+        "button:has-text('Status')",
+    ])
+    page.wait_for_timeout(1000)
+
+    selected = select_first_matching(page, [
+        "select[name*='status' i]",
+        "select[id*='status' i]",
+        "select",
+    ], "SALE")
+
+    if not selected:
+        raise RuntimeError("Could not select SALE in Status search")
+
+    ok_from = fill_first_matching_input(page, [
+        "input[name*='from' i]",
+        "input[id*='from' i]",
+        "input[placeholder*='from' i]",
+    ], from_date)
+
+    ok_to = fill_first_matching_input(page, [
+        "input[name*='to' i]",
+        "input[id*='to' i]",
+        "input[placeholder*='to' i]",
+    ], to_date)
+
+    if not ok_from or not ok_to:
+        raise RuntimeError("Could not fill from/to dates in Status search")
+
+    clicked = click_first_matching(page, [
+        "input[type='submit'][value*='Status']",
+        "button:has-text('Search for Status')",
+        "text=Search for Status",
+        "input[value='Search for Status']",
+    ])
+
+    if not clicked:
+        raise RuntimeError("Could not click Search for Status")
+
+    wait_network_quiet(page, 15000)
+    page.wait_for_timeout(2500)
+
+    all_links = []
+    seen = set()
+
+    for _ in range(50):
+        page_links = extract_case_links_from_current_results(page)
+
+        for h in page_links:
+            if h not in seen:
+                seen.add(h)
+                all_links.append(h)
+
+        if PALM_BEACH_MAX_CASES > 0 and len(all_links) >= PALM_BEACH_MAX_CASES:
+            return all_links[:PALM_BEACH_MAX_CASES]
+
+        moved = goto_next_results_page(page)
+        if not moved:
+            break
+
+    return all_links[:PALM_BEACH_MAX_CASES] if PALM_BEACH_MAX_CASES > 0 else all_links
+
+
+# =========================
+# CASE HTML
+# =========================
+def is_valid_case(html: str) -> bool:
+    t = html.lower()
+    return (
+        "case number" in t and
+        "parcel id" in t and
+        "auction date" in t
+    )
+
+
+def parse_case(html: str, url: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    def pick(label):
+        m = re.search(rf"{re.escape(label)}\s*\n\s*(.+)", text, re.I)
+        return norm(m.group(1)) if m else None
+
+    tax_url = None
+    pdf_url = None
+    property_appraiser_url = None
+
+    for a in soup.find_all("a", href=True):
+        label = norm(a.get_text()).lower()
+        href = urljoin(url, a["href"])
+
+        if "tax collector" in label:
+            tax_url = href
+
+        if "tax certificate" in label:
+            pdf_url = href
+
+        if "property appraiser" in label:
+            property_appraiser_url = href
+
+    return {
+        "case": pick("Case Number"),
+        "parcel": pick("Parcel ID"),
+        "date": pick("Auction Date"),
+        "status": pick("Status"),
+        "bid": pick("Opening Bid"),
+        "applicant": pick("Applicant Names"),
+        "tax": tax_url,
+        "pdf": pdf_url,
+        "property_appraiser": property_appraiser_url,
+    }
+
+
+# =========================
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach corrected mode: SALE only + dedup + PDF-first ===")
+    log.info("=== Palm Beach V6.1 search-driven SALE-only + Property Appraiser fallback ===")
 
-    s = requests.Session()
-    s.headers.update(HEADERS)
-
-    start = (get_last() or (PALM_BEACH_START_ID - 1)) + 1
-    end = start + PALM_BEACH_MAX_IDS
-
-    invalid = 0
+    seen_cases = get_seen_cases()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context()
+        page = context.new_page()
 
-        for i in range(start, end):
-            log.info("Palm Beach ID %s", i)
+        try:
+            case_links = discover_sale_case_links(page)
+            log.info("Discovered %s SALE case links from search", len(case_links))
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        if not case_links:
+            log.warning("No SALE case links discovered from search")
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return
+
+        s = requests.Session()
+        s.headers.update(HEADERS)
+
+        for idx, case_url in enumerate(case_links, start=1):
+            log.info("Palm Beach case %s/%s → %s", idx, len(case_links), case_url)
 
             try:
-                r = s.get(DETAILS_URL.format(id=i), timeout=30)
+                r = s.get(case_url, timeout=30)
 
                 if r.status_code != 200 or not is_valid_case(r.text):
-                    invalid += 1
-                    if invalid > 40:
-                        log.warning("Stop: dead range")
-                        break
+                    log.warning("Invalid case page at %s", case_url)
                     continue
 
-                invalid = 0
                 case = parse_case(r.text, r.url)
 
-                # =========================
-                # CRITICAL BUSINESS RULE:
-                # ONLY SALE
-                # =========================
                 status_value = (case.get("status") or "").strip().upper()
                 if status_value != "SALE":
                     log.info(
-                        "SKIPPED id=%s because status is not SALE → %s",
-                        i,
+                        "SKIPPED case because status is not SALE → %s (%s)",
                         case.get("status"),
+                        case.get("case"),
                     )
-                    set_last(i)
+                    continue
+
+                if case.get("case") in seen_cases:
+                    log.info("SKIPPED case already seen in current state → %s", case.get("case"))
                     continue
 
                 addr = empty_addr()
 
+                # 1) PDF first
                 if case.get("pdf"):
                     try:
                         pdf = s.get(case["pdf"], timeout=60)
@@ -713,29 +933,29 @@ def run_palm_beach():
                             addr = extract_pdf_addr(pdf.content)
                         else:
                             log.warning(
-                                "Non-PDF response for id=%s: %s",
-                                i,
+                                "Non-PDF response for case=%s: %s",
+                                case.get("case"),
                                 pdf.headers.get("content-type")
                             )
                     except Exception as e:
-                        log.warning("PDF read failed for id=%s: %s", i, str(e))
+                        log.warning("PDF read failed for case=%s: %s", case.get("case"), str(e))
 
                 addr = sanitize_address_payload(addr)
 
-                # last-resort fallback only if address still missing
-                if not addr.get("address") and case.get("tax"):
-                    log.info("Address missing after PDF → trying final tax URL fallback")
-                    tax_addr = fetch_address_from_taxdeed_url(browser, case["tax"])
-                    tax_addr = sanitize_address_payload(tax_addr)
-                    if tax_addr.get("address"):
-                        addr = tax_addr
-                        log.info("Address found from tax URL fallback")
+                # 2) final fallback = Property Appraiser
+                if not addr.get("address") and case.get("property_appraiser"):
+                    log.info("Address missing after PDF → trying Property Appraiser fallback")
+                    pa_addr = fetch_address_from_property_appraiser_url(browser, case["property_appraiser"])
+                    pa_addr = sanitize_address_payload(pa_addr)
+                    if pa_addr.get("address"):
+                        addr = pa_addr
+                        log.info("Address found from Property Appraiser fallback")
 
                 payload = {
                     "county": "PalmBeach",
                     "state": "FL",
                     "node": case.get("case"),
-                    "auction_source_url": case.get("tax"),
+                    "auction_source_url": case.get("property_appraiser") or case.get("tax"),
                     "tax_sale_id": case.get("case"),
                     "parcel_number": case.get("parcel"),
                     "sale_date": case.get("date"),
@@ -753,22 +973,24 @@ def run_palm_beach():
                 print(json.dumps(payload, indent=2))
 
                 should_send, reason = should_send_payload(payload)
-                log.info("DEDUP CHECK id=%s → %s", i, reason)
+                log.info("DEDUP CHECK case=%s → %s", case.get("case"), reason)
 
                 if should_send:
                     if send(payload):
-                        set_last(i)
-                        log.info("SENT id=%s", i)
+                        add_seen_case(case.get("case"))
+                        seen_cases.add(case.get("case"))
+                        log.info("SENT case=%s", case.get("case"))
                     else:
-                        log.warning("SEND FAILED id=%s", i)
+                        log.warning("SEND FAILED case=%s", case.get("case"))
                 else:
-                    set_last(i)
-                    log.info("SKIPPED id=%s because duplicate", i)
+                    add_seen_case(case.get("case"))
+                    seen_cases.add(case.get("case"))
+                    log.info("SKIPPED case=%s because duplicate", case.get("case"))
 
-                time.sleep(1.5)
+                time.sleep(1.0)
 
             except Exception as e:
-                log.error("ERROR %s: %s", i, str(e))
+                log.error("ERROR case url=%s: %s", case_url, str(e))
 
         try:
             browser.close()
