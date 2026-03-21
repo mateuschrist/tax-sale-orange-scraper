@@ -160,6 +160,7 @@ def is_valid_property_address(addr: str) -> bool:
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
+    # aceita unidade/lote tipo: 18 BURGUNDY A
     if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
         return True
 
@@ -234,7 +235,7 @@ def build_search_dates():
     return today.strftime("%m/%d/%Y"), future.strftime("%m/%d/%Y")
 
 
-def human_pause(a=0.25, b=0.8):
+def human_pause(a=0.20, b=0.70):
     time.sleep(random.uniform(a, b))
 
 
@@ -247,7 +248,12 @@ def wait_network_quiet(page, timeout=10000):
 
 def visible_elements(locator):
     out = []
-    for i in range(locator.count()):
+    try:
+        count = locator.count()
+    except Exception:
+        return out
+
+    for i in range(count):
         item = locator.nth(i)
         try:
             if item.is_visible() and item.is_enabled():
@@ -262,31 +268,38 @@ def human_click(locator):
         locator.scroll_into_view_if_needed(timeout=5000)
     except Exception:
         pass
-    human_pause(0.15, 0.35)
+
+    human_pause(0.10, 0.25)
+
     try:
         locator.hover(timeout=5000)
-        human_pause(0.10, 0.25)
+        human_pause(0.08, 0.18)
     except Exception:
         pass
+
     locator.click(timeout=10000)
-    human_pause(0.25, 0.6)
+    human_pause(0.20, 0.45)
 
 
 def human_fill(page, locator, value: str):
     locator.click(timeout=10000)
-    human_pause(0.15, 0.3)
+    human_pause(0.10, 0.20)
+
     try:
         locator.press("Control+A")
     except Exception:
         pass
-    human_pause(0.05, 0.15)
+
+    human_pause(0.05, 0.12)
+
     try:
         locator.press("Backspace")
     except Exception:
         pass
-    human_pause(0.10, 0.2)
+
+    human_pause(0.08, 0.18)
     page.keyboard.type(value, delay=35)
-    human_pause(0.25, 0.45)
+    human_pause(0.20, 0.35)
 
 
 # =========================
@@ -673,90 +686,64 @@ def fetch_address_from_property_appraiser_url(browser, url: str) -> dict:
 
 
 # =========================
-# SEARCH-DRIVEN SALE LIST
+# SEARCH FLOW
 # =========================
-def open_status_tab_like_human(page):
-    tab = None
-
-    candidates = [
-        page.locator("a:has-text('Status')"),
-        page.locator("text=Status"),
-        page.locator("button:has-text('Status')"),
-    ]
-
-    for loc in candidates:
-        try:
-            vis = visible_elements(loc)
-            if vis:
-                tab = vis[0]
-                break
-        except Exception:
-            continue
-
-    if tab is None:
-        raise RuntimeError("Could not locate Status tab")
-
-    human_click(tab)
-    wait_network_quiet(page, 6000)
-    page.wait_for_timeout(800)
-
-
-def select_status_sale_like_human(page):
+def get_status_form_controls(page):
+    """
+    Usa os controles visíveis da home.
+    Não depende de clicar em aba.
+    """
     selects = visible_elements(page.locator("select"))
-    if not selects:
-        raise RuntimeError("Could not locate visible select for Status search")
+    status_select = selects[0] if selects else None
 
-    sale_selected = False
-    for sel in selects:
-        try:
-            sel.select_option(label="SALE")
-            sale_selected = True
-            break
-        except Exception:
-            try:
-                sel.select_option(value="SALE")
-                sale_selected = True
-                break
-            except Exception:
-                continue
-
-    if not sale_selected:
-        raise RuntimeError("Could not select SALE")
-
-    human_pause(0.3, 0.6)
-
-
-def fill_status_dates_like_human(page, from_date: str, to_date: str):
     text_inputs = visible_elements(page.locator("input[type='text']"))
-    if len(text_inputs) < 2:
-        raise RuntimeError("Could not locate visible from/to inputs")
+    from_input = text_inputs[0] if len(text_inputs) >= 1 else None
+    to_input = text_inputs[1] if len(text_inputs) >= 2 else None
 
-    # 1º = from / 2º = to
-    human_fill(page, text_inputs[0], from_date)
-    human_fill(page, text_inputs[1], to_date)
-
-
-def click_search_for_status_like_human(page):
-    btn = None
+    button = None
     candidates = [
         page.locator("input[type='submit'][value='Search for Status']"),
         page.locator("button:has-text('Search for Status')"),
         page.locator("text=Search for Status"),
     ]
-
     for loc in candidates:
-        try:
-            vis = visible_elements(loc)
-            if vis:
-                btn = vis[0]
-                break
-        except Exception:
-            continue
+        items = visible_elements(loc)
+        if items:
+            button = items[0]
+            break
 
-    if btn is None:
+    return status_select, from_input, to_input, button
+
+
+def select_status_sale_like_human(page):
+    status_select, _, _, _ = get_status_form_controls(page)
+    if status_select is None:
+        raise RuntimeError("Could not locate visible status select")
+
+    try:
+        status_select.select_option(label="SALE")
+    except Exception:
+        status_select.select_option(value="SALE")
+
+    human_pause(0.25, 0.50)
+
+
+def fill_status_dates_like_human(page, from_date: str, to_date: str):
+    _, from_input, to_input, _ = get_status_form_controls(page)
+
+    if from_input is None or to_input is None:
+        raise RuntimeError("Could not locate visible from/to inputs")
+
+    human_fill(page, from_input, from_date)
+    human_fill(page, to_input, to_date)
+
+
+def click_search_for_status_like_human(page):
+    _, _, _, button = get_status_form_controls(page)
+    if button is None:
         raise RuntimeError("Could not locate Search for Status button")
 
-    human_click(btn)
+    human_click(button)
     wait_network_quiet(page, 15000)
     page.wait_for_timeout(1800)
 
@@ -822,7 +809,6 @@ def discover_sale_case_links(page) -> list[str]:
     wait_network_quiet(page, 10000)
     page.wait_for_timeout(1800)
 
-    open_status_tab_like_human(page)
     select_status_sale_like_human(page)
     fill_status_dates_like_human(page, from_date, to_date)
     click_search_for_status_like_human(page)
@@ -902,7 +888,7 @@ def parse_case(html: str, url: str) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.2 human-flow SALE-only + Property Appraiser fallback ===")
+    log.info("=== Palm Beach V6.2 human-home-form SALE-only + Property Appraiser fallback ===")
 
     seen_cases = get_seen_cases()
 
@@ -958,7 +944,6 @@ def run_palm_beach():
 
                 addr = empty_addr()
 
-                # 1) PDF first
                 if case.get("pdf"):
                     try:
                         pdf = s.get(case["pdf"], timeout=60)
@@ -975,7 +960,6 @@ def run_palm_beach():
 
                 addr = sanitize_address_payload(addr)
 
-                # 2) final fallback = Property Appraiser
                 if not addr.get("address") and case.get("property_appraiser"):
                     log.info("Address missing after PDF → trying Property Appraiser fallback")
                     pa_addr = fetch_address_from_property_appraiser_url(browser, case["property_appraiser"])
