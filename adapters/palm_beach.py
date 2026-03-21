@@ -198,44 +198,7 @@ def payload_quality_score(payload: dict) -> int:
         "deed_status",
         "applicant_name",
     ]
-    score = 0
-    for f in fields:
-        v = payload.get(f)
-        if v is not None and str(v).strip() != "":
-            score += 1
-    return score
-
-
-def send(payload):
-    if not SEND_TO_APP:
-        return True
-
-    try:
-        r = requests.post(
-            f"{APP_API_BASE}/api/ingest",
-            json=payload,
-            headers={"Authorization": f"Bearer {APP_API_TOKEN}"},
-            timeout=30,
-        )
-        log.info("INGEST status=%s", r.status_code)
-        if r.text:
-            log.info("INGEST response=%s", r.text[:250].replace("\n", " "))
-        return r.status_code in (200, 201)
-    except Exception as e:
-        log.warning("INGEST failed: %s", str(e))
-        return False
-
-
-def build_search_dates():
-    if PALM_BEACH_FROM_DATE and PALM_BEACH_TO_DATE:
-        return PALM_BEACH_FROM_DATE, PALM_BEACH_TO_DATE
-
-    today = date.today()
-    future = today + timedelta(days=365)
-
-    if os.name == "nt":
-        return today.strftime("%#m/%#d/%Y"), future.strftime("%#m/%#d/%Y")
-    return today.strftime("%-m/%-d/%Y"), future.strftime("%-m/%-d/%Y")
+    return sum(1 for f in fields if payload.get(f) not in (None, ""))
 
 
 def human_pause(a=0.20, b=0.60):
@@ -303,6 +266,38 @@ def human_fill(page, locator, value: str):
     human_pause(0.04, 0.08)
     page.keyboard.type(value, delay=35)
     human_pause(0.12, 0.25)
+
+
+def build_search_dates():
+    if PALM_BEACH_FROM_DATE and PALM_BEACH_TO_DATE:
+        return PALM_BEACH_FROM_DATE, PALM_BEACH_TO_DATE
+
+    today = date.today()
+    future = today + timedelta(days=365)
+
+    if os.name == "nt":
+        return today.strftime("%#m/%#d/%Y"), future.strftime("%#m/%#d/%Y")
+    return today.strftime("%-m/%-d/%Y"), future.strftime("%-m/%-d/%Y")
+
+
+def send(payload):
+    if not SEND_TO_APP:
+        return True
+
+    try:
+        r = requests.post(
+            f"{APP_API_BASE}/api/ingest",
+            json=payload,
+            headers={"Authorization": f"Bearer {APP_API_TOKEN}"},
+            timeout=30,
+        )
+        log.info("INGEST status=%s", r.status_code)
+        if r.text:
+            log.info("INGEST response=%s", r.text[:250].replace("\n", " "))
+        return r.status_code in (200, 201)
+    except Exception as e:
+        log.warning("INGEST failed: %s", str(e))
+        return False
 
 
 # =========================
@@ -709,7 +704,6 @@ def find_from_to_inputs(page):
 
 
 def click_search_for_status_resilient(page):
-    # 1) exact selector
     try:
         btn = page.locator("button[name='buttonSubmitStatus']")
         if btn.count() > 0:
@@ -718,19 +712,16 @@ def click_search_for_status_resilient(page):
                 target.scroll_into_view_if_needed(timeout=5000)
             except Exception:
                 pass
-
             try:
                 target.click(timeout=10000)
                 return True
             except Exception:
                 pass
-
             try:
                 target.click(force=True, timeout=10000)
                 return True
             except Exception:
                 pass
-
             try:
                 target.evaluate("(el) => el.click()")
                 return True
@@ -739,7 +730,6 @@ def click_search_for_status_resilient(page):
     except Exception:
         pass
 
-    # 2) fallback by text
     try:
         btn = page.locator("button:has-text('Search for Status')")
         if btn.count() > 0:
@@ -748,19 +738,16 @@ def click_search_for_status_resilient(page):
                 target.scroll_into_view_if_needed(timeout=5000)
             except Exception:
                 pass
-
             try:
                 target.click(timeout=10000)
                 return True
             except Exception:
                 pass
-
             try:
                 target.click(force=True, timeout=10000)
                 return True
             except Exception:
                 pass
-
             try:
                 target.evaluate("(el) => el.click()")
                 return True
@@ -769,7 +756,6 @@ def click_search_for_status_resilient(page):
     except Exception:
         pass
 
-    # 3) deep scan
     try:
         buttons = page.locator("button")
         count = buttons.count()
@@ -789,19 +775,16 @@ def click_search_for_status_resilient(page):
                         btn.scroll_into_view_if_needed(timeout=5000)
                     except Exception:
                         pass
-
                     try:
                         btn.click(timeout=10000)
                         return True
                     except Exception:
                         pass
-
                     try:
                         btn.click(force=True, timeout=10000)
                         return True
                     except Exception:
                         pass
-
                     try:
                         btn.evaluate("(el) => el.click()")
                         return True
@@ -839,52 +822,79 @@ def do_status_search_like_human(page):
 
 
 def extract_case_links_from_current_results(page) -> list[str]:
-    hrefs = []
-    anchors = page.locator("a[href*='/Home/Details?id=']")
-    count = anchors.count()
+    """
+    The grid rows look like:
+    <tr role="row" id="53539" ...>
+    We build /Home/Details?id=<row_id>
+    """
+    links = []
+    seen = set()
+
+    rows = page.locator("tr[role='row'][id]")
+    count = rows.count()
 
     for i in range(count):
         try:
-            href = anchors.nth(i).get_attribute("href")
-            if href:
-                hrefs.append(urljoin(BASE_URL, href))
+            row = rows.nth(i)
+            row_id = (row.get_attribute("id") or "").strip()
+
+            if not row_id:
+                continue
+            if row_id.lower() == "jqgfirstrow":
+                continue
+            if not row_id.isdigit():
+                continue
+
+            full = f"{BASE_URL}/Home/Details?id={row_id}"
+            if full not in seen:
+                seen.add(full)
+                links.append(full)
         except Exception:
             continue
 
-    out = []
-    seen = set()
-    for h in hrefs:
-        if h not in seen:
-            seen.add(h)
-            out.append(h)
-    return out
+    return links
 
 
 def goto_next_results_page(page) -> bool:
     candidates = [
+        "td#next_pager a",
+        "td[id*='next'] a",
         "a[title='Next Page']",
         "a[aria-label='Next Page']",
-        "a:has-text('Next')",
         "span.ui-icon-seek-next",
+        "a:has-text('Next')",
     ]
 
     for sel in candidates:
         try:
             loc = page.locator(sel)
-            items = visible_elements(loc)
-            if items:
-                for item in items:
-                    try:
-                        cls = (item.get_attribute("class") or "").lower()
-                        aria = (item.get_attribute("aria-disabled") or "").lower()
-                        if "disabled" in cls or aria == "true":
-                            continue
-                        human_click(item)
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                try:
+                    cls = (item.get_attribute("class") or "").lower()
+                    aria = (item.get_attribute("aria-disabled") or "").lower()
+                    if "disabled" in cls or aria == "true":
+                        continue
+
+                    if item.is_visible():
+                        try:
+                            item.scroll_into_view_if_needed(timeout=3000)
+                        except Exception:
+                            pass
+
+                        try:
+                            item.click(timeout=5000)
+                        except Exception:
+                            try:
+                                item.click(force=True, timeout=5000)
+                            except Exception:
+                                continue
+
                         wait_network_quiet(page, 12000)
                         page.wait_for_timeout(1500)
                         return True
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
         except Exception:
             continue
 
@@ -893,6 +903,13 @@ def goto_next_results_page(page) -> bool:
 
 def discover_sale_case_links(page) -> list[str]:
     do_status_search_like_human(page)
+
+    try:
+        page.locator("tr[role='row'][id]").first.wait_for(timeout=10000)
+    except Exception:
+        pass
+
+    page.wait_for_timeout(2000)
 
     all_links = []
     seen = set()
@@ -969,7 +986,7 @@ def parse_case(html: str, url: str) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.6 direct-status-dates + resilient search click ===")
+    log.info("=== Palm Beach V6.7 direct-status-dates + resilient search click + jqgrid rows ===")
 
     seen_cases = get_seen_cases()
 
