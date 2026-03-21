@@ -1,10 +1,12 @@
 import json
 from scraper import run
 from adapters.palm_beach import run_palm_beach
+from adapters.miami import run_miami
 
 COUNTY_RUNNERS = {
     "Orange": run,
     "PalmBeach": run_palm_beach,
+    "MiamiDade": run_miami,
 }
 
 def main():
