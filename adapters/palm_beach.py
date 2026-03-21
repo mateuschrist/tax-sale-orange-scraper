@@ -11,7 +11,6 @@ import pdfplumber
 import pypdfium2
 import pytesseract
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 log = logging.getLogger("taxdeed-palmbeach")
 
@@ -28,13 +27,8 @@ SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
 
-# Observado nos PDFs Palm Beach
-PB_PRIMARY_PAGES = [9, 10, 11, 12, 13]
-PB_FALLBACK_PAGES = [8, 14]
-
 PALM_BEACH_START_ID = int(os.getenv("PALM_BEACH_START_ID", "64600"))
 PALM_BEACH_MAX_IDS = int(os.getenv("PALM_BEACH_MAX_IDS", "150"))
-
 STATE_FILE = os.getenv("PALM_BEACH_STATE_FILE", "state_palm_beach.json")
 
 
@@ -109,226 +103,6 @@ def send(payload):
 
 
 # =========================
-# PDF EXTRACTION
-# =========================
-def read_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> str:
-    """
-    pages em numeração humana: 1,2,3...
-    """
-    try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            out = []
-            total = len(pdf.pages)
-            for p in pages:
-                idx = p - 1
-                if 0 <= idx < total:
-                    txt = (pdf.pages[idx].extract_text() or "").strip()
-                    if txt:
-                        out.append(txt)
-            return "\n".join(out).strip()
-    except Exception:
-        return ""
-
-
-def ocr_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> str:
-    try:
-        doc = pypdfium2.PdfDocument(pdf_bytes)
-        out = []
-        total = len(doc)
-
-        for p in pages:
-            idx = p - 1
-            if 0 <= idx < total:
-                img = doc[idx].render(scale=OCR_SCALE).to_pil()
-                txt = pytesseract.image_to_string(img, config="--psm 6")
-                if txt:
-                    out.append(txt)
-
-        return "\n".join(out).strip()
-    except Exception:
-        return ""
-
-
-def parse_address_from_pdf_text(text: str) -> dict:
-    """
-    Palm Beach:
-    1) prioridade = Location Address
-    2) fallback = Mailing Address
-    """
-    if not text:
-        return empty_addr()
-
-    t = text.replace("\r", "\n")
-
-    # 1) Location Address: 1130 WYNNEWOOD DR
-    m_loc = re.search(r"Location Address\s*:\s*(.+)", t, re.I)
-    if m_loc:
-        street = norm(m_loc.group(1))
-
-        # busca cidade/zip em qualquer ponto do texto
-        m_city_zip = re.search(
-            r"([A-Z][A-Z ]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
-            t,
-            re.I
-        )
-        if m_city_zip:
-            return {
-                "address": street,
-                "city": norm(m_city_zip.group(1)).title(),
-                "state": "FL",
-                "zip": m_city_zip.group(2),
-                "source": "PDF_LOCATION_ADDRESS",
-            }
-
-        # mesmo sem city/zip, retorna o endereço
-        return {
-            "address": street,
-            "city": None,
-            "state": "FL",
-            "zip": None,
-            "source": "PDF_LOCATION_ADDRESS",
-        }
-
-    # 2) Mailing Address block
-    # Ex:
-    # Mailing Address
-    # 1130 WYNNEWOOD DR
-    # WEST PALM BEACH FL 33417 5638
-    m_mail = re.search(
-        r"Mailing Address\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z ]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
-        t,
-        re.I | re.S,
-    )
-    if m_mail:
-        return {
-            "address": norm(m_mail.group(1)),
-            "city": norm(m_mail.group(2)).title(),
-            "state": "FL",
-            "zip": m_mail.group(3),
-            "source": "PDF_MAILING_ADDRESS",
-        }
-
-    return empty_addr()
-
-
-def extract_pdf_addr(pdf_bytes: bytes) -> dict:
-    # 1) texto páginas principais
-    txt = read_pdf_pages(pdf_bytes, PB_PRIMARY_PAGES)
-    addr = parse_address_from_pdf_text(txt)
-    if addr.get("address"):
-        return addr
-
-    # 2) texto páginas fallback
-    txt2 = read_pdf_pages(pdf_bytes, PB_FALLBACK_PAGES)
-    addr = parse_address_from_pdf_text(txt2)
-    if addr.get("address"):
-        return addr
-
-    # 3) OCR principais
-    ocr1 = ocr_pdf_pages(pdf_bytes, PB_PRIMARY_PAGES)
-    addr = parse_address_from_pdf_text(ocr1)
-    if addr.get("address"):
-        return addr
-
-    # 4) OCR fallback
-    ocr2 = ocr_pdf_pages(pdf_bytes, PB_FALLBACK_PAGES)
-    addr = parse_address_from_pdf_text(ocr2)
-    if addr.get("address"):
-        return addr
-
-    return empty_addr()
-
-
-# =========================
-# TAX COLLECTOR FALLBACK (PLAYWRIGHT)
-# =========================
-def parse_tax_collector_text(body_text: str) -> dict:
-    """
-    Procura:
-    Property Address:
-    1130 WYNNEWOOD DR
-    WEST PALM BEACH, FL 33417
-    """
-    if not body_text:
-        return empty_addr()
-
-    t = body_text.replace("\r", "\n")
-
-    patterns = [
-        r"Property Address\s*:\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-        r"Property Address\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-        r"Property Address\s*:\s*(.+?),?\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, t, re.I | re.S)
-        if m:
-            return {
-                "address": norm(m.group(1)),
-                "city": norm(m.group(2)).title(),
-                "state": "FL",
-                "zip": m.group(3),
-                "source": "TAX_COLLECTOR_PROPERTY_ADDRESS",
-            }
-
-    # fallback por varredura de linhas
-    lines = [norm(x) for x in t.splitlines() if norm(x)]
-    for i, line in enumerate(lines):
-        if "property address" in line.lower():
-            window = "\n".join(lines[i:i+8])
-            m = re.search(
-                r"(\d{1,6}\s+[A-Z0-9 .'\-#/]+)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
-                window,
-                re.I
-            )
-            if m:
-                return {
-                    "address": norm(m.group(1)),
-                    "city": norm(m.group(2)).title(),
-                    "state": "FL",
-                    "zip": m.group(3),
-                    "source": "TAX_COLLECTOR_PROPERTY_ADDRESS",
-                }
-
-    return empty_addr()
-
-
-def extract_tax_addr_with_playwright(browser, url: str) -> dict:
-    """
-    Abre o Tax Collector, espera até 10s pelo carregamento,
-    e extrai o campo Property Address da página renderizada.
-    """
-    page = browser.new_page()
-    try:
-        log.info("Tax Collector fallback open: %s", url)
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-        try:
-            page.locator("text=Property Address").first.wait_for(timeout=10000)
-        except PWTimeout:
-            log.info("Property Address not found within 10s; reading page anyway")
-
-        page.wait_for_timeout(1500)
-
-        body_text = page.locator("body").inner_text(timeout=10000)
-        addr = parse_tax_collector_text(body_text)
-
-        if not addr.get("address"):
-            log.info("Tax Collector body snippet: %s", body_text[:1200].replace("\n", " "))
-
-        return addr
-
-    except Exception as e:
-        log.warning("Tax Collector fallback failed: %s", str(e))
-        return empty_addr()
-    finally:
-        try:
-            page.close()
-        except Exception:
-            pass
-
-
-# =========================
 # CASE HTML
 # =========================
 def is_valid_case(html: str) -> bool:
@@ -374,10 +148,182 @@ def parse_case(html: str, url: str) -> dict:
 
 
 # =========================
+# PDF EXTRACTION
+# =========================
+def build_adaptive_page_order(total_pages: int) -> list[int]:
+    """
+    Começa em 10 e 11, depois expande para perto.
+    Usa numeração humana: 1..N
+    """
+    preferred = [10, 11]
+    seen = set()
+    order = []
+
+    for p in preferred:
+        if 1 <= p <= total_pages and p not in seen:
+            order.append(p)
+            seen.add(p)
+
+    offsets = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    bases = [10, 11]
+
+    for off in offsets:
+        for base in bases:
+            for candidate in (base - off, base + off):
+                if 1 <= candidate <= total_pages and candidate not in seen:
+                    order.append(candidate)
+                    seen.add(candidate)
+
+    for p in range(1, total_pages + 1):
+        if p not in seen:
+            order.append(p)
+            seen.add(p)
+
+    return order
+
+
+def read_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
+    """
+    page_num em numeração humana
+    """
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            idx = page_num - 1
+            if 0 <= idx < len(pdf.pages):
+                return (pdf.pages[idx].extract_text() or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def ocr_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
+    """
+    page_num em numeração humana
+    """
+    try:
+        doc = pypdfium2.PdfDocument(pdf_bytes)
+        idx = page_num - 1
+        if 0 <= idx < len(doc):
+            img = doc[idx].render(scale=OCR_SCALE).to_pil()
+            return pytesseract.image_to_string(img, config="--psm 6").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def parse_address_from_pdf_text(text: str) -> dict:
+    """
+    Palm Beach:
+    prioridade:
+    1) Location Address
+    2) Mailing Address
+    3) Municipality como fallback de cidade
+    """
+    if not text:
+        return empty_addr()
+
+    t = text.replace("\r", "\n")
+
+    # 1) PRIORIDADE: Location Address
+    m_loc = re.search(r"Location Address\s*:\s*(.+)", t, re.I)
+    if m_loc:
+        street = norm(m_loc.group(1))
+
+        # Municipality como cidade fallback
+        m_muni = re.search(r"Municipality\s*:\s*([A-Z][A-Z .'-]+)", t, re.I)
+        municipality = norm(m_muni.group(1)).title() if m_muni else None
+
+        # tenta achar city/zip mais completos em qualquer ponto do texto
+        m_city_zip = re.search(
+            r"([A-Z][A-Z .'-]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
+            t,
+            re.I
+        )
+
+        if m_city_zip:
+            return {
+                "address": street,
+                "city": norm(m_city_zip.group(1)).title(),
+                "state": "FL",
+                "zip": m_city_zip.group(2),
+                "source": "PDF_LOCATION_ADDRESS",
+            }
+
+        return {
+            "address": street,
+            "city": municipality,
+            "state": "FL",
+            "zip": None,
+            "source": "PDF_LOCATION_ADDRESS",
+        }
+
+    # 2) FALLBACK: Mailing Address
+    # Exemplo:
+    # Mailing Address
+    # 1130 WYNNEWOOD DR
+    # WEST PALM BEACH FL 33417 5638
+    m_mail = re.search(
+        r"Mailing Address\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z ]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
+        t,
+        re.I | re.S,
+    )
+    if m_mail:
+        return {
+            "address": norm(m_mail.group(1)),
+            "city": norm(m_mail.group(2)).title(),
+            "state": "FL",
+            "zip": m_mail.group(3),
+            "source": "PDF_MAILING_ADDRESS",
+        }
+
+    return empty_addr()
+
+
+def extract_pdf_addr(pdf_bytes: bytes) -> dict:
+    """
+    Busca adaptativa:
+    1) tenta texto página a página, começando em 10 e 11
+    2) se não achar, tenta OCR página a página na mesma ordem
+    só retorna vazio depois de esgotar as páginas
+    """
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+    except Exception:
+        total_pages = 0
+
+    if total_pages <= 0:
+        return empty_addr()
+
+    page_order = build_adaptive_page_order(total_pages)
+    log.info("Adaptive PDF page order: %s", page_order)
+
+    # 1) Texto primeiro
+    for p in page_order:
+        txt = read_single_pdf_page(pdf_bytes, p)
+        if txt:
+            addr = parse_address_from_pdf_text(txt)
+            if addr.get("address"):
+                log.info("Address found in PDF text on page %s (%s)", p, addr.get("source"))
+                return addr
+
+    # 2) OCR depois
+    for p in page_order:
+        txt = ocr_single_pdf_page(pdf_bytes, p)
+        if txt:
+            addr = parse_address_from_pdf_text(txt)
+            if addr.get("address"):
+                log.info("Address found in PDF OCR on page %s (%s)", p, addr.get("source"))
+                return addr
+
+    return empty_addr()
+
+
+# =========================
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V4.2 ===")
+    log.info("=== Palm Beach PDF-only adaptive mode ===")
 
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -387,76 +333,63 @@ def run_palm_beach():
 
     invalid = 0
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-
-        for i in range(start, end):
-            log.info("Palm Beach ID %s", i)
-
-            try:
-                r = s.get(DETAILS_URL.format(id=i), timeout=30)
-
-                if r.status_code != 200 or not is_valid_case(r.text):
-                    invalid += 1
-                    if invalid > 40:
-                        log.warning("Stop: dead range")
-                        break
-                    continue
-
-                invalid = 0
-                case = parse_case(r.text, r.url)
-
-                addr = empty_addr()
-
-                # 1) PDF primeiro
-                if case.get("pdf"):
-                    try:
-                        pdf = s.get(case["pdf"], timeout=60)
-                        if "pdf" in (pdf.headers.get("content-type") or "").lower():
-                            addr = extract_pdf_addr(pdf.content)
-                            if addr.get("address"):
-                                log.info("Address found from PDF (%s)", addr.get("source"))
-                    except Exception as e:
-                        log.warning("PDF read failed for id=%s: %s", i, str(e))
-
-                # 2) Se não trouxe address, tentar Tax Collector com espera de até 10s
-                if not addr.get("address") and case.get("tax"):
-                    log.info("PDF missing address → trying Tax Collector fallback")
-                    tc_addr = extract_tax_addr_with_playwright(browser, case["tax"])
-                    if tc_addr.get("address"):
-                        addr = tc_addr
-                        log.info("Address found from Tax Collector (%s)", addr.get("source"))
-
-                payload = {
-                    "county": "PalmBeach",
-                    "state": "FL",
-                    "node": case.get("case"),
-                    "auction_source_url": case.get("tax"),   # conforme você pediu
-                    "tax_sale_id": case.get("case"),
-                    "parcel_number": case.get("parcel"),
-                    "sale_date": case.get("date"),
-                    "opening_bid": clean_bid(case.get("bid")),
-                    "deed_status": case.get("status"),
-                    "applicant_name": case.get("applicant"),
-                    "pdf_url": case.get("pdf"),
-                    "address": addr.get("address"),
-                    "city": addr.get("city"),
-                    "state_address": addr.get("state"),
-                    "zip": addr.get("zip"),
-                    "address_source": addr.get("source"),
-                }
-
-                print(json.dumps(payload, indent=2))
-
-                if send(payload):
-                    set_last(i)
-
-                time.sleep(1.5)
-
-            except Exception as e:
-                log.error("ERROR %s: %s", i, str(e))
+    for i in range(start, end):
+        log.info("Palm Beach ID %s", i)
 
         try:
-            browser.close()
-        except Exception:
-            pass
+            r = s.get(DETAILS_URL.format(id=i), timeout=30)
+
+            if r.status_code != 200 or not is_valid_case(r.text):
+                invalid += 1
+                if invalid > 40:
+                    log.warning("Stop: dead range")
+                    break
+                continue
+
+            invalid = 0
+            case = parse_case(r.text, r.url)
+
+            addr = empty_addr()
+
+            if case.get("pdf"):
+                try:
+                    pdf = s.get(case["pdf"], timeout=60)
+                    if "pdf" in (pdf.headers.get("content-type") or "").lower():
+                        addr = extract_pdf_addr(pdf.content)
+                    else:
+                        log.warning(
+                            "Non-PDF response for id=%s: %s",
+                            i,
+                            pdf.headers.get("content-type")
+                        )
+                except Exception as e:
+                    log.warning("PDF read failed for id=%s: %s", i, str(e))
+
+            payload = {
+                "county": "PalmBeach",
+                "state": "FL",
+                "node": case.get("case"),
+                "auction_source_url": case.get("tax"),
+                "tax_sale_id": case.get("case"),
+                "parcel_number": case.get("parcel"),
+                "sale_date": case.get("date"),
+                "opening_bid": clean_bid(case.get("bid")),
+                "deed_status": case.get("status"),
+                "applicant_name": case.get("applicant"),
+                "pdf_url": case.get("pdf"),
+                "address": addr.get("address"),
+                "city": addr.get("city"),
+                "state_address": addr.get("state"),
+                "zip": addr.get("zip"),
+                "address_source": addr.get("source"),
+            }
+
+            print(json.dumps(payload, indent=2))
+
+            if send(payload):
+                set_last(i)
+
+            time.sleep(1.5)
+
+        except Exception as e:
+            log.error("ERROR %s: %s", i, str(e))
