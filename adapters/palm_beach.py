@@ -11,6 +11,7 @@ import pdfplumber
 import pypdfium2
 import pytesseract
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 log = logging.getLogger("taxdeed-palmbeach")
 
@@ -130,7 +131,6 @@ def looks_like_garbage_address(addr: str) -> bool:
         if marker in upper:
             return True
 
-    # muito "falado" para ser endereço
     if upper.count(" ") > 12:
         return True
 
@@ -146,12 +146,10 @@ def is_valid_property_address(addr: str) -> bool:
     if looks_like_garbage_address(a):
         return False
 
-    # aceita endereços com número
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
-    # aceita alguns endereços de unidade/lote sem número clássico
-    # ex.: 18 BURGUNDY A
+    # aceita alguns formatos de unidade/lote sem padrão clássico
     if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
         return True
 
@@ -371,9 +369,6 @@ def parse_case(html: str, url: str) -> dict:
 # PDF EXTRACTION
 # =========================
 def build_adaptive_page_order(total_pages: int) -> list[int]:
-    """
-    Começa em 10 e 11, depois expande.
-    """
     preferred = [10, 11]
     seen = set()
     order = []
@@ -425,11 +420,6 @@ def ocr_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
 
 
 def parse_location_or_mailing_address(text: str) -> dict:
-    """
-    Parser principal:
-    1) Location Address
-    2) Mailing Address
-    """
     if not text:
         return empty_addr()
 
@@ -491,10 +481,6 @@ def parse_location_or_mailing_address(text: str) -> dict:
 
 
 def parse_you_entered_address(text: str) -> dict:
-    """
-    Fallback opcional:
-    procura bloco USPS "You entered" só quando o modo principal falhar.
-    """
     if not text:
         return empty_addr()
 
@@ -504,7 +490,6 @@ def parse_you_entered_address(text: str) -> dict:
         if "you entered" in line.lower():
             window = lines[i:i+12]
 
-            # procura a última dupla válida address + city FL ZIP
             for j in range(len(window) - 2, -1, -1):
                 addr_line = window[j]
                 if j + 1 >= len(window):
@@ -536,12 +521,6 @@ def parse_you_entered_address(text: str) -> dict:
 
 
 def parse_address_from_pdf_text(text: str) -> dict:
-    """
-    Estratégia:
-    1) parser principal
-    2) se falhar, fallback "You entered"
-    3) valida tudo antes de aceitar
-    """
     if not text:
         return empty_addr()
 
@@ -593,10 +572,96 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
 
 
 # =========================
+# FINAL FALLBACK: TAX URL
+# =========================
+def parse_address_from_tax_page(text: str) -> dict:
+    if not text:
+        return empty_addr()
+
+    t = text.replace("\r", "\n")
+
+    patterns = [
+        r"Property Address\s*:?\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
+        r"Property Address\s*:?\s*(.+?)\s+([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, t, re.I | re.S)
+        if m:
+            addr = normalize_property_address(m.group(1))
+            if is_valid_property_address(addr):
+                return {
+                    "address": addr,
+                    "city": norm(m.group(2)).title(),
+                    "state": "FL",
+                    "zip": m.group(3),
+                    "source": "TAX_PAGE_PROPERTY_ADDRESS",
+                }
+
+    lines = [norm(x) for x in t.splitlines() if norm(x)]
+    for i, line in enumerate(lines):
+        if "property address" in line.lower():
+            window = "\n".join(lines[i:i+10])
+            m = re.search(
+                r"(\d{1,6}\s+[A-Z0-9 .'\-#/]+)\s*\n+\s*([A-Z][A-Z .'-]+),?\s*FL\s*(\d{5})",
+                window,
+                re.I
+            )
+            if m:
+                addr = normalize_property_address(m.group(1))
+                if is_valid_property_address(addr):
+                    return {
+                        "address": addr,
+                        "city": norm(m.group(2)).title(),
+                        "state": "FL",
+                        "zip": m.group(3),
+                        "source": "TAX_PAGE_PROPERTY_ADDRESS",
+                    }
+
+    return empty_addr()
+
+
+def fetch_address_from_taxdeed_url(browser, url: str) -> dict:
+    page = browser.new_page()
+    try:
+        log.info("Final fallback opening tax URL: %s", url)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except PWTimeout:
+            pass
+
+        try:
+            page.locator("text=Property Address").first.wait_for(timeout=10000)
+        except PWTimeout:
+            log.info("Property Address not explicitly found within 10s; parsing full body anyway")
+
+        page.wait_for_timeout(1500)
+
+        body_text = page.locator("body").inner_text(timeout=10000)
+        addr = parse_address_from_tax_page(body_text)
+
+        if not addr.get("address"):
+            log.info("Tax page snippet: %s", body_text[:1200].replace("\n", " "))
+
+        return addr
+
+    except Exception as e:
+        log.warning("Tax URL fallback failed: %s", str(e))
+        return empty_addr()
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+# =========================
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach PDF-only adaptive mode + dedup V5.1 ===")
+    log.info("=== Palm Beach corrected mode: SALE only + dedup + PDF-first ===")
 
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -606,76 +671,106 @@ def run_palm_beach():
 
     invalid = 0
 
-    for i in range(start, end):
-        log.info("Palm Beach ID %s", i)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+
+        for i in range(start, end):
+            log.info("Palm Beach ID %s", i)
+
+            try:
+                r = s.get(DETAILS_URL.format(id=i), timeout=30)
+
+                if r.status_code != 200 or not is_valid_case(r.text):
+                    invalid += 1
+                    if invalid > 40:
+                        log.warning("Stop: dead range")
+                        break
+                    continue
+
+                invalid = 0
+                case = parse_case(r.text, r.url)
+
+                # =========================
+                # CRITICAL BUSINESS RULE:
+                # ONLY SALE
+                # =========================
+                status_value = (case.get("status") or "").strip().upper()
+                if status_value != "SALE":
+                    log.info(
+                        "SKIPPED id=%s because status is not SALE → %s",
+                        i,
+                        case.get("status"),
+                    )
+                    set_last(i)
+                    continue
+
+                addr = empty_addr()
+
+                if case.get("pdf"):
+                    try:
+                        pdf = s.get(case["pdf"], timeout=60)
+                        if "pdf" in (pdf.headers.get("content-type") or "").lower():
+                            addr = extract_pdf_addr(pdf.content)
+                        else:
+                            log.warning(
+                                "Non-PDF response for id=%s: %s",
+                                i,
+                                pdf.headers.get("content-type")
+                            )
+                    except Exception as e:
+                        log.warning("PDF read failed for id=%s: %s", i, str(e))
+
+                addr = sanitize_address_payload(addr)
+
+                # last-resort fallback only if address still missing
+                if not addr.get("address") and case.get("tax"):
+                    log.info("Address missing after PDF → trying final tax URL fallback")
+                    tax_addr = fetch_address_from_taxdeed_url(browser, case["tax"])
+                    tax_addr = sanitize_address_payload(tax_addr)
+                    if tax_addr.get("address"):
+                        addr = tax_addr
+                        log.info("Address found from tax URL fallback")
+
+                payload = {
+                    "county": "PalmBeach",
+                    "state": "FL",
+                    "node": case.get("case"),
+                    "auction_source_url": case.get("tax"),
+                    "tax_sale_id": case.get("case"),
+                    "parcel_number": case.get("parcel"),
+                    "sale_date": case.get("date"),
+                    "opening_bid": clean_bid(case.get("bid")),
+                    "deed_status": case.get("status"),
+                    "applicant_name": case.get("applicant"),
+                    "pdf_url": case.get("pdf"),
+                    "address": addr.get("address"),
+                    "city": addr.get("city"),
+                    "state_address": addr.get("state"),
+                    "zip": addr.get("zip"),
+                    "address_source": addr.get("source"),
+                }
+
+                print(json.dumps(payload, indent=2))
+
+                should_send, reason = should_send_payload(payload)
+                log.info("DEDUP CHECK id=%s → %s", i, reason)
+
+                if should_send:
+                    if send(payload):
+                        set_last(i)
+                        log.info("SENT id=%s", i)
+                    else:
+                        log.warning("SEND FAILED id=%s", i)
+                else:
+                    set_last(i)
+                    log.info("SKIPPED id=%s because duplicate", i)
+
+                time.sleep(1.5)
+
+            except Exception as e:
+                log.error("ERROR %s: %s", i, str(e))
 
         try:
-            r = s.get(DETAILS_URL.format(id=i), timeout=30)
-
-            if r.status_code != 200 or not is_valid_case(r.text):
-                invalid += 1
-                if invalid > 40:
-                    log.warning("Stop: dead range")
-                    break
-                continue
-
-            invalid = 0
-            case = parse_case(r.text, r.url)
-
-            addr = empty_addr()
-
-            if case.get("pdf"):
-                try:
-                    pdf = s.get(case["pdf"], timeout=60)
-                    if "pdf" in (pdf.headers.get("content-type") or "").lower():
-                        addr = extract_pdf_addr(pdf.content)
-                    else:
-                        log.warning(
-                            "Non-PDF response for id=%s: %s",
-                            i,
-                            pdf.headers.get("content-type")
-                        )
-                except Exception as e:
-                    log.warning("PDF read failed for id=%s: %s", i, str(e))
-
-            # proteção final contra lixo
-            addr = sanitize_address_payload(addr)
-
-            payload = {
-                "county": "PalmBeach",
-                "state": "FL",
-                "node": case.get("case"),
-                "auction_source_url": case.get("tax"),
-                "tax_sale_id": case.get("case"),
-                "parcel_number": case.get("parcel"),
-                "sale_date": case.get("date"),
-                "opening_bid": clean_bid(case.get("bid")),
-                "deed_status": case.get("status"),
-                "applicant_name": case.get("applicant"),
-                "pdf_url": case.get("pdf"),
-                "address": addr.get("address"),
-                "city": addr.get("city"),
-                "state_address": addr.get("state"),
-                "zip": addr.get("zip"),
-                "address_source": addr.get("source"),
-            }
-
-            print(json.dumps(payload, indent=2))
-
-            should_send, reason = should_send_payload(payload)
-            log.info("DEDUP CHECK id=%s → %s", i, reason)
-
-            if should_send:
-                if send(payload):
-                    set_last(i)
-                    log.info("SENT id=%s", i)
-                else:
-                    log.warning("SEND FAILED id=%s", i)
-            else:
-                set_last(i)
-                log.info("SKIPPED id=%s because duplicate", i)
-
-            time.sleep(1.5)
-
-        except Exception as e:
-            log.error("ERROR %s: %s", i, str(e))
+            browser.close()
+        except Exception:
+            pass
