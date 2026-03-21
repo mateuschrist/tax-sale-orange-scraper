@@ -4,7 +4,7 @@ import json
 import time
 import logging
 from io import BytesIO
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import requests
 import pdfplumber
@@ -24,6 +24,10 @@ HEADERS = {
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
+
+SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+CAN_CHECK_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
 
@@ -82,6 +86,28 @@ def empty_addr():
     }
 
 
+def payload_quality_score(payload: dict) -> int:
+    fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "parcel_number",
+        "sale_date",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+    ]
+    score = 0
+    for f in fields:
+        v = payload.get(f)
+        if v is not None and str(v).strip() != "":
+            score += 1
+    return score
+
+
 def send(payload):
     if not SEND_TO_APP:
         return True
@@ -100,6 +126,111 @@ def send(payload):
     except Exception as e:
         log.warning("INGEST failed: %s", str(e))
         return False
+
+
+# =========================
+# SUPABASE DEDUP
+# =========================
+def sb_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def supabase_find_existing_case(node: str):
+    if not CAN_CHECK_SUPABASE or not node:
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/properties"
+        f"?county=eq.PalmBeach"
+        f"&node=eq.{quote(str(node), safe='')}"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+        f"&limit=1"
+    )
+
+    try:
+        r = requests.get(url, headers=sb_headers(), timeout=30)
+        if r.status_code == 200:
+            arr = r.json()
+            return arr[0] if arr else None
+        log.warning("supabase_find_existing_case status=%s body=%s", r.status_code, r.text[:300])
+    except Exception as e:
+        log.warning("supabase_find_existing_case failed: %s", str(e))
+
+    return None
+
+
+def supabase_find_existing_property(parcel_number: str, sale_date: str):
+    if not CAN_CHECK_SUPABASE or not parcel_number or not sale_date:
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/properties"
+        f"?county=eq.PalmBeach"
+        f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
+        f"&sale_date=eq.{quote(str(sale_date), safe='')}"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+        f"&limit=1"
+    )
+
+    try:
+        r = requests.get(url, headers=sb_headers(), timeout=30)
+        if r.status_code == 200:
+            arr = r.json()
+            return arr[0] if arr else None
+        log.warning("supabase_find_existing_property status=%s body=%s", r.status_code, r.text[:300])
+    except Exception as e:
+        log.warning("supabase_find_existing_property failed: %s", str(e))
+
+    return None
+
+
+def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
+    new_score = payload_quality_score(payload)
+    old_score = payload_quality_score(existing)
+
+    if new_score > old_score:
+        return True
+
+    important_fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+    ]
+
+    for f in important_fields:
+        old_val = (existing.get(f) or "").strip() if existing.get(f) else ""
+        new_val = (payload.get(f) or "").strip() if payload.get(f) else ""
+        if not old_val and new_val:
+            return True
+
+    return False
+
+
+def should_send_payload(payload: dict):
+    node = payload.get("node")
+    parcel = payload.get("parcel_number")
+    sale_date = payload.get("sale_date")
+
+    existing_case = supabase_find_existing_case(node)
+    if existing_case:
+        if payload_is_better_than_existing(payload, existing_case):
+            return True, "existing case found, but new payload is better"
+        return False, "duplicate case/node already exists"
+
+    existing_prop = supabase_find_existing_property(parcel, sale_date)
+    if existing_prop:
+        if payload_is_better_than_existing(payload, existing_prop):
+            return True, "existing parcel_number + sale_date found, but new payload is better"
+        return False, "duplicate parcel_number + sale_date already exists"
+
+    return True, "new record"
 
 
 # =========================
@@ -151,10 +282,6 @@ def parse_case(html: str, url: str) -> dict:
 # PDF EXTRACTION
 # =========================
 def build_adaptive_page_order(total_pages: int) -> list[int]:
-    """
-    Começa em 10 e 11, depois expande para perto.
-    Usa numeração humana: 1..N
-    """
     preferred = [10, 11]
     seen = set()
     order = []
@@ -183,9 +310,6 @@ def build_adaptive_page_order(total_pages: int) -> list[int]:
 
 
 def read_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
-    """
-    page_num em numeração humana
-    """
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             idx = page_num - 1
@@ -197,9 +321,6 @@ def read_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
 
 
 def ocr_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
-    """
-    page_num em numeração humana
-    """
     try:
         doc = pypdfium2.PdfDocument(pdf_bytes)
         idx = page_num - 1
@@ -212,13 +333,6 @@ def ocr_single_pdf_page(pdf_bytes: bytes, page_num: int) -> str:
 
 
 def parse_address_from_pdf_text(text: str) -> dict:
-    """
-    Palm Beach:
-    prioridade:
-    1) Location Address
-    2) Mailing Address
-    3) Municipality como fallback de cidade
-    """
     if not text:
         return empty_addr()
 
@@ -229,11 +343,9 @@ def parse_address_from_pdf_text(text: str) -> dict:
     if m_loc:
         street = norm(m_loc.group(1))
 
-        # Municipality como cidade fallback
         m_muni = re.search(r"Municipality\s*:\s*([A-Z][A-Z .'-]+)", t, re.I)
         municipality = norm(m_muni.group(1)).title() if m_muni else None
 
-        # tenta achar city/zip mais completos em qualquer ponto do texto
         m_city_zip = re.search(
             r"([A-Z][A-Z .'-]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
             t,
@@ -258,10 +370,6 @@ def parse_address_from_pdf_text(text: str) -> dict:
         }
 
     # 2) FALLBACK: Mailing Address
-    # Exemplo:
-    # Mailing Address
-    # 1130 WYNNEWOOD DR
-    # WEST PALM BEACH FL 33417 5638
     m_mail = re.search(
         r"Mailing Address\s*\n+\s*(.+?)\s*\n+\s*([A-Z][A-Z ]+)\s+FL\s+(\d{5})(?:-\d{4}|\s+\d{4})?",
         t,
@@ -280,12 +388,6 @@ def parse_address_from_pdf_text(text: str) -> dict:
 
 
 def extract_pdf_addr(pdf_bytes: bytes) -> dict:
-    """
-    Busca adaptativa:
-    1) tenta texto página a página, começando em 10 e 11
-    2) se não achar, tenta OCR página a página na mesma ordem
-    só retorna vazio depois de esgotar as páginas
-    """
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
@@ -323,7 +425,7 @@ def extract_pdf_addr(pdf_bytes: bytes) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach PDF-only adaptive mode ===")
+    log.info("=== Palm Beach PDF-only adaptive mode + dedup V5 ===")
 
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -386,8 +488,18 @@ def run_palm_beach():
 
             print(json.dumps(payload, indent=2))
 
-            if send(payload):
+            should_send, reason = should_send_payload(payload)
+            log.info("DEDUP CHECK id=%s → %s", i, reason)
+
+            if should_send:
+                if send(payload):
+                    set_last(i)
+                    log.info("SENT id=%s", i)
+                else:
+                    log.warning("SEND FAILED id=%s", i)
+            else:
                 set_last(i)
+                log.info("SKIPPED id=%s because duplicate", i)
 
             time.sleep(1.5)
 
