@@ -161,7 +161,6 @@ def is_valid_property_address(addr: str) -> bool:
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
-    # aceita unidade/lote tipo: 18 BURGUNDY A
     if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
         return True
 
@@ -233,9 +232,10 @@ def build_search_dates():
 
     today = date.today()
     future = today + timedelta(days=365)
-    # same style the site shows
-    return today.strftime("%-m/%-d/%Y") if os.name != "nt" else today.strftime("%#m/%#d/%Y"), \
-           future.strftime("%-m/%-d/%Y") if os.name != "nt" else future.strftime("%#m/%#d/%Y")
+
+    if os.name == "nt":
+        return today.strftime("%#m/%#d/%Y"), future.strftime("%#m/%#d/%Y")
+    return today.strftime("%-m/%-d/%Y"), future.strftime("%-m/%-d/%Y")
 
 
 def human_pause(a=0.20, b=0.60):
@@ -701,7 +701,6 @@ def find_from_to_inputs(page):
     if from_items and to_items:
         return from_items[0], to_items[0]
 
-    # fallback
     text_inputs = visible_elements(page.locator("input[type='text']"))
     if len(text_inputs) >= 2:
         return text_inputs[0], text_inputs[1]
@@ -709,19 +708,111 @@ def find_from_to_inputs(page):
     return None, None
 
 
-def find_search_button(page):
-    candidates = [
-        page.locator("button[name='buttonSubmitStatus']"),
-        page.locator("button:has-text('Search for Status')"),
-        page.locator("text=Search for Status"),
-    ]
+def click_search_for_status_resilient(page):
+    # 1) exact selector
+    try:
+        btn = page.locator("button[name='buttonSubmitStatus']")
+        if btn.count() > 0:
+            target = btn.first
+            try:
+                target.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
 
-    for loc in candidates:
-        items = visible_elements(loc)
-        if items:
-            return items[0]
+            try:
+                target.click(timeout=10000)
+                return True
+            except Exception:
+                pass
 
-    return None
+            try:
+                target.click(force=True, timeout=10000)
+                return True
+            except Exception:
+                pass
+
+            try:
+                target.evaluate("(el) => el.click()")
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) fallback by text
+    try:
+        btn = page.locator("button:has-text('Search for Status')")
+        if btn.count() > 0:
+            target = btn.first
+            try:
+                target.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+
+            try:
+                target.click(timeout=10000)
+                return True
+            except Exception:
+                pass
+
+            try:
+                target.click(force=True, timeout=10000)
+                return True
+            except Exception:
+                pass
+
+            try:
+                target.evaluate("(el) => el.click()")
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3) deep scan
+    try:
+        buttons = page.locator("button")
+        count = buttons.count()
+        for i in range(count):
+            btn = buttons.nth(i)
+            try:
+                name = (btn.get_attribute("name") or "").strip()
+                btype = (btn.get_attribute("type") or "").strip()
+                text = (btn.inner_text() or "").strip()
+
+                if (
+                    name == "buttonSubmitStatus"
+                    or (btype == "submit" and text == "Search for Status")
+                    or text == "Search for Status"
+                ):
+                    try:
+                        btn.scroll_into_view_if_needed(timeout=5000)
+                    except Exception:
+                        pass
+
+                    try:
+                        btn.click(timeout=10000)
+                        return True
+                    except Exception:
+                        pass
+
+                    try:
+                        btn.click(force=True, timeout=10000)
+                        return True
+                    except Exception:
+                        pass
+
+                    try:
+                        btn.evaluate("(el) => el.click()")
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
 
 
 def do_status_search_like_human(page):
@@ -739,11 +830,10 @@ def do_status_search_like_human(page):
     human_fill(page, from_input, from_date)
     human_fill(page, to_input, to_date)
 
-    button = find_search_button(page)
-    if button is None:
-        raise RuntimeError("Could not locate Search for Status button")
+    clicked = click_search_for_status_resilient(page)
+    if not clicked:
+        raise RuntimeError("Could not click Search for Status button")
 
-    human_click(button)
     wait_network_quiet(page, 15000)
     page.wait_for_timeout(2200)
 
@@ -879,7 +969,7 @@ def parse_case(html: str, url: str) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.5 direct-status-form SALE-only + Property Appraiser fallback ===")
+    log.info("=== Palm Beach V6.6 direct-status-dates + resilient search click ===")
 
     seen_cases = get_seen_cases()
 
