@@ -3,7 +3,7 @@ import logging
 import re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-log = logging.getLogger("miami-test")
+log = logging.getLogger("miami")
 
 LIST_URL = "https://miamidade.realtdm.com/public/cases/list"
 
