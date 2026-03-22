@@ -507,13 +507,14 @@ def get_results_summary(page) -> Dict:
                 '';
 
             return {
-                rows_on_page": rows,
-                "page_links": pageLinks,
-                "current_page_text": currentPageText,
-                "body_sample": bodyText.slice(0, 3000)
+                rows_on_page: rows,
+                page_links: pageLinks,
+                current_page_text: currentPageText,
+                body_sample: bodyText.slice(0, 3000)
             };
         }
         """
+    
     )
 
 
