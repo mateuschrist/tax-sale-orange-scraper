@@ -64,16 +64,17 @@ def normalize_money(value: str) -> Optional[float]:
 
 def payload_quality_score(payload: dict) -> int:
     fields = [
-        "external_id",
-        "case_number",
+        "node",
         "parcel_number",
-        "property_address_case",
-        "property_address_pa",
-        "owner_name",
-        "mailing_address",
+        "sale_date",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
         "auction_source_url",
         "opening_bid",
-        "sale_date",
+        "deed_status",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
 
@@ -93,12 +94,12 @@ def send_to_app(payload: dict) -> bool:
             headers={"Authorization": f"Bearer {APP_API_TOKEN}"},
             timeout=30,
         )
-        log.info("APP INGEST status=%s external_id=%s", r.status_code, payload.get("external_id"))
+        log.info("APP INGEST status=%s node=%s", r.status_code, payload.get("node"))
         if r.text:
             log.info("APP INGEST response=%s", r.text[:300].replace("\n", " "))
         return r.status_code in (200, 201)
     except Exception as e:
-        log.warning("APP INGEST failed external_id=%s error=%s", payload.get("external_id"), str(e))
+        log.warning("APP INGEST failed node=%s error=%s", payload.get("node"), str(e))
         return False
 
 
@@ -113,15 +114,15 @@ def sb_headers():
     }
 
 
-def supabase_find_existing_case(external_id: str):
-    if not CAN_CHECK_SUPABASE or not external_id:
+def supabase_find_existing_case(node: str):
+    if not CAN_CHECK_SUPABASE or not node:
         return None
 
     url = (
         f"{SUPABASE_URL}/rest/v1/properties"
         f"?county=eq.Miami-Dade"
-        f"&external_id=eq.{quote(str(external_id), safe='')}"
-        f"&select=id,external_id,parcel_number,sale_date,address,city,state_address,zip,auction_source_url,opening_bid,deed_status,owner_name"
+        f"&node=eq.{quote(str(node), safe='')}"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
         f"&limit=1"
     )
 
@@ -146,7 +147,7 @@ def supabase_find_existing_property(parcel_number: str, sale_date: str):
         f"?county=eq.Miami-Dade"
         f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
         f"&sale_date=eq.{quote(str(sale_date), safe='')}"
-        f"&select=id,external_id,parcel_number,sale_date,address,city,state_address,zip,auction_source_url,opening_bid,deed_status,owner_name"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
         f"&limit=1"
     )
 
@@ -174,8 +175,8 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
         "city",
         "state_address",
         "zip",
+        "pdf_url",
         "auction_source_url",
-        "owner_name",
     ]
 
     for f in important_fields:
@@ -188,15 +189,15 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
 
 
 def should_send_payload(payload: dict):
-    external_id = payload.get("external_id")
+    node = payload.get("node")
     parcel = payload.get("parcel_number")
     sale_date = payload.get("sale_date")
 
-    existing_case = supabase_find_existing_case(external_id)
+    existing_case = supabase_find_existing_case(node)
     if existing_case:
         if payload_is_better_than_existing(payload, existing_case):
-            return True, "existing external_id found, but new payload is better"
-        return False, "duplicate external_id already exists"
+            return True, "existing node found, but new payload is better"
+        return False, "duplicate node already exists"
 
     existing_prop = supabase_find_existing_property(parcel, sale_date)
     if existing_prop:
@@ -212,18 +213,18 @@ def supabase_upsert_property(payload: dict) -> dict:
         return {
             "sent": False,
             "status_code": None,
-            "external_id": payload.get("external_id"),
+            "node": payload.get("node"),
             "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
         }
 
     should_send, reason = should_send_payload(payload)
-    log.info("SUPABASE DEDUP external_id=%s => %s", payload.get("external_id"), reason)
+    log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
 
     if not should_send:
         return {
             "sent": False,
             "status_code": 200,
-            "external_id": payload.get("external_id"),
+            "node": payload.get("node"),
             "response_text": reason,
         }
 
@@ -237,30 +238,30 @@ def supabase_upsert_property(payload: dict) -> dict:
 
         if ok:
             log.info(
-                "SUPABASE UPSERT OK status=%s external_id=%s",
+                "SUPABASE UPSERT OK status=%s node=%s",
                 r.status_code,
-                payload.get("external_id"),
+                payload.get("node"),
             )
         else:
             log.error(
-                "SUPABASE UPSERT FAILED status=%s external_id=%s body=%s",
+                "SUPABASE UPSERT FAILED status=%s node=%s body=%s",
                 r.status_code,
-                payload.get("external_id"),
+                payload.get("node"),
                 r.text[:600],
             )
 
         return {
             "sent": ok,
             "status_code": r.status_code,
-            "external_id": payload.get("external_id"),
+            "node": payload.get("node"),
             "response_text": r.text[:1000],
         }
     except Exception as e:
-        log.exception("SUPABASE UPSERT EXCEPTION external_id=%s error=%s", payload.get("external_id"), str(e))
+        log.exception("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
         return {
             "sent": False,
             "status_code": None,
-            "external_id": payload.get("external_id"),
+            "node": payload.get("node"),
             "response_text": str(e),
         }
 
@@ -430,31 +431,6 @@ def wait_for_case_rows(page, timeout_ms=25000):
     raise RuntimeError("No case rows found after Miami search")
 
 
-def wait_for_page_change(page, previous_first_caseid: str, timeout_ms: int = 20000):
-    log.info("Waiting for next Miami page to load...")
-    waited = 0
-    step = 1000
-
-    while waited < timeout_ms:
-        try:
-            rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-            count = rows.count()
-            if count > 0:
-                first_caseid = rows.first.get_attribute("data-caseid") or ""
-                if first_caseid and first_caseid != previous_first_caseid:
-                    log.info("Next Miami page loaded. First case changed %s -> %s", previous_first_caseid, first_caseid)
-                    page.wait_for_timeout(1500)
-                    return True
-        except Exception:
-            pass
-
-        page.wait_for_timeout(step)
-        waited += step
-
-    log.warning("Timed out waiting for next page change after %sms", timeout_ms)
-    return False
-
-
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
@@ -514,7 +490,6 @@ def get_results_summary(page) -> Dict:
             };
         }
         """
-    
     )
 
 
@@ -547,19 +522,13 @@ def parse_total_pages(page) -> int:
     return max_page
 
 
-def click_next_page(page) -> bool:
-    current_rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-    previous_first_caseid = ""
-    try:
-        if current_rows.count() > 0:
-            previous_first_caseid = current_rows.first.get_attribute("data-caseid") or ""
-    except Exception:
-        pass
+def go_to_page_number(page, page_num: int) -> bool:
+    if page_num == 1:
+        return True
 
     selectors = [
-        "a[rel='next']",
-        "a:has-text('Next')",
-        ".pagination a.next",
+        f"a:has-text('Page {page_num}')",
+        f"text='Page {page_num}'",
     ]
 
     for sel in selectors:
@@ -580,33 +549,31 @@ def click_next_page(page) -> bool:
                     except Exception:
                         continue
 
-                if wait_for_page_change(page, previous_first_caseid, timeout_ms=22000):
-                    return True
+                page.wait_for_timeout(10000)
+                wait_for_case_rows(page, timeout_ms=20000)
+                page.wait_for_timeout(1500)
+                return True
         except Exception:
             continue
 
     try:
-        page_links = page.locator("a")
-        count = page_links.count()
-        for i in range(count):
-            a = page_links.nth(i)
-            txt = clean_text(a.inner_text())
-            if txt.lower() == "next":
-                try:
-                    a.scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
-
-                try:
-                    a.click(timeout=8000)
-                except Exception:
-                    try:
-                        a.click(force=True, timeout=8000)
-                    except Exception:
-                        continue
-
-                if wait_for_page_change(page, previous_first_caseid, timeout_ms=22000):
-                    return True
+        ok = page.evaluate(
+            """
+            (pageNum) => {
+                const links = Array.from(document.querySelectorAll('a'));
+                const target = links.find(a => ((a.innerText || '').trim() === `Page ${pageNum}`));
+                if (!target) return false;
+                target.click();
+                return true;
+            }
+            """,
+            page_num,
+        )
+        if ok:
+            page.wait_for_timeout(10000)
+            wait_for_case_rows(page, timeout_ms=20000)
+            page.wait_for_timeout(1500)
+            return True
     except Exception:
         pass
 
@@ -630,19 +597,18 @@ def parse_row_text(row_text: str) -> Dict:
     return payload
 
 
-def open_case_by_index(page, index: int) -> Dict:
-    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+def open_case_by_caseid(page, caseid: str) -> Dict:
+    rows = page.locator(f'tr.load-case.table-row.link[data-caseid="{caseid}"]')
     count = rows.count()
-    if index >= count:
-        raise RuntimeError(f"Index {index} out of range. Row count={count}")
+    if count == 0:
+        raise RuntimeError(f"Case row not found for caseid={caseid}")
 
-    row = rows.nth(index)
-    caseid = row.get_attribute("data-caseid") or ""
+    row = rows.first
     row_text = clean_text(row.inner_text())
 
     handle = row.element_handle()
     if handle is None:
-        raise RuntimeError(f"Could not get handle for case row {index}")
+        raise RuntimeError(f"Could not get handle for case row {caseid}")
 
     if not click_element_handle_safe(handle, page, f"CASE ROW {caseid}"):
         raise RuntimeError(f"Could not open case detail for caseid {caseid}")
@@ -788,62 +754,7 @@ def extract_case_detail(page, base_case: Dict) -> Dict:
     return detail
 
 
-def open_property_appraiser(context, parcel_href):
-    if not parcel_href:
-        raise RuntimeError("No parcel/property appraiser href found")
-
-    log.info("Opening Property Appraiser URL: %s", parcel_href)
-    pa_page = context.new_page()
-    pa_page.goto(parcel_href, wait_until="domcontentloaded", timeout=60000)
-    pa_page.wait_for_timeout(10000)
-    return pa_page
-
-
-def extract_property_appraiser(pa_page):
-    data = pa_page.evaluate(
-        """
-        () => {
-            function findField(label) {
-                const nodes = Array.from(document.querySelectorAll('body *'));
-                for (const el of nodes) {
-                    const txt = (el.innerText || '').trim();
-                    if (txt === label || txt.startsWith(label)) {
-                        const parent = el.parentElement;
-                        if (parent) {
-                            const parentText = (parent.innerText || '').trim();
-                            if (parentText && parentText !== label) {
-                                return parentText.replace(label, '').trim();
-                            }
-                        }
-                        const next = el.nextElementSibling;
-                        if (next) return (next.innerText || '').trim();
-                    }
-                }
-                return '';
-            }
-
-            return {
-                folio: findField('Folio:'),
-                subdivision: findField('Sub-Division:'),
-                property_address: findField('Property Address'),
-                owner: findField('Owner'),
-                mailing_address: findField('Mailing Address'),
-                pa_primary_zone: findField('PA Primary Zone'),
-                primary_land_use: findField('Primary Land Use'),
-                beds_baths_half: findField('Beds / Baths /Half')
-            };
-        }
-        """
-    )
-
-    data["property_address"] = clean_multiline(data.get("property_address", ""))
-    data["mailing_address"] = clean_multiline(data.get("mailing_address", ""))
-
-    log.info("PROPERTY APPRAISER EXTRACTED: %s", json.dumps(data, indent=2))
-    return data
-
-
-def build_final_record(case_detail: Dict, pa_data: Dict) -> Dict:
+def build_final_record(case_detail: Dict) -> Dict:
     row_parsed = parse_row_text(case_detail.get("row_text", ""))
     header = case_detail.get("header", {})
     summary = case_detail.get("case_summary", {})
@@ -860,8 +771,6 @@ def build_final_record(case_detail: Dict, pa_data: Dict) -> Dict:
         "auction_date": None,
         "auction_time": None,
         "auction_location": "Miami-Dade RealForeclose",
-        "auction_url": AUCTION_URL,
-        "external_id": f"{case_number}|{parcel_number}",
         "caseid": case_detail.get("caseid", ""),
         "case_number": case_number,
         "case_status": header.get("case_status") or row_parsed.get("status", ""),
@@ -875,86 +784,61 @@ def build_final_record(case_detail: Dict, pa_data: Dict) -> Dict:
         "redemption_amount": header.get("redemption_amount", ""),
         "opening_bid": header.get("opening_bid", ""),
         "property_address_case": summary.get("property_address", ""),
-        "property_address_pa": pa_data.get("property_address", ""),
         "legal_description": summary.get("legal_description", ""),
         "homestead": summary.get("homestead", ""),
-        "folio": pa_data.get("folio", ""),
-        "subdivision": pa_data.get("subdivision", ""),
-        "owner": pa_data.get("owner", ""),
-        "mailing_address": pa_data.get("mailing_address", ""),
-        "pa_primary_zone": pa_data.get("pa_primary_zone", ""),
-        "primary_land_use": pa_data.get("primary_land_use", ""),
-        "beds_baths_half": pa_data.get("beds_baths_half", ""),
         "parcel_appraiser_url": parcel.get("href", ""),
     }
     return record
 
 
 def build_properties_payload(record: dict) -> dict:
-    addr_full = record.get("property_address_pa") or record.get("property_address_case") or ""
+    addr_full = record.get("property_address_case") or ""
 
     city = None
     state_address = None
     zip_code = None
 
-    m = re.search(r",\s*([A-Z ]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", addr_full, re.I)
+    m = re.search(r"^(.*?),\s*([A-Z][A-Z .]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", addr_full, re.I)
     if m:
-        city = clean_text(m.group(1)).title()
-        state_address = clean_text(m.group(2)).upper()
-        zip_code = clean_text(m.group(3))
-
-    address_only = addr_full
-    if m:
-        address_only = addr_full[:m.start()].strip(" ,")
+        address_only = clean_text(m.group(1))
+        city = clean_text(m.group(2)).title()
+        state_address = clean_text(m.group(3)).upper()
+        zip_code = clean_text(m.group(4))
+    else:
+        address_only = addr_full.strip(" ,") or None
 
     return {
         "county": "Miami-Dade",
         "state": "FL",
-        "node": record.get("caseid"),
-        "external_id": record.get("external_id"),
-        "auction_source_url": record.get("parcel_appraiser_url") or AUCTION_URL,
+        "node": str(record.get("caseid") or ""),
+
+        "pdf_url": record.get("parcel_appraiser_url") or None,
+        "auction_source_url": "https://www.miamidade.realforeclose.com/index.cfm",
+
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
         "sale_date": record.get("sale_date"),
+
         "opening_bid": normalize_money(record.get("opening_bid")),
         "deed_status": record.get("case_status"),
+
         "applicant_name": record.get("applicant_number"),
-        "owner_name": record.get("owner"),
-        "address": address_only or None,
+
+        "address": address_only,
         "city": city,
         "state_address": state_address,
         "zip": zip_code,
-        "mailing_address": record.get("mailing_address"),
+
+        "auction_location": "Miami-Dade RealForeclose",
+        "auction_start_time": None,
+        "auction_platform": "Miami-Dade RealForeclose",
+
+        "status": record.get("case_status") or "ACTIVE",
+        "is_active": True,
+
         "legal_description": record.get("legal_description"),
         "homestead": record.get("homestead"),
-        "folio": record.get("folio"),
-        "property_address_case": record.get("property_address_case"),
-        "property_address_pa": record.get("property_address_pa"),
-        "auction_location": record.get("auction_location"),
-        "auction_url": record.get("auction_url"),
         "redemption_amount": normalize_money(record.get("redemption_amount")),
-    }
-
-
-def scrape_case_by_index_on_current_page(context, page, index: int) -> Dict:
-    base_case = open_case_by_index(page, index)
-    case_detail = extract_case_detail(page, base_case)
-
-    parcel_href = (case_detail.get("parcel_link") or {}).get("href", "")
-    pa_data = {}
-    if parcel_href:
-        pa_page = open_property_appraiser(context, parcel_href)
-        pa_data = extract_property_appraiser(pa_page)
-        pa_page.close()
-    else:
-        log.warning("No parcel href found for case %s", base_case.get("caseid"))
-
-    record = build_final_record(case_detail, pa_data)
-
-    return {
-        "case_detail": case_detail,
-        "property_appraiser": pa_data,
-        "record": record,
     }
 
 
@@ -962,7 +846,7 @@ def scrape_case_by_index_on_current_page(context, page, index: int) -> Dict:
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V3 + PAGE-BY-PAGE + SUPABASE ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V4 + PAGE-BY-PAGE + SUPABASE CLEAN ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -989,92 +873,99 @@ def run_miami():
         page = context.new_page()
 
         open_list_and_apply_filter(page)
+
         total_pages = parse_total_pages(page)
+        summary = get_results_summary(page)
+
         log.info("Detected total Miami pages: %s", total_pages)
 
         results = []
         failures = []
         supabase_results = []
-        processed_caseids = set()
-
         total_processed = 0
-        current_page_num = 1
 
-        while current_page_num <= total_pages and total_processed < MAX_LOTS:
-            rows = collect_case_rows(page)
-            row_count = len(rows)
-
-            if row_count == 0:
-                log.warning("No rows found on page %s", current_page_num)
+        for page_num in range(1, total_pages + 1):
+            if total_processed >= MAX_LOTS:
                 break
 
-            log.info("Processing all %s rows from page %s before moving forward", row_count, current_page_num)
+            if page_num > 1:
+                ok = go_to_page_number(page, page_num)
+                if not ok:
+                    log.warning("Could not navigate to page %s", page_num)
+                    break
 
-            for idx, row_meta in enumerate(rows):
+            rows = collect_case_rows(page)
+            if not rows:
+                log.warning("No rows found on page %s", page_num)
+                continue
+
+            log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
+
+            for row in rows:
                 if total_processed >= MAX_LOTS:
                     break
 
-                caseid = row_meta.get("caseid")
-                if not caseid or caseid in processed_caseids:
-                    continue
+                caseid = row.get("caseid")
+                row_index = row.get("index")
 
+                total_processed += 1
                 log.info(
                     "[%s/%s] Scraping caseid=%s page=%s row=%s ...",
-                    total_processed + 1,
+                    total_processed,
                     MAX_LOTS,
                     caseid,
-                    current_page_num,
-                    idx,
+                    page_num,
+                    row_index,
                 )
 
                 try:
-                    result = scrape_case_by_index_on_current_page(context, page, idx)
-                    record = result["record"]
+                    if page_num > 1:
+                        # garante que estamos na página correta após voltar do detalhe
+                        ok = go_to_page_number(page, page_num)
+                        if not ok:
+                            raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
+
+                    base_case = open_case_by_caseid(page, caseid)
+                    case_detail = extract_case_detail(page, base_case)
+
+                    record = build_final_record(case_detail)
                     results.append(record)
-                    processed_caseids.add(caseid)
-                    total_processed += 1
 
                     prop_payload = build_properties_payload(record)
+
                     sb_result = supabase_upsert_property(prop_payload)
                     supabase_results.append(sb_result)
 
                     send_to_app(prop_payload)
 
-                    log.info("SUCCESS CASE %s: %s", total_processed, record.get("external_id"))
+                    log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
+
+                    # voltar para a listagem
+                    open_list_and_apply_filter(page)
+                    if page_num > 1:
+                        ok = go_to_page_number(page, page_num)
+                        if not ok:
+                            raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
 
                 except Exception as e:
-                    log.exception("FAILED CASE caseid=%s page=%s row=%s: %s", caseid, current_page_num, idx, e)
+                    log.exception("FAILED CASE caseid=%s: %s", caseid, e)
                     failures.append({
                         "caseid": caseid,
-                        "page_num": current_page_num,
-                        "row_index": idx,
+                        "page_num": page_num,
+                        "row_index": row_index,
                         "error": str(e),
                     })
 
-                if idx < row_count - 1 and total_processed < MAX_LOTS:
-                    open_list_and_apply_filter(page)
-
-                    for _ in range(1, current_page_num):
-                        moved = click_next_page(page)
-                        if not moved:
-                            raise RuntimeError(f"Could not return to page {current_page_num} after scraping caseid={caseid}")
-
-            if total_processed >= MAX_LOTS:
-                break
-
-            if current_page_num < total_pages:
-                moved = click_next_page(page)
-                if not moved:
-                    log.warning("Could not navigate to page %s", current_page_num + 1)
-                    break
-
-            current_page_num += 1
-
-        summary = get_results_summary(page)
+                    try:
+                        open_list_and_apply_filter(page)
+                        if page_num > 1:
+                            go_to_page_number(page, page_num)
+                    except Exception:
+                        pass
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v3_page_by_page_supabase",
+            "mode": "final_operational_v4_page_by_page_supabase_clean",
             "total_pages_detected": total_pages,
             "rows_detected": len(results) + len(failures),
             "records_count": len(results),
