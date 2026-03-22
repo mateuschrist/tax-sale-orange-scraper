@@ -1,15 +1,26 @@
 import json
 import logging
+import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = None
+
 
 log = logging.getLogger("miami")
 
 BASE_URL = "https://miamidade.realtdm.com"
 LIST_URL = f"{BASE_URL}/public/cases/list"
 AUCTION_URL = "https://www.miamidade.realforeclose.com/index.cfm"
+
+# AJUSTE AQUI SE SUA TABELA TIVER OUTRO NOME
+SUPABASE_TABLE = "properties"
 
 
 def clean_text(value):
@@ -24,13 +35,6 @@ def clean_multiline(value):
     lines = [re.sub(r"\s+", " ", x).strip(" ,") for x in str(value).splitlines()]
     lines = [x for x in lines if x]
     return ", ".join(lines)
-
-
-def money_from_text(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"\$[\d,]+(?:\.\d{2})?", text)
-    return m.group(0) if m else ""
 
 
 def click_safe(page, selector, name, timeout=6000):
@@ -180,6 +184,21 @@ def get_filter_state(page):
     )
 
 
+def wait_for_case_rows(page, timeout_ms=30000):
+    log.info("Waiting for Miami search results...")
+    waited = 0
+    step = 1000
+    while waited < timeout_ms:
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+        if rows > 0:
+            log.info(f"Rows after search: {rows}")
+            return rows
+        page.wait_for_timeout(step)
+        waited += step
+
+    raise RuntimeError("No case rows found after Miami search")
+
+
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
@@ -206,45 +225,25 @@ def run_search_flow(page):
     wait_for_case_rows(page)
 
 
-def wait_for_case_rows(page, timeout_ms=25000):
-    log.info("Waiting for Miami search results...")
-    waited = 0
-    step = 1000
-    while waited < timeout_ms:
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-        if rows > 0:
-            log.info(f"Rows after search: {rows}")
-            return rows
-        page.wait_for_timeout(step)
-        waited += step
-
-    raise RuntimeError("No case rows found after Miami search")
-
-
 def get_results_summary(page) -> Dict:
-    data = page.evaluate(
+    return page.evaluate(
         """
         () => {
-            const bodyText = document.body.innerText || '';
-
             const pageLinks = Array.from(document.querySelectorAll('a'))
                 .map(a => (a.innerText || '').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
-
             const hiddenPerPage = document.querySelector('#filterCasesPerPage');
 
             return {
                 rows_on_page: rows,
                 page_links: pageLinks,
-                hidden_per_page: hiddenPerPage ? hiddenPerPage.value : '',
-                body_sample: bodyText.slice(0, 3000)
+                hidden_per_page: hiddenPerPage ? hiddenPerPage.value : ''
             };
         }
         """
     )
-    return data
 
 
 def try_set_results_per_page(page, target="100") -> Dict:
@@ -253,15 +252,14 @@ def try_set_results_per_page(page, target="100") -> Dict:
     success = page.evaluate(
         """
         (target) => {
-            const sel = document.querySelector('#filterCasesPerPage');
-            if (!sel) return {ok:false, reason:'filterCasesPerPage not found'};
+            const hidden = document.querySelector('#filterCasesPerPage');
+            if (!hidden) return {ok:false, reason:'filterCasesPerPage not found'};
 
-            sel.value = String(target);
+            hidden.value = String(target);
+            hidden.dispatchEvent(new Event('input', { bubbles: true }));
+            hidden.dispatchEvent(new Event('change', { bubbles: true }));
 
-            sel.dispatchEvent(new Event('input', { bubbles: true }));
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-
-            return {ok:true, value: sel.value};
+            return {ok:true, value:hidden.value};
         }
         """,
         target,
@@ -276,20 +274,14 @@ def try_set_results_per_page(page, target="100") -> Dict:
         return {"ok": False, "target": target, "reason": "could not re-submit search"}
 
     wait_for_case_rows(page)
-
     page.wait_for_timeout(4000)
+
     summary = get_results_summary(page)
-
-    rows = summary.get("rows_on_page", 0)
-    hidden = summary.get("hidden_per_page", "")
-
-    ok = (str(hidden) == str(target)) or (rows > 20 and str(target) == "100")
-
     result = {
-        "ok": ok,
+        "ok": str(summary.get("hidden_per_page", "")) == str(target),
         "target": target,
-        "rows_on_page": rows,
-        "hidden_per_page": hidden,
+        "rows_on_page": summary.get("rows_on_page", 0),
+        "hidden_per_page": summary.get("hidden_per_page", ""),
         "page_links_count": len(summary.get("page_links", [])),
     }
     log.info(f"Results/page final state: {result}")
@@ -325,7 +317,7 @@ def collect_case_rows(page) -> List[Dict]:
 def parse_row_text(row_text: str) -> Dict:
     parts = re.split(r"\s{2,}|\t", row_text)
     parts = [clean_text(x) for x in parts if clean_text(x)]
-    payload = {
+    return {
         "status": parts[0] if len(parts) > 0 else "",
         "case_number": parts[1] if len(parts) > 1 else "",
         "date_created": parts[2] if len(parts) > 2 else "",
@@ -333,22 +325,19 @@ def parse_row_text(row_text: str) -> Dict:
         "parcel_number": parts[4] if len(parts) > 4 else "",
         "sale_date": parts[5] if len(parts) > 5 else "",
     }
-    return payload
 
 
-def open_case_by_index(page, index: int) -> Dict:
-    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-    count = rows.count()
-    if index >= count:
-        raise RuntimeError(f"Index {index} out of range. Row count={count}")
+def open_case_by_caseid(page, caseid: str) -> Dict:
+    selector = f'tr.load-case.table-row.link[data-caseid="{caseid}"]'
+    row = page.locator(selector).first
 
-    row = rows.nth(index)
-    caseid = row.get_attribute("data-caseid") or ""
+    if row.count() == 0:
+        raise RuntimeError(f"Case row not found for caseid {caseid}")
+
     row_text = clean_text(row.inner_text())
-
     handle = row.element_handle()
     if handle is None:
-        raise RuntimeError(f"Could not get handle for case row {index}")
+        raise RuntimeError(f"Could not get handle for caseid {caseid}")
 
     if not click_element_handle_safe(handle, page, f"CASE ROW {caseid}"):
         raise RuntimeError(f"Could not open case detail for caseid {caseid}")
@@ -359,9 +348,43 @@ def open_case_by_index(page, index: int) -> Dict:
     try:
         page.wait_for_selector("text=CASE SUMMARY", timeout=15000)
     except PlaywrightTimeoutError:
-        log.warning("CASE SUMMARY title not found; continuing with DOM parse attempt")
+        log.warning("CASE SUMMARY title not found; continuing with parse attempt")
 
     return {"caseid": caseid, "row_text": row_text}
+
+
+def click_back_to_case_list(page):
+    selectors = [
+        "a.case-details-close",
+        "button.case-details-close",
+        "a:has-text('Back')",
+        "button:has-text('Back')",
+        "a:has-text('Case List')",
+        "button:has-text('Case List')",
+    ]
+
+    for sel in selectors:
+        try:
+            if click_safe(page, sel, f"BACK TO CASE LIST [{sel}]", timeout=3000):
+                page.wait_for_timeout(4000)
+                rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+                if rows > 0:
+                    return True
+        except Exception:
+            pass
+
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(5000)
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+        if rows > 0:
+            log.info("Returned to case list via browser back")
+            return True
+    except Exception:
+        pass
+
+    log.warning("Could not explicitly return to case list; assuming inline list remains available")
+    return False
 
 
 def parse_case_header(page):
@@ -408,19 +431,11 @@ def parse_case_header(page):
     )
 
     raw_body = data.get("raw_body", "")
-    data["redemption_amount"] = money_from_text(
-        re.search(r"Redemption Amount:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body).group(0)
-        if re.search(r"Redemption Amount:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body) else ""
-    )
-    if data["redemption_amount"]:
-        data["redemption_amount"] = re.search(r"\$[\d,]+(?:\.\d{2})?", data["redemption_amount"]).group(0)
+    rm = re.search(r"Redemption Amount:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body)
+    om = re.search(r"Opening Bid:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body)
 
-    data["opening_bid"] = money_from_text(
-        re.search(r"Opening Bid:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body).group(0)
-        if re.search(r"Opening Bid:\s*(\$[\d,]+(?:\.\d{2})?)", raw_body) else ""
-    )
-    if data["opening_bid"]:
-        data["opening_bid"] = re.search(r"\$[\d,]+(?:\.\d{2})?", data["opening_bid"]).group(0)
+    data["redemption_amount"] = rm.group(1) if rm else ""
+    data["opening_bid"] = om.group(1) if om else ""
 
     return data
 
@@ -462,11 +477,7 @@ def parse_case_summary(page):
 
     data["property_address"] = clean_multiline(data.get("property_address", ""))
     pub = data.get("publish_dates", "")
-    if pub:
-        data["publish_dates_list"] = [clean_text(x) for x in pub.splitlines() if clean_text(x)]
-    else:
-        data["publish_dates_list"] = []
-
+    data["publish_dates_list"] = [clean_text(x) for x in pub.splitlines() if clean_text(x)] if pub else []
     return data
 
 
@@ -487,7 +498,7 @@ def extract_case_detail(page, base_case: Dict) -> Dict:
         },
         "case_summary": summary_data,
         "parcel_link": header_data.get("parcel_link"),
-        "has_case_summary": "CASE SUMMARY" in header_data.get("raw_body", ""),
+        "has_case_summary": True,
     }
 
     log.info(f"CASE DETAIL EXTRACTED: {json.dumps(detail, indent=2)}")
@@ -496,7 +507,7 @@ def extract_case_detail(page, base_case: Dict) -> Dict:
 
 def open_property_appraiser(context, parcel_href):
     if not parcel_href:
-        raise RuntimeError("No parcel/property appraiser href found")
+        raise RuntimeError("No property appraiser href found")
 
     log.info(f"Opening Property Appraiser URL: {parcel_href}")
     pa_page = context.new_page()
@@ -544,7 +555,6 @@ def extract_property_appraiser(pa_page):
 
     data["property_address"] = clean_multiline(data.get("property_address", ""))
     data["mailing_address"] = clean_multiline(data.get("mailing_address", ""))
-
     log.info(f"PROPERTY APPRAISER EXTRACTED: {json.dumps(data, indent=2)}")
     return data
 
@@ -558,7 +568,7 @@ def build_final_record(case_detail: Dict, pa_data: Dict) -> Dict:
     parcel_number = header.get("parcel_number") or row_parsed.get("parcel_number") or parcel.get("text", "")
     case_number = header.get("case_number") or row_parsed.get("case_number", "")
 
-    record = {
+    return {
         "source": "MiamiDade",
         "county": "Miami-Dade",
         "visible_in_app": True,
@@ -593,11 +603,10 @@ def build_final_record(case_detail: Dict, pa_data: Dict) -> Dict:
         "beds_baths_half": pa_data.get("beds_baths_half", ""),
         "parcel_appraiser_url": parcel.get("href", ""),
     }
-    return record
 
 
-def scrape_one_case(context, page, index: int) -> Dict:
-    base_case = open_case_by_index(page, index)
+def scrape_one_case_by_caseid(context, page, caseid: str) -> Dict:
+    base_case = open_case_by_caseid(page, caseid)
     case_detail = extract_case_detail(page, base_case)
 
     parcel_href = (case_detail.get("parcel_link") or {}).get("href", "")
@@ -607,9 +616,11 @@ def scrape_one_case(context, page, index: int) -> Dict:
         pa_data = extract_property_appraiser(pa_page)
         pa_page.close()
     else:
-        log.warning(f"No parcel href found for case {base_case.get('caseid')}")
+        log.warning(f"No parcel href found for case {caseid}")
 
     record = build_final_record(case_detail, pa_data)
+    click_back_to_case_list(page)
+
     return {
         "case_detail": case_detail,
         "property_appraiser": pa_data,
@@ -617,8 +628,64 @@ def scrape_one_case(context, page, index: int) -> Dict:
     }
 
 
+def get_supabase_client():
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+    if not url:
+        log.error("SUPABASE_URL not found in environment")
+        return None
+
+    if not key:
+        log.error("SUPABASE_SERVICE_ROLE_KEY not found in environment")
+        return None
+
+    if create_client is None:
+        log.error("supabase package is not installed")
+        return None
+
+    try:
+        client = create_client(url, key)
+        log.info("Supabase client created successfully")
+        return client
+    except Exception as e:
+        log.exception(f"Could not create Supabase client: {e}")
+        return None
+
+
+def send_record_to_supabase(client, record: Dict) -> Dict:
+    if client is None:
+        return {
+            "sent": False,
+            "reason": "client is None",
+            "external_id": record.get("external_id", "")
+        }
+
+    payload = dict(record)
+
+    try:
+        resp = client.table(SUPABASE_TABLE).upsert(
+            payload,
+            on_conflict="external_id"
+        ).execute()
+
+        log.info(f"SUPABASE UPSERT SUCCESS: {record.get('external_id')}")
+        return {
+            "sent": True,
+            "external_id": record.get("external_id", ""),
+            "response_has_data": hasattr(resp, "data")
+        }
+    except Exception as e:
+        log.exception(f"SUPABASE UPSERT FAILED for {record.get('external_id')}: {e}")
+        return {
+            "sent": False,
+            "external_id": record.get("external_id", ""),
+            "reason": str(e)
+        }
+
+
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V1 ===")
+    log.info("=== MIAMI FINAL FULL + SUPABASE ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -646,42 +713,52 @@ def run_miami():
         page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(8000)
 
+        # PREPARA LISTA UMA VEZ SÓ
         run_search_flow(page)
-
         per_page_mode = set_results_per_page_with_fallback(page)
+        page.wait_for_timeout(4000)
+
         summary = get_results_summary(page)
         case_rows = collect_case_rows(page)
+        case_ids = [x["caseid"] for x in case_rows if x.get("caseid")]
 
-        # For now, scrape current page only.
-        results = []
-        total_to_read = min(len(case_rows), 100)
+        log.info(f"Case IDs collected: {len(case_ids)}")
 
-        # reopen search page state before each detail if needed by re-running the list state
-        # simpler first operational approach: scrape first row only unless you want to scale immediately
-        # Here we'll do current page loop, reopening list fresh each time for robustness.
-        for i in range(total_to_read):
-            log.info(f"[{i+1}/{total_to_read}] Scraping case row on current page...")
-            page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
-            run_search_flow(page)
-            set_results_per_page_with_fallback(page)
-            page.wait_for_timeout(4000)
+        client = get_supabase_client()
 
+        records = []
+        failures = []
+        supabase_results = []
+
+        total_to_read = min(len(case_ids), 100)
+
+        for idx, case_id in enumerate(case_ids[:total_to_read], start=1):
+            log.info(f"[{idx}/{total_to_read}] Scraping caseid={case_id}")
             try:
-                result = scrape_one_case(context, page, i)
-                results.append(result["record"])
-                log.info(f"SUCCESS CASE {i+1}: {result['record'].get('external_id')}")
+                result = scrape_one_case_by_caseid(context, page, case_id)
+                record = result["record"]
+                records.append(record)
+
+                send_result = send_record_to_supabase(client, record)
+                supabase_results.append(send_result)
+
+                log.info(f"SUCCESS CASE {idx}: {record.get('external_id')}")
             except Exception as e:
-                log.exception(f"FAILED CASE INDEX {i}: {e}")
+                failures.append({"caseid": case_id, "error": str(e)})
+                log.exception(f"FAILED CASEID {case_id}: {e}")
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v1",
+            "mode": "final_full_supabase",
             "auction_url_default": AUCTION_URL,
             "results_per_page_mode": per_page_mode,
             "page_summary": summary,
             "rows_detected": len(case_rows),
-            "records": results,
+            "records_count": len(records),
+            "failures_count": len(failures),
+            "failures": failures,
+            "supabase_results": supabase_results,
+            "records": records,
         }
 
         log.info("===== FINAL PAYLOAD =====")
