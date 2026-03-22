@@ -430,6 +430,31 @@ def wait_for_case_rows(page, timeout_ms=25000):
     raise RuntimeError("No case rows found after Miami search")
 
 
+def wait_for_page_change(page, previous_first_caseid: str, timeout_ms: int = 20000):
+    log.info("Waiting for next Miami page to load...")
+    waited = 0
+    step = 1000
+
+    while waited < timeout_ms:
+        try:
+            rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+            count = rows.count()
+            if count > 0:
+                first_caseid = rows.first.get_attribute("data-caseid") or ""
+                if first_caseid and first_caseid != previous_first_caseid:
+                    log.info("Next Miami page loaded. First case changed %s -> %s", previous_first_caseid, first_caseid)
+                    page.wait_for_timeout(1500)
+                    return True
+        except Exception:
+            pass
+
+        page.wait_for_timeout(step)
+        waited += step
+
+    log.warning("Timed out waiting for next page change after %sms", timeout_ms)
+    return False
+
+
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
@@ -482,10 +507,10 @@ def get_results_summary(page) -> Dict:
                 '';
 
             return {
-                rows_on_page: rows,
-                page_links: pageLinks,
-                current_page_text: currentPageText,
-                body_sample: bodyText.slice(0, 3000)
+                rows_on_page": rows,
+                "page_links": pageLinks,
+                "current_page_text": currentPageText,
+                "body_sample": bodyText.slice(0, 3000)
             };
         }
         """
@@ -521,13 +546,19 @@ def parse_total_pages(page) -> int:
     return max_page
 
 
-def go_to_page_number(page, page_num: int) -> bool:
-    if page_num == 1:
-        return True
+def click_next_page(page) -> bool:
+    current_rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+    previous_first_caseid = ""
+    try:
+        if current_rows.count() > 0:
+            previous_first_caseid = current_rows.first.get_attribute("data-caseid") or ""
+    except Exception:
+        pass
 
     selectors = [
-        f"a:has-text('Page {page_num}')",
-        f"text='Page {page_num}'",
+        "a[rel='next']",
+        "a:has-text('Next')",
+        ".pagination a.next",
     ]
 
     for sel in selectors:
@@ -539,6 +570,7 @@ def go_to_page_number(page, page_num: int) -> bool:
                     target.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
                     pass
+
                 try:
                     target.click(timeout=8000)
                 except Exception:
@@ -547,75 +579,37 @@ def go_to_page_number(page, page_num: int) -> bool:
                     except Exception:
                         continue
 
-                page.wait_for_timeout(2500)
-                wait_for_case_rows(page)
-                page.wait_for_timeout(1500)
-                return True
+                if wait_for_page_change(page, previous_first_caseid, timeout_ms=22000):
+                    return True
         except Exception:
             continue
 
     try:
-        ok = page.evaluate(
-            """
-            (pageNum) => {
-                const links = Array.from(document.querySelectorAll('a'));
-                const target = links.find(a => ((a.innerText || '').trim() === `Page ${pageNum}`));
-                if (!target) return false;
-                target.click();
-                return true;
-            }
-            """,
-            page_num,
-        )
-        if ok:
-            page.wait_for_timeout(2500)
-            wait_for_case_rows(page)
-            page.wait_for_timeout(1500)
-            return True
+        page_links = page.locator("a")
+        count = page_links.count()
+        for i in range(count):
+            a = page_links.nth(i)
+            txt = clean_text(a.inner_text())
+            if txt.lower() == "next":
+                try:
+                    a.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+
+                try:
+                    a.click(timeout=8000)
+                except Exception:
+                    try:
+                        a.click(force=True, timeout=8000)
+                    except Exception:
+                        continue
+
+                if wait_for_page_change(page, previous_first_caseid, timeout_ms=22000):
+                    return True
     except Exception:
         pass
 
     return False
-
-
-def discover_all_case_targets(page, max_lots: int) -> List[Dict]:
-    open_list_and_apply_filter(page)
-
-    total_pages = parse_total_pages(page)
-    log.info("Detected total Miami pages: %s", total_pages)
-
-    all_targets: List[Dict] = []
-    seen_caseids = set()
-
-    for page_num in range(1, total_pages + 1):
-        if page_num > 1:
-            ok = go_to_page_number(page, page_num)
-            if not ok:
-                log.warning("Could not navigate to page %s", page_num)
-                break
-
-        rows = collect_case_rows(page)
-        if not rows:
-            log.warning("No rows found on page %s", page_num)
-            continue
-
-        for row in rows:
-            caseid = row.get("caseid", "")
-            if not caseid or caseid in seen_caseids:
-                continue
-
-            seen_caseids.add(caseid)
-            all_targets.append({
-                "page_num": page_num,
-                "caseid": caseid,
-                "row_text": row.get("row_text", ""),
-            })
-
-            if len(all_targets) >= max_lots:
-                log.info("Reached MAX_LOTS=%s while discovering targets", max_lots)
-                return all_targets
-
-    return all_targets
 
 
 # =========================
@@ -635,18 +629,19 @@ def parse_row_text(row_text: str) -> Dict:
     return payload
 
 
-def open_case_by_caseid(page, caseid: str) -> Dict:
-    rows = page.locator(f'tr.load-case.table-row.link[data-caseid="{caseid}"]')
+def open_case_by_index(page, index: int) -> Dict:
+    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
     count = rows.count()
-    if count == 0:
-        raise RuntimeError(f"Case row not found for caseid={caseid}")
+    if index >= count:
+        raise RuntimeError(f"Index {index} out of range. Row count={count}")
 
-    row = rows.first
+    row = rows.nth(index)
+    caseid = row.get_attribute("data-caseid") or ""
     row_text = clean_text(row.inner_text())
 
     handle = row.element_handle()
     if handle is None:
-        raise RuntimeError(f"Could not get handle for case row {caseid}")
+        raise RuntimeError(f"Could not get handle for case row {index}")
 
     if not click_element_handle_safe(handle, page, f"CASE ROW {caseid}"):
         raise RuntimeError(f"Could not open case detail for caseid {caseid}")
@@ -940,18 +935,8 @@ def build_properties_payload(record: dict) -> dict:
     }
 
 
-def scrape_case_target(context, page, target: Dict) -> Dict:
-    page_num = target["page_num"]
-    caseid = target["caseid"]
-
-    open_list_and_apply_filter(page)
-
-    if page_num > 1:
-        ok = go_to_page_number(page, page_num)
-        if not ok:
-            raise RuntimeError(f"Could not navigate to page {page_num} for caseid={caseid}")
-
-    base_case = open_case_by_caseid(page, caseid)
+def scrape_case_by_index_on_current_page(context, page, index: int) -> Dict:
+    base_case = open_case_by_index(page, index)
     case_detail = extract_case_detail(page, base_case)
 
     parcel_href = (case_detail.get("parcel_link") or {}).get("href", "")
@@ -976,7 +961,7 @@ def scrape_case_target(context, page, target: Dict) -> Dict:
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V2 + PAGINATION + SUPABASE ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V3 + PAGE-BY-PAGE + SUPABASE ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1002,55 +987,99 @@ def run_miami():
 
         page = context.new_page()
 
-        targets = discover_all_case_targets(page, MAX_LOTS)
-        summary = get_results_summary(page)
-
-        log.info("Discovered %s target cases across paginated results", len(targets))
+        open_list_and_apply_filter(page)
+        total_pages = parse_total_pages(page)
+        log.info("Detected total Miami pages: %s", total_pages)
 
         results = []
         failures = []
         supabase_results = []
+        processed_caseids = set()
 
-        total_to_read = min(len(targets), MAX_LOTS)
+        total_processed = 0
+        current_page_num = 1
 
-        for i, target in enumerate(targets[:total_to_read]):
-            log.info(
-                "[%s/%s] Scraping caseid=%s page=%s ...",
-                i + 1,
-                total_to_read,
-                target.get("caseid"),
-                target.get("page_num"),
-            )
+        while current_page_num <= total_pages and total_processed < MAX_LOTS:
+            rows = collect_case_rows(page)
+            row_count = len(rows)
 
-            try:
-                result = scrape_case_target(context, page, target)
-                record = result["record"]
-                results.append(record)
+            if row_count == 0:
+                log.warning("No rows found on page %s", current_page_num)
+                break
 
-                prop_payload = build_properties_payload(record)
-                sb_result = supabase_upsert_property(prop_payload)
-                supabase_results.append(sb_result)
+            log.info("Processing all %s rows from page %s before moving forward", row_count, current_page_num)
 
-                send_to_app(prop_payload)
+            for idx, row_meta in enumerate(rows):
+                if total_processed >= MAX_LOTS:
+                    break
 
-                log.info("SUCCESS CASE %s: %s", i + 1, record.get("external_id"))
-            except Exception as e:
-                log.exception("FAILED CASE caseid=%s: %s", target.get("caseid"), e)
-                failures.append({
-                    "caseid": target.get("caseid"),
-                    "page_num": target.get("page_num"),
-                    "error": str(e),
-                })
+                caseid = row_meta.get("caseid")
+                if not caseid or caseid in processed_caseids:
+                    continue
+
+                log.info(
+                    "[%s/%s] Scraping caseid=%s page=%s row=%s ...",
+                    total_processed + 1,
+                    MAX_LOTS,
+                    caseid,
+                    current_page_num,
+                    idx,
+                )
+
+                try:
+                    result = scrape_case_by_index_on_current_page(context, page, idx)
+                    record = result["record"]
+                    results.append(record)
+                    processed_caseids.add(caseid)
+                    total_processed += 1
+
+                    prop_payload = build_properties_payload(record)
+                    sb_result = supabase_upsert_property(prop_payload)
+                    supabase_results.append(sb_result)
+
+                    send_to_app(prop_payload)
+
+                    log.info("SUCCESS CASE %s: %s", total_processed, record.get("external_id"))
+
+                except Exception as e:
+                    log.exception("FAILED CASE caseid=%s page=%s row=%s: %s", caseid, current_page_num, idx, e)
+                    failures.append({
+                        "caseid": caseid,
+                        "page_num": current_page_num,
+                        "row_index": idx,
+                        "error": str(e),
+                    })
+
+                if idx < row_count - 1 and total_processed < MAX_LOTS:
+                    open_list_and_apply_filter(page)
+
+                    for _ in range(1, current_page_num):
+                        moved = click_next_page(page)
+                        if not moved:
+                            raise RuntimeError(f"Could not return to page {current_page_num} after scraping caseid={caseid}")
+
+            if total_processed >= MAX_LOTS:
+                break
+
+            if current_page_num < total_pages:
+                moved = click_next_page(page)
+                if not moved:
+                    log.warning("Could not navigate to page %s", current_page_num + 1)
+                    break
+
+            current_page_num += 1
+
+        summary = get_results_summary(page)
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v2_paginated_supabase",
-            "rows_detected": len(targets),
+            "mode": "final_operational_v3_page_by_page_supabase",
+            "total_pages_detected": total_pages,
+            "rows_detected": len(results) + len(failures),
             "records_count": len(results),
             "failures_count": len(failures),
             "supabase_results": supabase_results,
             "page_summary": summary,
-            "targets": targets,
             "records": results,
             "failures": failures,
         }
