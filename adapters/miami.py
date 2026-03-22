@@ -50,9 +50,8 @@ def force_clear_all_active_statuses(page):
                 const icon = el.querySelector('i');
                 if (icon) {
                     icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    if (!icon.className.includes('icon-circle-blank')) {
-                        icon.className = (icon.className + ' icon-circle-blank').trim();
-                    }
+                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    icon.className = (icon.className + ' icon-circle-blank').trim();
                 }
             });
 
@@ -62,18 +61,20 @@ def force_clear_all_active_statuses(page):
                 const icon = parent.querySelector('i');
                 if (icon) {
                     icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    if (!icon.className.includes('icon-circle-blank')) {
-                        icon.className = (icon.className + ' icon-circle-blank').trim();
-                    }
+                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    icon.className = (icon.className + ' icon-circle-blank').trim();
                 }
             }
+
+            const hidden = document.querySelector('#filterCaseStatus');
+            if (hidden) hidden.value = '';
 
             const label = document.querySelector('#filterCaseStatusLabel');
             if (label) label.innerText = 'None Selected';
         }
         """
     )
-    log.info("Cleared all Active child statuses via JS")
+    log.info("Cleared UI + hidden filterCaseStatus")
 
 
 def force_select_only_192(page):
@@ -88,9 +89,8 @@ def force_select_only_192(page):
             const icon = el.querySelector('i');
             if (icon) {
                 icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                if (!icon.className.includes('icon-ok-sign')) {
-                    icon.className = (icon.className + ' icon-ok-sign').trim();
-                }
+                icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                icon.className = (icon.className + ' icon-ok-sign').trim();
             }
 
             const parent = document.querySelector('#caseStatus2');
@@ -99,62 +99,46 @@ def force_select_only_192(page):
                 const picon = parent.querySelector('i');
                 if (picon) {
                     picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    if (!picon.className.includes('icon-ok-sign')) {
-                        picon.className = (picon.className + ' icon-ok-sign').trim();
-                    }
+                    picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    picon.className = (picon.className + ' icon-ok-sign').trim();
                 }
             }
+
+            const hidden = document.querySelector('#filterCaseStatus');
+            if (hidden) hidden.value = '192';
 
             const label = document.querySelector('#filterCaseStatusLabel');
             if (label) label.innerText = '1 Selected';
         }
         """
     )
-    log.info("Forced only status 192 via JS")
+    log.info("Forced UI + hidden filterCaseStatus=192")
 
 
-def dump_status_related_state(page, title):
+def dump_state(page, title):
     data = page.evaluate(
         """
         () => {
-            const fields = Array.from(document.querySelectorAll('input, select, textarea')).map(el => ({
-                tag: el.tagName.toLowerCase(),
-                type: el.getAttribute('type') || '',
-                name: el.getAttribute('name') || '',
-                id: el.id || '',
-                value: el.value || '',
-                cls: el.className || ''
-            }));
-
-            const filteredFields = fields.filter(x =>
-                (x.name || '').toLowerCase().includes('status') ||
-                (x.id || '').toLowerCase().includes('status') ||
-                (x.name || '').toLowerCase().includes('case') ||
-                (x.id || '').toLowerCase().includes('case')
-            );
-
+            const hidden = document.querySelector('#filterCaseStatus');
             const selected192 = document.querySelector('a[data-statusid="192"][data-parentid="2"]');
 
             return {
                 label: (document.querySelector('#filterCaseStatusLabel')?.innerText || '').trim(),
+                hidden_filterCaseStatus: hidden ? hidden.value : None,
                 selected192: selected192 ? {
                     className: selected192.className || '',
                     outerHTML: selected192.outerHTML
-                } : null,
-                status_fields: filteredFields
+                } : null
             };
         }
         """
     )
-
     log.info("===== %s =====", title)
-    log.info("STATUS LABEL: %s", data["label"])
-    log.info("SELECTED 192: %s", data["selected192"])
-    log.info("STATUS FIELDS: %s", data["status_fields"])
+    log.info("STATE: %s", data)
 
 
 def run_miami():
-    log.info("=== MIAMI REQUEST DIAGNOSTIC ===")
+    log.info("=== MIAMI REAL FILTER FIX ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -181,24 +165,22 @@ def run_miami():
         page = context.new_page()
 
         def on_request(request):
-            if "cases" in request.url or "search" in request.url or "list" in request.url:
-                log.info("===== OUTGOING REQUEST =====")
-                log.info("REQ METHOD: %s", request.method)
+            if request.method == "POST" and "/public/cases/list" in request.url:
+                log.info("===== OUTGOING POST =====")
                 log.info("REQ URL: %s", request.url)
-                try:
-                    log.info("REQ POST DATA: %s", request.post_data)
-                except Exception:
-                    pass
+                log.info("REQ POST DATA: %s", request.post_data)
 
         page.on("request", on_request)
 
         page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(8000)
 
-        click_safe(page, "a.filters-reset", "RESET FILTERS")
+        if not click_safe(page, "a.filters-reset", "RESET FILTERS"):
+            raise RuntimeError("Could not reset filters")
         page.wait_for_timeout(2000)
 
-        click_safe(page, "#filterButtonStatus", "FILTER BUTTON")
+        if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
+            raise RuntimeError("Could not open filter button")
         page.wait_for_timeout(1500)
 
         force_clear_all_active_statuses(page)
@@ -207,19 +189,21 @@ def run_miami():
         force_select_only_192(page)
         page.wait_for_timeout(1200)
 
-        dump_status_related_state(page, "BEFORE SEARCH")
+        dump_state(page, "BEFORE SEARCH")
 
-        click_safe(page, "button.filters-submit", "SEARCH BUTTON")
+        if not click_safe(page, "button.filters-submit", "SEARCH BUTTON"):
+            raise RuntimeError("Could not click search")
 
+        log.info("Sleeping 15 seconds to let search finish...")
         page.wait_for_timeout(15000)
 
-        dump_status_related_state(page, "AFTER SEARCH")
+        dump_state(page, "AFTER SEARCH")
 
         rows = page.locator('tr.load-case.table-row.link[data-caseid]')
         count = rows.count()
         log.info(f"FOUND {count} CASE ROWS")
 
-        for i in range(min(count, 10)):
+        for i in range(min(count, 20)):
             row = rows.nth(i)
             try:
                 caseid = row.get_attribute("data-caseid")
