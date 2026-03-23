@@ -471,43 +471,51 @@ def get_results_summary(page) -> Dict:
         """
         () => {
             const bodyText = document.body.innerText || '';
-
-            const pageLinks = Array.from(document.querySelectorAll('a'))
-                .map(a => (a.innerText || '').trim())
-                .filter(x => /^Page\\s+\\d+/i.test(x));
-
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const currentPageText =
-                (document.querySelector('.pagination .active')?.innerText || '').trim() ||
-                '';
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
+                .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+                .filter(x => /^Page\\s+\\d+/i.test(x));
+
+            const m = bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
 
             return {
                 rows_on_page: rows,
                 page_links: pageLinks,
-                current_page_text: currentPageText,
+                current_page_text: m ? `Page ${m[1]}/${m[2]}` : "",
                 body_sample: bodyText.slice(0, 3000)
             };
         }
         """
     )
 
+
 def get_active_page_number(page) -> int:
     try:
         active = page.evaluate(
             """
             () => {
-                const txt = document.body.innerText || '';
-                const m = txt.match(/Page\\s+(\\d+)\\/(\\d+)/i);
-                if (!m) return 1;
-                return parseInt(m[1], 10);
+                const candidates = Array.from(document.querySelectorAll('button, a, span, div'));
+
+                for (const el of candidates) {
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const m = txt.match(/^Page\\s+(\\d+)$/i);
+                    if (m) return parseInt(m[1], 10);
+                }
+
+                const body = document.body.innerText || '';
+                const m2 = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                if (m2) return parseInt(m2[1], 10);
+
+                return 1;
             }
             """
         )
         return int(active) if active else 1
     except Exception:
         return 1
-        
+
+
 def collect_case_rows(page) -> List[Dict]:
     rows = page.locator('tr.load-case.table-row.link[data-caseid]')
     count = rows.count()
@@ -525,75 +533,110 @@ def collect_case_rows(page) -> List[Dict]:
 
 
 def parse_total_pages(page) -> int:
-    summary = get_results_summary(page)
-    links = summary.get("page_links", [])
-    max_page = 1
+    try:
+        total = page.evaluate(
+            """
+            () => {
+                const body = document.body.innerText || '';
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                if (m) return parseInt(m[2], 10);
 
-    for txt in links:
-        m = re.search(r"Page\s+(\d+)", txt, re.I)
-        if m:
-            max_page = max(max_page, int(m.group(1)))
+                const candidates = Array.from(document.querySelectorAll('a, button, span, div'))
+                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+                    .filter(Boolean);
 
-    return max_page
+                let maxPage = 1;
+                for (const txt of candidates) {
+                    const mm = txt.match(/^Page\\s+(\\d+)/i);
+                    if (mm) {
+                        maxPage = Math.max(maxPage, parseInt(mm[1], 10));
+                    }
+                }
+                return maxPage;
+            }
+            """
+        )
+        return int(total or 1)
+    except Exception:
+        return 1
 
 
-def go_to_page_number(page, page_num: int) -> bool:
+def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
-    if current_before == page_num:
-        return True
-
-    selectors = [
-        f"a:has-text('Page {page_num}')",
-        f"text='Page {page_num}'",
-    ]
+    log.info("Current Miami page before NEXT click: %s", current_before)
 
     clicked = False
 
-    for sel in selectors:
+    candidate_selectors = [
+        "button[title*='Next']",
+        "a[title*='Next']",
+        "button[aria-label*='Next']",
+        "a[aria-label*='Next']",
+    ]
+
+    for sel in candidate_selectors:
         try:
             loc = page.locator(sel)
             if loc.count() > 0:
-                target = loc.first
+                btn = loc.first
                 try:
-                    target.scroll_into_view_if_needed(timeout=3000)
+                    btn.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
                     pass
 
                 try:
-                    target.click(timeout=8000)
+                    btn.click(timeout=8000)
                     clicked = True
+                    log.info("NEXT clicked using selector: %s", sel)
                     break
                 except Exception:
                     try:
-                        target.click(force=True, timeout=8000)
+                        btn.click(force=True, timeout=8000)
                         clicked = True
+                        log.info("NEXT clicked using selector(force): %s", sel)
                         break
                     except Exception:
-                        continue
+                        pass
         except Exception:
-            continue
+            pass
 
     if not clicked:
         try:
             clicked = page.evaluate(
                 """
-                (pageNum) => {
-                    const links = Array.from(document.querySelectorAll('a'));
-                    const target = links.find(a => ((a.innerText || '').trim() === `Page ${pageNum}`));
-                    if (!target) return false;
-                    target.click();
-                    return true;
+                () => {
+                    const els = Array.from(document.querySelectorAll('button, a, span, div, i'));
+
+                    for (const el of els) {
+                        const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                        const title = (el.getAttribute('title') || '').toLowerCase();
+                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+
+                        if (
+                            txt === '>' ||
+                            txt === '›' ||
+                            txt === '»' ||
+                            title.includes('next') ||
+                            aria.includes('next') ||
+                            cls.includes('next')
+                        ) {
+                            el.click();
+                            return true;
+                        }
+                    }
+
+                    return false;
                 }
-                """,
-                page_num,
+                """
             )
         except Exception:
             clicked = False
 
     if not clicked:
+        log.warning("Could not click NEXT page button")
         return False
 
-    # Miami demora para carregar
     page.wait_for_timeout(12000)
 
     try:
@@ -604,9 +647,32 @@ def go_to_page_number(page, page_num: int) -> bool:
     page.wait_for_timeout(2000)
 
     current_after = get_active_page_number(page)
-    log.info("Page before=%s | expected=%s | after=%s", current_before, page_num, current_after)
+    log.info("Current Miami page after NEXT click: %s", current_after)
 
-    return current_after == page_num
+    return current_after > current_before
+
+
+def go_to_page_number(page, page_num: int) -> bool:
+    current = get_active_page_number(page)
+
+    if current == page_num:
+        return True
+
+    if page_num < current:
+        log.warning(
+            "Requested page %s but current page is %s. Reloading list is required to go backwards.",
+            page_num,
+            current,
+        )
+        return False
+
+    while current < page_num:
+        ok = click_next_page(page)
+        if not ok:
+            return False
+        current = get_active_page_number(page)
+
+    return current == page_num
 
 
 # =========================
@@ -933,7 +999,6 @@ def run_miami():
 
                 try:
                     if page_num > 1:
-                        # garante que estamos na página correta após voltar do detalhe
                         ok = go_to_page_number(page, page_num)
                         if not ok:
                             raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
@@ -953,7 +1018,6 @@ def run_miami():
 
                     log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
 
-                    # voltar para a listagem
                     open_list_and_apply_filter(page)
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
