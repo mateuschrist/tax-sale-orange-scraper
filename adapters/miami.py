@@ -811,34 +811,18 @@ def build_properties_payload(record: dict) -> dict:
         "county": "Miami-Dade",
         "state": "FL",
         "node": str(record.get("caseid") or ""),
-
         "pdf_url": record.get("parcel_appraiser_url") or None,
         "auction_source_url": "https://www.miamidade.realforeclose.com/index.cfm",
-
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
         "sale_date": record.get("sale_date"),
-
         "opening_bid": normalize_money(record.get("opening_bid")),
         "deed_status": record.get("case_status"),
-
         "applicant_name": record.get("applicant_number"),
-
         "address": address_only,
         "city": city,
         "state_address": state_address,
         "zip": zip_code,
-
-        "auction_location": "Miami-Dade RealForeclose",
-        "auction_start_time": None,
-        "auction_platform": "Miami-Dade RealForeclose",
-
-        "status": record.get("case_status") or "ACTIVE",
-        "is_active": True,
-
-        "legal_description": record.get("legal_description"),
-        "homestead": record.get("homestead"),
-        "redemption_amount": normalize_money(record.get("redemption_amount")),
     }
 
 
