@@ -497,16 +497,10 @@ def get_active_page_number(page) -> int:
         active = page.evaluate(
             """
             () => {
-                const activeEl =
-                    document.querySelector('.pagination .active') ||
-                    document.querySelector('a.active') ||
-                    document.querySelector('li.active');
-
-                if (!activeEl) return null;
-
-                const txt = (activeEl.innerText || activeEl.textContent || '').trim();
-                const m = txt.match(/(\\d+)/);
-                return m ? parseInt(m[1], 10) : null;
+                const txt = document.body.innerText || '';
+                const m = txt.match(/Page\\s+(\\d+)\\/(\\d+)/i);
+                if (!m) return 1;
+                return parseInt(m[1], 10);
             }
             """
         )
@@ -544,13 +538,16 @@ def parse_total_pages(page) -> int:
 
 
 def go_to_page_number(page, page_num: int) -> bool:
-    if page_num == 1:
+    current_before = get_active_page_number(page)
+    if current_before == page_num:
         return True
 
     selectors = [
         f"a:has-text('Page {page_num}')",
         f"text='Page {page_num}'",
     ]
+
+    clicked = False
 
     for sel in selectors:
         try:
@@ -564,41 +561,52 @@ def go_to_page_number(page, page_num: int) -> bool:
 
                 try:
                     target.click(timeout=8000)
+                    clicked = True
+                    break
                 except Exception:
                     try:
                         target.click(force=True, timeout=8000)
+                        clicked = True
+                        break
                     except Exception:
                         continue
-
-                page.wait_for_timeout(10000)
-                wait_for_case_rows(page, timeout_ms=20000)
-                page.wait_for_timeout(1500)
-                return True
         except Exception:
             continue
 
+    if not clicked:
+        try:
+            clicked = page.evaluate(
+                """
+                (pageNum) => {
+                    const links = Array.from(document.querySelectorAll('a'));
+                    const target = links.find(a => ((a.innerText || '').trim() === `Page ${pageNum}`));
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }
+                """,
+                page_num,
+            )
+        except Exception:
+            clicked = False
+
+    if not clicked:
+        return False
+
+    # Miami demora para carregar
+    page.wait_for_timeout(12000)
+
     try:
-        ok = page.evaluate(
-            """
-            (pageNum) => {
-                const links = Array.from(document.querySelectorAll('a'));
-                const target = links.find(a => ((a.innerText || '').trim() === `Page ${pageNum}`));
-                if (!target) return false;
-                target.click();
-                return true;
-            }
-            """,
-            page_num,
-        )
-        if ok:
-            page.wait_for_timeout(10000)
-            wait_for_case_rows(page, timeout_ms=20000)
-            page.wait_for_timeout(1500)
-            return True
+        wait_for_case_rows(page, timeout_ms=20000)
     except Exception:
         pass
 
-    return False
+    page.wait_for_timeout(2000)
+
+    current_after = get_active_page_number(page)
+    log.info("Page before=%s | expected=%s | after=%s", current_before, page_num, current_after)
+
+    return current_after == page_num
 
 
 # =========================
