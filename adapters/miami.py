@@ -492,7 +492,28 @@ def get_results_summary(page) -> Dict:
         """
     )
 
+def get_active_page_number(page) -> int:
+    try:
+        active = page.evaluate(
+            """
+            () => {
+                const activeEl =
+                    document.querySelector('.pagination .active') ||
+                    document.querySelector('a.active') ||
+                    document.querySelector('li.active');
 
+                if (!activeEl) return null;
+
+                const txt = (activeEl.innerText || activeEl.textContent || '').trim();
+                const m = txt.match(/(\\d+)/);
+                return m ? parseInt(m[1], 10) : null;
+            }
+            """
+        )
+        return int(active) if active else 1
+    except Exception:
+        return 1
+        
 def collect_case_rows(page) -> List[Dict]:
     rows = page.locator('tr.load-case.table-row.link[data-caseid]')
     count = rows.count()
