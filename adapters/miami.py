@@ -540,19 +540,7 @@ def parse_total_pages(page) -> int:
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-
-                const candidates = Array.from(document.querySelectorAll('a, button, span, div'))
-                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
-                    .filter(Boolean);
-
-                let maxPage = 1;
-                for (const txt of candidates) {
-                    const mm = txt.match(/^Page\\s+(\\d+)/i);
-                    if (mm) {
-                        maxPage = Math.max(maxPage, parseInt(mm[1], 10));
-                    }
-                }
-                return maxPage;
+                return 1;
             }
             """
         )
@@ -567,76 +555,111 @@ def click_next_page(page) -> bool:
 
     clicked = False
 
-    candidate_selectors = [
-        "button[title*='Next']",
-        "a[title*='Next']",
-        "button[aria-label*='Next']",
-        "a[aria-label*='Next']",
-    ]
+    # tentativa 1: clicar no botão logo à direita do seletor "Page X"
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+                const all = Array.from(document.querySelectorAll('button, a, div, span'));
 
-    for sel in candidate_selectors:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                btn = loc.first
-                try:
-                    btn.scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
+                let pageControl = null;
+                for (const el of all) {
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    if (/^Page\\s+\\d+$/i.test(txt)) {
+                        pageControl = el;
+                        break;
+                    }
+                }
 
-                try:
-                    btn.click(timeout=8000)
-                    clicked = True
-                    log.info("NEXT clicked using selector: %s", sel)
-                    break
-                except Exception:
-                    try:
-                        btn.click(force=True, timeout=8000)
-                        clicked = True
-                        log.info("NEXT clicked using selector(force): %s", sel)
-                        break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                if (!pageControl) return false;
+
+                function isVisible(el) {
+                    const s = window.getComputedStyle(el);
+                    return s && s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+                }
+
+                const parent = pageControl.parentElement;
+                if (!parent) return false;
+
+                const siblings = Array.from(parent.children);
+                const idx = siblings.indexOf(pageControl);
+
+                for (let i = idx + 1; i < siblings.length; i++) {
+                    const el = siblings[i];
+                    if (!isVisible(el)) continue;
+
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const cls = (el.className || '').toString().toLowerCase();
+
+                    // botão da direita / next / ícone
+                    if (
+                        txt === '>' ||
+                        txt === '›' ||
+                        txt === '»' ||
+                        cls.includes('next') ||
+                        cls.includes('glyphicon') ||
+                        cls.includes('icon') ||
+                        el.querySelector('i, svg, img')
+                    ) {
+                        el.click();
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            """
+        )
+    except Exception:
+        clicked = False
 
     if not clicked:
+        # tentativa 2: localizar botão visualmente à direita do controle "Page X"
         try:
-            clicked = page.evaluate(
-                """
-                () => {
-                    const els = Array.from(document.querySelectorAll('button, a, span, div, i'));
+            page_box = page.locator("text=/^Page\\s+\\d+$/i").first.bounding_box()
+            if page_box:
+                candidates = page.locator("button, a, div, span")
+                count = candidates.count()
 
-                    for (const el of els) {
-                        const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                        const title = (el.getAttribute('title') || '').toLowerCase();
-                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                        const cls = (el.className || '').toString().toLowerCase();
+                for i in range(count):
+                    el = candidates.nth(i)
+                    try:
+                        box = el.bounding_box()
+                        if not box:
+                            continue
 
-                        if (
-                            txt === '>' ||
-                            txt === '›' ||
-                            txt === '»' ||
-                            title.includes('next') ||
-                            aria.includes('next') ||
-                            cls.includes('next')
-                        ) {
-                            el.click();
-                            return true;
-                        }
-                    }
+                        # precisa estar na mesma faixa horizontal e à direita
+                        same_row = abs(box["y"] - page_box["y"]) < 40
+                        is_right = box["x"] > (page_box["x"] + page_box["width"] - 5)
 
-                    return false;
-                }
-                """
-            )
+                        if not (same_row and is_right):
+                            continue
+
+                        txt = clean_text(el.inner_text())
+                        cls = (el.get_attribute("class") or "").lower()
+
+                        if txt in (">", "›", "»") or "next" in cls or "icon" in cls or "glyphicon" in cls:
+                            try:
+                                el.click(timeout=4000)
+                                clicked = True
+                                break
+                            except Exception:
+                                try:
+                                    el.click(force=True, timeout=4000)
+                                    clicked = True
+                                    break
+                                except Exception:
+                                    pass
+                    except Exception:
+                        continue
         except Exception:
-            clicked = False
+            pass
 
     if not clicked:
         log.warning("Could not click NEXT page button")
         return False
 
+    # site lento
     page.wait_for_timeout(12000)
 
     try:
