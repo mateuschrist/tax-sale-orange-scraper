@@ -495,26 +495,24 @@ def get_active_page_number(page) -> int:
         active = page.evaluate(
             """
             () => {
-                const candidates = Array.from(document.querySelectorAll('button, a, span, div'));
-
-                for (const el of candidates) {
-                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    const m = txt.match(/^Page\\s+(\\d+)$/i);
-                    if (m) return parseInt(m[1], 10);
-                }
-
                 const body = document.body.innerText || '';
-                const m2 = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
-                if (m2) return parseInt(m2[1], 10);
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                if (m) return parseInt(m[1], 10);
+
+                const els = Array.from(document.querySelectorAll('button, a, div, span'));
+                for (const el of els) {
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const mm = txt.match(/^Page\\s+(\\d+)$/i);
+                    if (mm) return parseInt(mm[1], 10);
+                }
 
                 return 1;
             }
             """
         )
-        return int(active) if active else 1
+        return int(active or 1)
     except Exception:
         return 1
-
 
 def collect_case_rows(page) -> List[Dict]:
     rows = page.locator('tr.load-case.table-row.link[data-caseid]')
@@ -553,113 +551,114 @@ def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
     log.info("Current Miami page before NEXT click: %s", current_before)
 
-    clicked = False
-
-    # tentativa 1: clicar no botão logo à direita do seletor "Page X"
     try:
-        clicked = page.evaluate(
+        result = page.evaluate(
             """
             () => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    return s &&
+                        s.display !== 'none' &&
+                        s.visibility !== 'hidden' &&
+                        el.offsetWidth > 0 &&
+                        el.offsetHeight > 0;
+                }
+
+                function textOf(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                function clsOf(el) {
+                    return ((el && el.className) || '').toString().toLowerCase();
+                }
+
                 const all = Array.from(document.querySelectorAll('button, a, div, span'));
 
                 let pageControl = null;
                 for (const el of all) {
-                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    if (/^Page\\s+\\d+$/i.test(txt)) {
+                    const txt = textOf(el);
+                    if (/^Page\\s+\\d+$/i.test(txt) && isVisible(el)) {
                         pageControl = el;
                         break;
                     }
                 }
 
-                if (!pageControl) return false;
-
-                function isVisible(el) {
-                    const s = window.getComputedStyle(el);
-                    return s && s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+                if (!pageControl) {
+                    return { clicked: false, reason: 'page control not found' };
                 }
 
-                const parent = pageControl.parentElement;
-                if (!parent) return false;
+                const controlRect = pageControl.getBoundingClientRect();
 
-                const siblings = Array.from(parent.children);
-                const idx = siblings.indexOf(pageControl);
-
-                for (let i = idx + 1; i < siblings.length; i++) {
-                    const el = siblings[i];
+                // procurar elemento clicável à direita, na mesma linha
+                const candidates = [];
+                for (const el of all) {
+                    if (el === pageControl) continue;
                     if (!isVisible(el)) continue;
 
-                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    const cls = (el.className || '').toString().toLowerCase();
+                    const rect = el.getBoundingClientRect();
+                    const txt = textOf(el);
+                    const cls = clsOf(el);
 
-                    // botão da direita / next / ícone
-                    if (
-                        txt === '>' ||
-                        txt === '›' ||
-                        txt === '»' ||
-                        cls.includes('next') ||
-                        cls.includes('glyphicon') ||
-                        cls.includes('icon') ||
-                        el.querySelector('i, svg, img')
-                    ) {
-                        el.click();
-                        return true;
+                    const sameRow = Math.abs(rect.top - controlRect.top) < 40;
+                    const toRight = rect.left >= (controlRect.right - 5);
+
+                    if (!sameRow || !toRight) continue;
+
+                    const score =
+                        (txt === '>' ? 100 : 0) +
+                        (txt === '›' ? 100 : 0) +
+                        (txt === '»' ? 100 : 0) +
+                        (cls.includes('next') ? 60 : 0) +
+                        (cls.includes('icon') ? 25 : 0) +
+                        (cls.includes('glyph') ? 25 : 0) +
+                        (el.querySelector('i, svg, img') ? 20 : 0) +
+                        (rect.width > 20 && rect.width < 120 ? 10 : 0);
+
+                    if (score > 0) {
+                        candidates.push({
+                            el,
+                            txt,
+                            cls,
+                            left: rect.left,
+                            top: rect.top,
+                            score
+                        });
                     }
                 }
 
-                return false;
+                candidates.sort((a, b) => {
+                    if (b.score !== a.score) return b.score - a.score;
+                    return a.left - b.left;
+                });
+
+                if (!candidates.length) {
+                    return { clicked: false, reason: 'no next candidate found' };
+                }
+
+                const target = candidates[0].el;
+                target.click();
+
+                return {
+                    clicked: true,
+                    reason: 'clicked best candidate',
+                    chosen_text: textOf(target),
+                    chosen_class: clsOf(target)
+                };
             }
             """
         )
-    except Exception:
-        clicked = False
 
-    if not clicked:
-        # tentativa 2: localizar botão visualmente à direita do controle "Page X"
-        try:
-            page_box = page.locator("text=/^Page\\s+\\d+$/i").first.bounding_box()
-            if page_box:
-                candidates = page.locator("button, a, div, span")
-                count = candidates.count()
+        log.info("NEXT click result: %s", result)
 
-                for i in range(count):
-                    el = candidates.nth(i)
-                    try:
-                        box = el.bounding_box()
-                        if not box:
-                            continue
+        if not result or not result.get("clicked"):
+            log.warning("Could not click NEXT page button")
+            return False
 
-                        # precisa estar na mesma faixa horizontal e à direita
-                        same_row = abs(box["y"] - page_box["y"]) < 40
-                        is_right = box["x"] > (page_box["x"] + page_box["width"] - 5)
-
-                        if not (same_row and is_right):
-                            continue
-
-                        txt = clean_text(el.inner_text())
-                        cls = (el.get_attribute("class") or "").lower()
-
-                        if txt in (">", "›", "»") or "next" in cls or "icon" in cls or "glyphicon" in cls:
-                            try:
-                                el.click(timeout=4000)
-                                clicked = True
-                                break
-                            except Exception:
-                                try:
-                                    el.click(force=True, timeout=4000)
-                                    clicked = True
-                                    break
-                                except Exception:
-                                    pass
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    if not clicked:
-        log.warning("Could not click NEXT page button")
+    except Exception as e:
+        log.warning("Could not click NEXT page button: %s", str(e))
         return False
 
-    # site lento
     page.wait_for_timeout(12000)
 
     try:
@@ -674,7 +673,6 @@ def click_next_page(page) -> bool:
 
     return current_after > current_before
 
-
 def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
 
@@ -683,7 +681,7 @@ def go_to_page_number(page, page_num: int) -> bool:
 
     if page_num < current:
         log.warning(
-            "Requested page %s but current page is %s. Reloading list is required to go backwards.",
+            "Requested page %s but current page is %s. Reload is required to go backwards.",
             page_num,
             current,
         )
