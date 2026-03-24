@@ -558,7 +558,7 @@ def get_results_summary(page) -> Dict:
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, li'))
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
@@ -584,7 +584,7 @@ def get_active_page_number(page) -> int:
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
-                const els = Array.from(document.querySelectorAll('button, a, div, span, li'));
+                const els = Array.from(document.querySelectorAll('button, a, div, span'));
                 for (const el of els) {
                     const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                     const mm = txt.match(/^Page\\s+(\\d+)$/i);
@@ -624,20 +624,7 @@ def parse_total_pages(page) -> int:
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-
-                const allText = Array.from(document.querySelectorAll('a, button, span, div, li'))
-                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
-                    .filter(Boolean);
-
-                let maxPage = 1;
-                for (const txt of allText) {
-                    const mm = txt.match(/^Page\\s+(\\d+)\\b/i);
-                    if (mm) {
-                        const n = parseInt(mm[1], 10);
-                        if (n > maxPage) maxPage = n;
-                    }
-                }
-                return maxPage;
+                return 1;
             }
             """
         )
@@ -646,7 +633,7 @@ def parse_total_pages(page) -> int:
         return 1
 
 
-def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeout_ms: int = 30000) -> bool:
+def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeout_ms: int = 45000) -> bool:
     waited = 0
     step = 1000
 
@@ -668,14 +655,14 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeou
 
             if current != old_page and rows > 0:
                 log.info(
-                    "Miami page changed by number: %s -> %s | first_caseid=%s",
+                    "Miami page changed by page number: %s -> %s | first_caseid=%s",
                     old_page, current, new_first_caseid
                 )
                 return True
 
             if old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid:
                 log.info(
-                    "Miami page changed by row set: %s -> %s",
+                    "Miami page changed by first row: %s -> %s",
                     old_first_caseid, new_first_caseid
                 )
                 return True
@@ -693,87 +680,44 @@ def open_pager_dropdown(page) -> bool:
     selectors = [
         "text=/^Page\\s+\\d+\\s*$/",
         "text=/^Page\\s+\\d+$/",
+        "div:has-text('Page ')",
+        "span:has-text('Page ')",
+        "button:has-text('Page ')",
     ]
 
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            if loc.count() > 0:
-                loc.first.click(timeout=5000, force=True)
-                page.wait_for_timeout(1200)
+            if loc.count() == 0:
+                continue
 
-                opened = page.evaluate(
-                    """
-                    () => {
-                        const els = Array.from(document.querySelectorAll('a, button, div, span, li, td'))
-                            .map(el => ((el.innerText || '').replace(/\\s+/g, ' ').trim()))
-                            .filter(Boolean);
-                        return els.some(t => /^Page\\s+\\d+\\s+\\(results/i.test(t));
-                    }
-                    """
-                )
+            target = loc.first
+            target.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
 
-                if opened:
-                    log.info("Opened pager dropdown using selector: %s", sel)
-                    return True
-        except Exception:
-            pass
+            try:
+                target.click(timeout=4000)
+            except Exception:
+                try:
+                    target.click(timeout=4000, force=True)
+                except Exception:
+                    box = target.bounding_box()
+                    if not box:
+                        continue
+                    page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2
+                    )
 
-    try:
-        result = page.evaluate(
-            """
-            () => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           r.width > 0 &&
-                           r.height > 0;
-                }
-
-                function clean(txt) {
-                    return (txt || '').replace(/\\s+/g, ' ').trim();
-                }
-
-                const all = Array.from(document.querySelectorAll('a, button, div, span, td'))
-                    .filter(isVisible);
-
-                const target = all.find(el => /^Page\\s+\\d+$/.test(clean(el.innerText)));
-                if (!target) return { ok: false };
-
-                const r = target.getBoundingClientRect();
-                return {
-                    ok: true,
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2,
-                    text: clean(target.innerText)
-                };
-            }
-            """
-        )
-
-        if result and result.get("ok"):
-            page.mouse.click(result["x"], result["y"])
             page.wait_for_timeout(1200)
 
-            opened = page.evaluate(
-                """
-                () => {
-                    const els = Array.from(document.querySelectorAll('a, button, div, span, li, td'))
-                        .map(el => ((el.innerText || '').replace(/\\s+/g, ' ').trim()))
-                        .filter(Boolean);
-                    return els.some(t => /^Page\\s+\\d+\\s+\\(results/i.test(t));
-                }
-                """
-            )
-
-            if opened:
-                log.info("Opened pager dropdown via mouse click: %s", result)
+            options = page.locator("text=/^Page\\s+\\d+\\s+\\(results/i")
+            if options.count() > 0:
+                log.info("Opened pager dropdown using selector: %s", sel)
                 return True
-    except Exception as e:
-        log.warning("open_pager_dropdown JS/mouse failed: %s", str(e))
+
+        except Exception:
+            pass
 
     return False
 
@@ -789,58 +733,14 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
     except Exception:
         pass
 
-    option_regex = re.compile(
-        r"^Page\s+" + re.escape(str(target_page)) + r"\s+\(results",
-        re.I
-    )
-
-    # tentativa 1: locator do Playwright
-    try:
-        candidates = page.locator("text=/^Page\\s+\\d+\\s+\\(results/i")
-        count = candidates.count()
-
-        for i in range(count):
-            txt = clean_text(candidates.nth(i).inner_text())
-            if option_regex.match(txt):
-                log.info("Trying locator click on dropdown option: %s", txt)
-
-                try:
-                    candidates.nth(i).click(timeout=5000, force=True)
-                except Exception:
-                    box = candidates.nth(i).bounding_box()
-                    if box:
-                        page.mouse.click(
-                            box["x"] + box["width"] / 2,
-                            box["y"] + box["height"] / 2
-                        )
-                    else:
-                        raise
-
-                # aguarda a navegação/render
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-
-                page.wait_for_timeout(2500)
-
-                if wait_for_page_change(
-                    page,
-                    old_page=old_page,
-                    old_first_caseid=old_first_caseid,
-                    timeout_ms=30000,
-                ):
-                    return True
-
-                break
-    except Exception as e:
-        log.warning("Locator dropdown click failed for page %s: %s", target_page, str(e))
-
-    # tentativa 2: JS dispatch
     try:
         result = page.evaluate(
             """
             (targetPage) => {
+                function clean(txt) {
+                    return (txt || '').replace(/\\s+/g, ' ').trim();
+                }
+
                 function isVisible(el) {
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
@@ -851,30 +751,61 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                            r.height > 0;
                 }
 
-                function clean(txt) {
-                    return (txt || '').replace(/\\s+/g, ' ').trim();
+                function clickableAncestor(el) {
+                    let cur = el;
+                    for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) {
+                        const tag = (cur.tagName || '').toLowerCase();
+                        const cls = (cur.className || '').toString().toLowerCase();
+                        const role = (cur.getAttribute && cur.getAttribute('role')) || '';
+
+                        if (
+                            tag === 'a' ||
+                            tag === 'button' ||
+                            tag === 'li' ||
+                            role === 'option' ||
+                            role === 'menuitem' ||
+                            !!cur.onclick ||
+                            cls.includes('item') ||
+                            cls.includes('option') ||
+                            cls.includes('menu')
+                        ) {
+                            return cur;
+                        }
+                    }
+                    return el;
                 }
 
-                const all = Array.from(document.querySelectorAll('a, button, div, span, li, td'))
-                    .filter(isVisible);
+                const exactRe = new RegExp("^Page\\\\s+" + String(targetPage) + "\\\\s+\\\\(results", "i");
 
-                const exactRe = new RegExp("^Page\\\\s+" + targetPage + "\\\\s+\\\\(results", "i");
-                const target = all.find(el => exactRe.test(clean(el.innerText)));
+                const all = Array.from(document.querySelectorAll('*')).filter(isVisible);
 
-                if (!target) {
-                    return { ok: false, reason: 'dropdown option not found' };
+                let textNode = null;
+                for (const el of all) {
+                    const txt = clean(el.innerText);
+                    if (exactRe.test(txt)) {
+                        textNode = el;
+                        break;
+                    }
                 }
 
+                if (!textNode) {
+                    return { ok: false, reason: 'page option not found' };
+                }
+
+                const target = clickableAncestor(textNode);
                 const r = target.getBoundingClientRect();
 
                 target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 
                 return {
                     ok: true,
-                    text: clean(target.innerText),
+                    text: clean(textNode.innerText),
+                    target_tag: target.tagName,
+                    target_class: (target.className || '').toString(),
                     x: r.left + r.width / 2,
                     y: r.top + r.height / 2
                 };
@@ -885,43 +816,103 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
 
         log.info("Dropdown page option click result for page %s: %s", target_page, result)
 
-        if result and result.get("ok"):
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+        if not result or not result.get("ok"):
+            return False
 
-            page.wait_for_timeout(2500)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
 
-            if wait_for_page_change(
-                page,
-                old_page=old_page,
-                old_first_caseid=old_first_caseid,
-                timeout_ms=30000,
-            ):
-                return True
+        page.wait_for_timeout(3000)
 
-            # fallback final: clique do mouse no centro
+        if wait_for_page_change(
+            page,
+            old_page=old_page,
+            old_first_caseid=old_first_caseid,
+            timeout_ms=45000,
+        ):
+            return True
+
+        try:
             page.mouse.click(result["x"], result["y"])
+        except Exception:
+            return False
 
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
 
-            page.wait_for_timeout(2500)
+        page.wait_for_timeout(3000)
 
-            if wait_for_page_change(
-                page,
-                old_page=old_page,
-                old_first_caseid=old_first_caseid,
-                timeout_ms=30000,
-            ):
-                return True
+        if wait_for_page_change(
+            page,
+            old_page=old_page,
+            old_first_caseid=old_first_caseid,
+            timeout_ms=45000,
+        ):
+            return True
 
     except Exception as e:
-        log.warning("JS dropdown click failed for page %s: %s", target_page, str(e))
+        log.warning("Dropdown option click failed for page %s: %s", target_page, str(e))
 
+    return False
+
+
+def click_next_page(page) -> bool:
+    current_before = get_active_page_number(page)
+    old_first_caseid = ""
+
+    try:
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+        if rows.count() > 0:
+            old_first_caseid = rows.first.get_attribute("data-caseid") or ""
+    except Exception:
+        pass
+
+    log.info("Current Miami page before NEXT click: %s", current_before)
+
+    next_selectors = [
+        "text='›'",
+        "text='>'",
+        "text='»'",
+    ]
+
+    for sel in next_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+
+            target = loc.first
+            target.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
+
+            try:
+                target.click(timeout=4000)
+            except Exception:
+                target.click(timeout=4000, force=True)
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(3000)
+
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                timeout_ms=45000,
+            ):
+                return True
+
+        except Exception:
+            pass
+
+    log.warning("Could not click NEXT page button")
     return False
 
 
@@ -929,30 +920,44 @@ def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
 
     if current == page_num:
-        log.info("Already on page %s", page_num)
         return True
 
-    for attempt in range(1, 4):
-        current = get_active_page_number(page)
-        log.info("Trying to navigate from page %s to page %s (attempt %s)", current, page_num, attempt)
+    if page_num < current:
+        log.warning(
+            "Requested page %s but current page is %s. Reload is required to go backwards.",
+            page_num,
+            current,
+        )
+        return False
 
-        if current == page_num:
-            return True
+    while current < page_num:
+        next_page = current + 1
+        success = False
 
-        if not open_pager_dropdown(page):
-            log.warning("Could not open pager dropdown on attempt %s", attempt)
+        for attempt in range(1, 4):
+            log.info(
+                "Trying to navigate from page %s to page %s (attempt %s)",
+                current, next_page, attempt
+            )
+
+            if not open_pager_dropdown(page):
+                log.warning("Could not open pager dropdown on attempt %s", attempt)
+                page.wait_for_timeout(1000)
+                continue
+
+            if click_page_option_from_dropdown(page, next_page):
+                success = True
+                break
+
             page.wait_for_timeout(1000)
-            continue
 
-        if click_page_option_from_dropdown(page, page_num):
-            new_page = get_active_page_number(page)
-            log.info("Navigation success: page %s -> %s", current, new_page)
-            return True
+        if not success:
+            log.warning("Failed navigating from page %s to page %s", current, next_page)
+            return False
 
-        page.wait_for_timeout(1500)
+        current = get_active_page_number(page)
 
-    log.warning("Failed navigating from page %s to page %s", current, page_num)
-    return False
+    return current == page_num
     
 # =========================
 # DETAIL PARSING
