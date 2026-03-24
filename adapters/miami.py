@@ -348,51 +348,24 @@ def click_safe(page, selector, name, timeout=6000, allow_navigation=False):
 def click_search_button(page) -> bool:
     selectors = [
         "button.filters-submit",
-        "button[type='submit']",
         "text=Search",
     ]
 
     for sel in selectors:
         try:
-            locator = page.locator(sel).first
-            if locator.count() == 0:
-                continue
-
-            try:
-                locator.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                pass
-
-            try:
-                locator.click(timeout=8000)
-                log.info("SEARCH BUTTON clicked (normal) selector=%s", sel)
-            except Exception:
-                locator.click(force=True, timeout=8000)
-                log.info("SEARCH BUTTON clicked (force) selector=%s", sel)
-
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                page.locator(sel).first.click(timeout=5000)
+            log.info("SEARCH BUTTON clicked with navigation: %s", sel)
             return True
+        except Exception:
+            pass
 
-        except Exception as e:
-            msg = str(e)
-
-            if (
-                "Execution context was destroyed" in msg
-                or "Target closed" in msg
-                or "has been closed" in msg
-            ):
-                log.info("SEARCH BUTTON triggered navigation selector=%s", sel)
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
-                return True
-
-            log.warning("SEARCH BUTTON selector failed %s: %s", sel, e)
+        try:
+            page.locator(sel).first.click(timeout=5000)
+            log.info("SEARCH BUTTON clicked without navigation: %s", sel)
+            return True
+        except Exception:
+            pass
 
     return False
     
@@ -582,15 +555,11 @@ def get_results_summary(page) -> Dict:
     return page.evaluate(
         """
         () => {
-            function clean(t) {
-                return (t || '').replace(/\\s+/g, ' ').trim();
-            }
-
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, td'))
-                .map(el => clean(el.innerText))
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, li'))
+                .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
             const m = bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
@@ -605,33 +574,20 @@ def get_results_summary(page) -> Dict:
         """
     )
 
+
 def get_active_page_number(page) -> int:
     try:
         active = page.evaluate(
             """
             () => {
-                function clean(t) {
-                    return (t || '').replace(/\\s+/g, ' ').trim();
-                }
-
                 const body = document.body.innerText || '';
-
-                // melhor fonte: "Page 1/14"
-                let m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
-                // fallback: tenta achar algo como "Page 2 (results 21-40)"
-                const els = Array.from(document.querySelectorAll('button, a, div, span, td'));
+                const els = Array.from(document.querySelectorAll('button, a, div, span, li'));
                 for (const el of els) {
-                    const txt = clean(el.innerText);
-                    let mm = txt.match(/^Page\\s+(\\d+)\\s*\\(results\\s+\\d+\\s*-\\s*\\d+\\)$/i);
-                    if (mm) return parseInt(mm[1], 10);
-                }
-
-                // fallback final: "Page 2"
-                for (const el of els) {
-                    const txt = clean(el.innerText);
-                    let mm = txt.match(/^Page\\s+(\\d+)$/i);
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const mm = txt.match(/^Page\\s+(\\d+)$/i);
                     if (mm) return parseInt(mm[1], 10);
                 }
 
@@ -668,7 +624,20 @@ def parse_total_pages(page) -> int:
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-                return 1;
+
+                const allText = Array.from(document.querySelectorAll('a, button, span, div, li'))
+                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+                    .filter(Boolean);
+
+                let maxPage = 1;
+                for (const txt of allText) {
+                    const mm = txt.match(/^Page\\s+(\\d+)\\b/i);
+                    if (mm) {
+                        const n = parseInt(mm[1], 10);
+                        if (n > maxPage) maxPage = n;
+                    }
+                }
+                return maxPage;
             }
             """
         )
@@ -677,9 +646,9 @@ def parse_total_pages(page) -> int:
         return 1
 
 
-def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
+def wait_for_page_change(page, old_page: int, timeout_ms: int = 20000) -> bool:
     waited = 0
-    step = 1000
+    step = 500
 
     while waited < timeout_ms:
         try:
@@ -698,153 +667,23 @@ def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
     return False
 
 
-def get_pager_debug(page) -> List[Dict]:
-    try:
-        return page.evaluate(
-            """
-            () => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return !!s &&
-                        s.display !== 'none' &&
-                        s.visibility !== 'hidden' &&
-                        r.width > 0 &&
-                        r.height > 0;
-                }
-
-                function clean(t) {
-                    return (t || '').replace(/\\s+/g, ' ').trim();
-                }
-
-                return Array.from(document.querySelectorAll('a, button, span, div, td'))
-                    .filter(isVisible)
-                    .map(el => {
-                        const r = el.getBoundingClientRect();
-                        return {
-                            tag: el.tagName,
-                            text: clean(el.innerText),
-                            className: (el.className || '').toString(),
-                            href: el.getAttribute('href') || '',
-                            x: r.left,
-                            y: r.top,
-                            w: r.width,
-                            h: r.height
-                        };
-                    })
-                    .filter(x => /^Page\\s+\\d+/i.test(x.text))
-                    .slice(0, 50);
-            }
-            """
-        )
-    except Exception:
-        return []
-
-
-def click_locator_safely(locator, page, label: str) -> bool:
-    try:
-        locator.scroll_into_view_if_needed(timeout=5000)
-    except Exception:
-        pass
-
-    try:
-        locator.click(timeout=8000)
-        log.info("%s clicked (normal)", label)
-        return True
-    except Exception:
-        pass
-
-    try:
-        locator.click(force=True, timeout=8000)
-        log.info("%s clicked (force)", label)
-        return True
-    except Exception:
-        pass
-
-    try:
-        handle = locator.element_handle()
-        if handle:
-            page.evaluate("(el) => el.click()", handle)
-            log.info("%s clicked (JS)", label)
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-def click_page_link_direct(page, page_num: int) -> bool:
-    current_before = get_active_page_number(page)
-
-    patterns = [
-        re.compile(rf"^Page\\s+{page_num}\\s*\\(results\\s+\\d+\\s*-\\s*\\d+\\)$", re.I),
-        re.compile(rf"^Page\\s+{page_num}$", re.I),
+def open_pager_dropdown(page) -> bool:
+    selectors = [
+        "text=/^Page\\s+\\d+$/",
+        "text=/^Page\\s+\\d+\\s*$/",
+        "text=/^Page\\s+\\d+\\s*▾?$/",
     ]
 
-    try:
-        all_candidates = page.locator("a, button, span, div, td")
-        count = all_candidates.count()
-
-        best_matches = []
-
-        for i in range(count):
-            item = all_candidates.nth(i)
-
-            try:
-                txt = clean_text(item.inner_text())
-            except Exception:
-                continue
-
-            if not txt:
-                continue
-
-            for idx, pattern in enumerate(patterns):
-                if pattern.match(txt):
-                    best_matches.append((idx, len(txt), item, txt))
-                    break
-
-        # prioriza:
-        # 1) padrão completo "Page X (results ...)"
-        # 2) texto menor dentro do mesmo padrão
-        best_matches.sort(key=lambda x: (x[0], x[1]))
-
-        log.info(
-            "Direct page candidates for page %s: %s",
-            page_num,
-            [m[3] for m in best_matches[:10]]
-        )
-
-        for _, _, locator, txt in best_matches:
-            if click_locator_safely(locator, page, f"PAGE LINK {txt}"):
-                page.wait_for_timeout(5000)
-
-                if wait_for_page_change(page, current_before, timeout_ms=15000):
-                    return True
-
-                current_after = get_active_page_number(page)
-                if current_after == page_num:
-                    log.info("Direct page navigation confirmed by active page number: %s", current_after)
-                    return True
-
-        debug = get_pager_debug(page)
-        log.info("PAGER DEBUG for page %s: %s", page_num, debug[:20])
-
-    except Exception as e:
-        log.warning("Direct page-link click failed for page %s: %s", page_num, str(e))
-
-    return False
-
-
-def click_next_page(page) -> bool:
-    current_before = get_active_page_number(page)
-    target_page = current_before + 1
-
-    log.info("Current Miami page before NEXT click: %s", current_before)
-
-    # primeiro tenta ir direto para a próxima página
-    if click_page_link_direct(page, target_page):
-        return True
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                loc.first.click(timeout=5000)
+                page.wait_for_timeout(800)
+                log.info("Opened pager dropdown using selector: %s", sel)
+                return True
+        except Exception:
+            pass
 
     try:
         result = page.evaluate(
@@ -854,81 +693,130 @@ def click_next_page(page) -> bool:
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
                     const r = el.getBoundingClientRect();
-                    return !!s &&
-                        s.display !== 'none' &&
-                        s.visibility !== 'hidden' &&
-                        r.width > 0 &&
-                        r.height > 0;
+                    return s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           r.width > 0 &&
+                           r.height > 0;
                 }
 
-                function txt(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
-                }
+                const els = Array.from(document.querySelectorAll('a, button, div, span, td'))
+                    .filter(isVisible);
 
-                function cls(el) {
-                    return ((el && el.className) || '').toString().toLowerCase();
-                }
+                const target = els.find(el => {
+                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return /^Page\\s+\\d+$/.test(txt);
+                });
 
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
-                const visible = all.filter(isVisible);
+                if (!target) return { ok: false };
 
-                const candidates = visible
-                    .map(el => {
-                        const r = el.getBoundingClientRect();
-                        const text = txt(el);
-                        const className = cls(el);
+                const r = target.getBoundingClientRect();
+                target.click();
 
-                        let score = 0;
-
-                        if (text === '>' || text === '›' || text === '»') score += 300;
-                        if (text.toLowerCase() === 'next') score += 250;
-                        if (className.includes('next')) score += 200;
-                        if (className.includes('pager')) score += 80;
-                        if (className.includes('pagination')) score += 80;
-                        if (className.includes('arrow')) score += 40;
-                        if (className.includes('right')) score += 40;
-
-                        return {
-                            text,
-                            className,
-                            score,
-                            x: r.left + r.width / 2,
-                            y: r.top + r.height / 2
-                        };
-                    })
-                    .filter(x => x.score > 0)
-                    .sort((a, b) => b.score - a.score)
-                    .slice(0, 20);
-
-                if (!candidates.length) {
-                    return { ok: false, reason: 'no strict next candidate found' };
-                }
-
-                return { ok: true, candidates };
+                return {
+                    ok: true,
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    text: (target.innerText || '').trim()
+                };
             }
             """
         )
 
-        log.info("NEXT strict candidates: %s", result)
-
         if result and result.get("ok"):
-            for c in result.get("candidates", []):
-                try:
-                    page.mouse.click(c["x"], c["y"])
-                    page.wait_for_timeout(5000)
+            page.wait_for_timeout(800)
+            log.info("Opened pager dropdown via JS click: %s", result)
+            return True
+    except Exception as e:
+        log.warning("open_pager_dropdown JS failed: %s", str(e))
 
-                    if wait_for_page_change(page, current_before, timeout_ms=15000):
-                        return True
+    return False
 
-                    if get_active_page_number(page) == target_page:
-                        return True
-                except Exception:
-                    pass
+
+def click_page_option_from_dropdown(page, target_page: int) -> bool:
+    old_page = get_active_page_number(page)
+
+    try:
+        result = page.evaluate(
+            """
+            (targetPage) => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           r.width > 0 &&
+                           r.height > 0;
+                }
+
+                function clean(txt) {
+                    return (txt || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                const all = Array.from(document.querySelectorAll('a, button, div, span, li, td'))
+                    .filter(isVisible);
+
+                const exactPrefix = `Page ${targetPage} `;
+                const exactOnly = `Page ${targetPage}`;
+
+                let candidates = all.filter(el => {
+                    const txt = clean(el.innerText);
+                    return txt === exactOnly || txt.startsWith(exactPrefix);
+                });
+
+                // prioriza texto com "(results ...)"
+                candidates.sort((a, b) => {
+                    const at = clean(a.innerText);
+                    const bt = clean(b.innerText);
+                    const ascore = at.includes('(results') ? 10 : 0;
+                    const bscore = bt.includes('(results') ? 10 : 0;
+                    return bscore - ascore;
+                });
+
+                if (!candidates.length) {
+                    return { ok: false, reason: 'dropdown option not found' };
+                }
+
+                const target = candidates[0];
+                const r = target.getBoundingClientRect();
+
+                target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                target.click();
+
+                return {
+                    ok: true,
+                    text: clean(target.innerText),
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2
+                };
+            }
+            """,
+            target_page,
+        )
+
+        log.info("Dropdown page option click result for page %s: %s", target_page, result)
+
+        if not result or not result.get("ok"):
+            return False
+
+        page.wait_for_timeout(2000)
+
+        if wait_for_page_change(page, old_page, timeout_ms=20000):
+            return True
+
+        try:
+            page.mouse.click(result["x"], result["y"])
+            page.wait_for_timeout(2000)
+            if wait_for_page_change(page, old_page, timeout_ms=20000):
+                return True
+        except Exception:
+            pass
 
     except Exception as e:
-        log.warning("NEXT click failed: %s", str(e))
+        log.warning("click_page_option_from_dropdown failed for page %s: %s", target_page, str(e))
 
-    log.warning("Could not click NEXT page button")
     return False
 
 
@@ -936,34 +824,26 @@ def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
 
     if current == page_num:
+        log.info("Already on page %s", page_num)
         return True
 
-    if page_num < current:
-        log.warning(
-            "Requested page %s but current page is %s. Reload is required to go backwards.",
-            page_num,
-            current,
-        )
-        return False
+    for attempt in range(1, 4):
+        log.info("Trying to navigate from page %s to page %s (attempt %s)", current, page_num, attempt)
 
-    while current < page_num:
-        next_page = current + 1
+        if not open_pager_dropdown(page):
+            log.warning("Could not open pager dropdown on attempt %s", attempt)
+            continue
 
-        # sempre tenta primeiro o link direto da próxima página
-        ok = click_page_link_direct(page, next_page)
+        if click_page_option_from_dropdown(page, page_num):
+            new_page = get_active_page_number(page)
+            log.info("Navigation success: page %s -> %s", current, new_page)
+            return new_page == page_num
 
-        if not ok:
-            ok = click_next_page(page)
+        page.wait_for_timeout(1000)
 
-        if not ok:
-            log.warning("Failed navigating from page %s to page %s", current, next_page)
-            return False
-
-        current = get_active_page_number(page)
-
-    return current == page_num
-
-
+    log.warning("Failed navigating from page %s to page %s", current, page_num)
+    return False
+    
 # =========================
 # DETAIL PARSING
 # =========================
