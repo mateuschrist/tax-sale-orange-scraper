@@ -693,13 +693,13 @@ def open_pager_dropdown(page) -> bool:
 
             target = loc.first
             target.scroll_into_view_if_needed()
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(30000)
 
             try:
-                target.click(timeout=4000)
+                target.click(timeout=40000)
             except Exception:
                 try:
-                    target.click(timeout=4000, force=True)
+                    target.click(timeout=40000, force=True)
                 except Exception:
                     box = target.bounding_box()
                     if not box:
@@ -709,7 +709,7 @@ def open_pager_dropdown(page) -> bool:
                         box["y"] + box["height"] / 2
                     )
 
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(12000)
 
             options = page.locator("text=/^Page\\s+\\d+\\s+\\(results/i")
             if options.count() > 0:
@@ -824,7 +824,7 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
         except Exception:
             pass
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(30000)
 
         if wait_for_page_change(
             page,
@@ -844,7 +844,7 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
         except Exception:
             pass
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(30000)
 
         if wait_for_page_change(
             page,
@@ -890,16 +890,16 @@ def click_next_page(page) -> bool:
             page.wait_for_timeout(300)
 
             try:
-                target.click(timeout=4000)
+                target.click(timeout=40000)
             except Exception:
-                target.click(timeout=4000, force=True)
+                target.click(timeout=40000, force=True)
 
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
 
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(30000)
 
             if wait_for_page_change(
                 page,
@@ -942,14 +942,14 @@ def go_to_page_number(page, page_num: int) -> bool:
 
             if not open_pager_dropdown(page):
                 log.warning("Could not open pager dropdown on attempt %s", attempt)
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(10000)
                 continue
 
             if click_page_option_from_dropdown(page, next_page):
                 success = True
                 break
 
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(10000)
 
         if not success:
             log.warning("Failed navigating from page %s to page %s", current, next_page)
