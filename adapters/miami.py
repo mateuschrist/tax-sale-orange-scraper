@@ -646,9 +646,9 @@ def parse_total_pages(page) -> int:
         return 1
 
 
-def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeout_ms: int = 25000) -> bool:
+def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeout_ms: int = 30000) -> bool:
     waited = 0
-    step = 500
+    step = 1000
 
     while waited < timeout_ms:
         try:
@@ -666,18 +666,16 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeou
                 except Exception:
                     pass
 
-            # sucesso se mudou o número da página
             if current != old_page and rows > 0:
                 log.info(
-                    "Miami page changed by page number: %s -> %s | first_caseid=%s",
+                    "Miami page changed by number: %s -> %s | first_caseid=%s",
                     old_page, current, new_first_caseid
                 )
                 return True
 
-            # fallback: às vezes o texto da página demora, mas a tabela já trocou
             if old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid:
                 log.info(
-                    "Miami page changed by table content: old_first_caseid=%s -> new_first_caseid=%s",
+                    "Miami page changed by row set: %s -> %s",
                     old_first_caseid, new_first_caseid
                 )
                 return True
@@ -785,18 +783,18 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
 
     old_first_caseid = ""
     try:
-        if page.locator('tr.load-case.table-row.link[data-caseid]').count() > 0:
-            old_first_caseid = (
-                page.locator('tr.load-case.table-row.link[data-caseid]')
-                .first
-                .get_attribute("data-caseid") or ""
-            )
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+        if rows.count() > 0:
+            old_first_caseid = rows.first.get_attribute("data-caseid") or ""
     except Exception:
         pass
 
-    option_regex = re.compile(rf"^Page\\s+{target_page}\\s+\\(results", re.I)
+    option_regex = re.compile(
+        r"^Page\s+" + re.escape(str(target_page)) + r"\s+\(results",
+        re.I
+    )
 
-    # tentativa 1: locator do Playwright no item visível
+    # tentativa 1: locator do Playwright
     try:
         candidates = page.locator("text=/^Page\\s+\\d+\\s+\\(results/i")
         count = candidates.count()
@@ -809,7 +807,6 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                 try:
                     candidates.nth(i).click(timeout=5000, force=True)
                 except Exception:
-                    # fallback: clique com mouse no centro do elemento
                     box = candidates.nth(i).bounding_box()
                     if box:
                         page.mouse.click(
@@ -819,20 +816,27 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                     else:
                         raise
 
-                page.wait_for_timeout(1500)
+                # aguarda a navegação/render
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(2500)
 
                 if wait_for_page_change(
                     page,
                     old_page=old_page,
                     old_first_caseid=old_first_caseid,
-                    timeout_ms=25000,
+                    timeout_ms=30000,
                 ):
                     return True
+
                 break
     except Exception as e:
         log.warning("Locator dropdown click failed for page %s: %s", target_page, str(e))
 
-    # tentativa 2: JS mais agressivo
+    # tentativa 2: JS dispatch
     try:
         result = page.evaluate(
             """
@@ -854,7 +858,7 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                 const all = Array.from(document.querySelectorAll('a, button, div, span, li, td'))
                     .filter(isVisible);
 
-                const exactRe = new RegExp(`^Page\\\\s+${targetPage}\\\\s+\\\\(results`, 'i');
+                const exactRe = new RegExp("^Page\\\\s+" + targetPage + "\\\\s+\\\\(results", "i");
                 const target = all.find(el => exactRe.test(clean(el.innerText)));
 
                 if (!target) {
@@ -863,7 +867,7 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
 
                 const r = target.getBoundingClientRect();
 
-                target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+                target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
                 target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -882,27 +886,39 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
         log.info("Dropdown page option click result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
-            page.wait_for_timeout(1500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(2500)
 
             if wait_for_page_change(
                 page,
                 old_page=old_page,
                 old_first_caseid=old_first_caseid,
-                timeout_ms=25000,
+                timeout_ms=30000,
             ):
                 return True
 
-            # fallback final: clique do mouse exatamente no centro
+            # fallback final: clique do mouse no centro
             page.mouse.click(result["x"], result["y"])
-            page.wait_for_timeout(1500)
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(2500)
 
             if wait_for_page_change(
                 page,
                 old_page=old_page,
                 old_first_caseid=old_first_caseid,
-                timeout_ms=25000,
+                timeout_ms=30000,
             ):
                 return True
+
     except Exception as e:
         log.warning("JS dropdown click failed for page %s: %s", target_page, str(e))
 
