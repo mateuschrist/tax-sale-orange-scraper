@@ -485,11 +485,15 @@ def get_results_summary(page) -> Dict:
     return page.evaluate(
         """
         () => {
+            function clean(t) {
+                return (t || '').replace(/\\s+/g, ' ').trim();
+            }
+
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
-                .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, td'))
+                .map(el => clean(el.innerText))
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
             const m = bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
@@ -504,20 +508,33 @@ def get_results_summary(page) -> Dict:
         """
     )
 
-
 def get_active_page_number(page) -> int:
     try:
         active = page.evaluate(
             """
             () => {
+                function clean(t) {
+                    return (t || '').replace(/\\s+/g, ' ').trim();
+                }
+
                 const body = document.body.innerText || '';
-                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+
+                // melhor fonte: "Page 1/14"
+                let m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
-                const els = Array.from(document.querySelectorAll('button, a, div, span'));
+                // fallback: tenta achar algo como "Page 2 (results 21-40)"
+                const els = Array.from(document.querySelectorAll('button, a, div, span, td'));
                 for (const el of els) {
-                    const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                    const mm = txt.match(/^Page\\s+(\\d+)$/i);
+                    const txt = clean(el.innerText);
+                    let mm = txt.match(/^Page\\s+(\\d+)\\s*\\(results\\s+\\d+\\s*-\\s*\\d+\\)$/i);
+                    if (mm) return parseInt(mm[1], 10);
+                }
+
+                // fallback final: "Page 2"
+                for (const el of els) {
+                    const txt = clean(el.innerText);
+                    let mm = txt.match(/^Page\\s+(\\d+)$/i);
                     if (mm) return parseInt(mm[1], 10);
                 }
 
@@ -572,7 +589,7 @@ def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
             current = get_active_page_number(page)
             rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
 
-            if current > old_page and rows > 0:
+            if current != old_page and rows > 0:
                 log.info("Miami page changed successfully: %s -> %s", old_page, current)
                 return True
         except Exception:
@@ -584,13 +601,11 @@ def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
     return False
 
 
-def click_page_link_direct(page, page_num: int) -> bool:
-    current_before = get_active_page_number(page)
-
+def get_pager_debug(page) -> List[Dict]:
     try:
-        result = page.evaluate(
+        return page.evaluate(
             """
-            (targetPage) => {
+            () => {
                 function isVisible(el) {
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
@@ -602,58 +617,121 @@ def click_page_link_direct(page, page_num: int) -> bool:
                         r.height > 0;
                 }
 
-                function text(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                function clean(t) {
+                    return (t || '').replace(/\\s+/g, ' ').trim();
                 }
 
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
-                const visible = all.filter(isVisible);
-
-                const exactPrefix = `Page ${targetPage}`;
-                let candidates = visible.filter(el => text(el).startsWith(exactPrefix));
-
-                candidates.sort((a, b) => text(a).length - text(b).length);
-
-                if (!candidates.length) {
-                    return { ok: false, reason: 'page link not found' };
-                }
-
-                const target = candidates[0];
-                const rect = target.getBoundingClientRect();
-
-                target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                target.click();
-
-                return {
-                    ok: true,
-                    text: text(target),
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2
-                };
+                return Array.from(document.querySelectorAll('a, button, span, div, td'))
+                    .filter(isVisible)
+                    .map(el => {
+                        const r = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName,
+                            text: clean(el.innerText),
+                            className: (el.className || '').toString(),
+                            href: el.getAttribute('href') || '',
+                            x: r.left,
+                            y: r.top,
+                            w: r.width,
+                            h: r.height
+                        };
+                    })
+                    .filter(x => /^Page\\s+\\d+/i.test(x.text))
+                    .slice(0, 50);
             }
-            """,
+            """
+        )
+    except Exception:
+        return []
+
+
+def click_locator_safely(locator, page, label: str) -> bool:
+    try:
+        locator.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+
+    try:
+        locator.click(timeout=8000)
+        log.info("%s clicked (normal)", label)
+        return True
+    except Exception:
+        pass
+
+    try:
+        locator.click(force=True, timeout=8000)
+        log.info("%s clicked (force)", label)
+        return True
+    except Exception:
+        pass
+
+    try:
+        handle = locator.element_handle()
+        if handle:
+            page.evaluate("(el) => el.click()", handle)
+            log.info("%s clicked (JS)", label)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def click_page_link_direct(page, page_num: int) -> bool:
+    current_before = get_active_page_number(page)
+
+    patterns = [
+        re.compile(rf"^Page\\s+{page_num}\\s*\\(results\\s+\\d+\\s*-\\s*\\d+\\)$", re.I),
+        re.compile(rf"^Page\\s+{page_num}$", re.I),
+    ]
+
+    try:
+        all_candidates = page.locator("a, button, span, div, td")
+        count = all_candidates.count()
+
+        best_matches = []
+
+        for i in range(count):
+            item = all_candidates.nth(i)
+
+            try:
+                txt = clean_text(item.inner_text())
+            except Exception:
+                continue
+
+            if not txt:
+                continue
+
+            for idx, pattern in enumerate(patterns):
+                if pattern.match(txt):
+                    best_matches.append((idx, len(txt), item, txt))
+                    break
+
+        # prioriza:
+        # 1) padrão completo "Page X (results ...)"
+        # 2) texto menor dentro do mesmo padrão
+        best_matches.sort(key=lambda x: (x[0], x[1]))
+
+        log.info(
+            "Direct page candidates for page %s: %s",
             page_num,
+            [m[3] for m in best_matches[:10]]
         )
 
-        log.info("Direct page-link click result for page %s: %s", page_num, result)
+        for _, _, locator, txt in best_matches:
+            if click_locator_safely(locator, page, f"PAGE LINK {txt}"):
+                page.wait_for_timeout(5000)
 
-        if not result or not result.get("ok"):
-            return False
+                if wait_for_page_change(page, current_before, timeout_ms=15000):
+                    return True
 
-        page.wait_for_timeout(12000)
+                current_after = get_active_page_number(page)
+                if current_after == page_num:
+                    log.info("Direct page navigation confirmed by active page number: %s", current_after)
+                    return True
 
-        if wait_for_page_change(page, current_before, timeout_ms=22000):
-            return True
-
-        try:
-            page.mouse.click(result["x"], result["y"])
-            page.wait_for_timeout(12000)
-            if wait_for_page_change(page, current_before, timeout_ms=22000):
-                return True
-        except Exception:
-            pass
+        debug = get_pager_debug(page)
+        log.info("PAGER DEBUG for page %s: %s", page_num, debug[:20])
 
     except Exception as e:
         log.warning("Direct page-link click failed for page %s: %s", page_num, str(e))
@@ -663,7 +741,13 @@ def click_page_link_direct(page, page_num: int) -> bool:
 
 def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
+    target_page = current_before + 1
+
     log.info("Current Miami page before NEXT click: %s", current_before)
+
+    # primeiro tenta ir direto para a próxima página
+    if click_page_link_direct(page, target_page):
+        return True
 
     try:
         result = page.evaluate(
@@ -688,62 +772,62 @@ def click_next_page(page) -> bool:
                     return ((el && el.className) || '').toString().toLowerCase();
                 }
 
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td, img'));
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
                 const visible = all.filter(isVisible);
 
-                const pageControls = visible.filter(el => /^Page\\s+\\d+/.test(txt(el)));
-                if (!pageControls.length) {
-                    return { ok: false, reason: 'page controls not found' };
+                const candidates = visible
+                    .map(el => {
+                        const r = el.getBoundingClientRect();
+                        const text = txt(el);
+                        const className = cls(el);
+
+                        let score = 0;
+
+                        if (text === '>' || text === '›' || text === '»') score += 300;
+                        if (text.toLowerCase() === 'next') score += 250;
+                        if (className.includes('next')) score += 200;
+                        if (className.includes('pager')) score += 80;
+                        if (className.includes('pagination')) score += 80;
+                        if (className.includes('arrow')) score += 40;
+                        if (className.includes('right')) score += 40;
+
+                        return {
+                            text,
+                            className,
+                            score,
+                            x: r.left + r.width / 2,
+                            y: r.top + r.height / 2
+                        };
+                    })
+                    .filter(x => x.score > 0)
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, 20);
+
+                if (!candidates.length) {
+                    return { ok: false, reason: 'no strict next candidate found' };
                 }
 
-                let best = null;
-
-                for (const el of visible) {
-                    const t = txt(el);
-                    const c = cls(el);
-                    let score = 0;
-
-                    if (t === '>' || t === '›' || t === '»') score += 200;
-                    if (c.includes('next')) score += 120;
-                    if (c.includes('right')) score += 80;
-                    if (c.includes('arrow')) score += 80;
-                    if (c.includes('chevron')) score += 80;
-                    if (el.tagName.toLowerCase() === 'img') score += 40;
-                    if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
-
-                    if (score <= 0) continue;
-
-                    const r = el.getBoundingClientRect();
-                    const candidate = {
-                        score,
-                        x: r.left + r.width / 2,
-                        y: r.top + r.height / 2,
-                        text: t,
-                        className: c
-                    };
-
-                    if (!best || candidate.score > best.score) {
-                        best = candidate;
-                    }
-                }
-
-                if (!best) {
-                    return { ok: false, reason: 'no next candidate found' };
-                }
-
-                return { ok: true, ...best };
+                return { ok: true, candidates };
             }
             """
         )
 
-        log.info("NEXT target detection: %s", result)
+        log.info("NEXT strict candidates: %s", result)
 
         if result and result.get("ok"):
-            page.mouse.click(result["x"], result["y"])
-            page.wait_for_timeout(12000)
+            for c in result.get("candidates", []):
+                try:
+                    page.mouse.click(c["x"], c["y"])
+                    page.wait_for_timeout(5000)
 
-            if wait_for_page_change(page, current_before, timeout_ms=22000):
-                return True
+                    if wait_for_page_change(page, current_before, timeout_ms=15000):
+                        return True
+
+                    if get_active_page_number(page) == target_page:
+                        return True
+                except Exception:
+                    pass
+
     except Exception as e:
         log.warning("NEXT click failed: %s", str(e))
 
@@ -753,6 +837,7 @@ def click_next_page(page) -> bool:
 
 def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
+
     if current == page_num:
         return True
 
@@ -767,14 +852,14 @@ def go_to_page_number(page, page_num: int) -> bool:
     while current < page_num:
         next_page = current + 1
 
-        if next_page == page_num:
-            ok = click_page_link_direct(page, page_num)
-            if not ok:
-                ok = click_next_page(page)
-        else:
+        # sempre tenta primeiro o link direto da próxima página
+        ok = click_page_link_direct(page, next_page)
+
+        if not ok:
             ok = click_next_page(page)
 
         if not ok:
+            log.warning("Failed navigating from page %s to page %s", current, next_page)
             return False
 
         current = get_active_page_number(page)
