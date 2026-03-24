@@ -514,6 +514,7 @@ def get_active_page_number(page) -> int:
     except Exception:
         return 1
 
+
 def collect_case_rows(page) -> List[Dict]:
     rows = page.locator('tr.load-case.table-row.link[data-caseid]')
     count = rows.count()
@@ -547,82 +548,118 @@ def parse_total_pages(page) -> int:
         return 1
 
 
+def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
+    waited = 0
+    step = 1000
+
+    while waited < timeout_ms:
+        try:
+            current = get_active_page_number(page)
+            rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+
+            if current > old_page and rows > 0:
+                log.info("Miami page changed successfully: %s -> %s", old_page, current)
+                return True
+        except Exception:
+            pass
+
+        page.wait_for_timeout(step)
+        waited += step
+
+    return False
+
+
 def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
     log.info("Current Miami page before NEXT click: %s", current_before)
 
+    # tentativa 1: achar coordenada do botão NEXT pelo pager visual
     try:
-        result = page.evaluate(
+        next_target = page.evaluate(
             """
             () => {
                 function isVisible(el) {
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
-                    return s &&
+                    return !!s &&
                         s.display !== 'none' &&
                         s.visibility !== 'hidden' &&
-                        el.offsetWidth > 0 &&
-                        el.offsetHeight > 0;
+                        el.getBoundingClientRect().width > 0 &&
+                        el.getBoundingClientRect().height > 0;
                 }
 
-                function textOf(el) {
+                function txt(el) {
                     return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
                 }
 
-                function clsOf(el) {
+                function cls(el) {
                     return ((el && el.className) || '').toString().toLowerCase();
                 }
 
-                const all = Array.from(document.querySelectorAll('button, a, div, span'));
+                function centerOf(rect) {
+                    return {
+                        x: rect.left + (rect.width / 2),
+                        y: rect.top + (rect.height / 2)
+                    };
+                }
 
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
+                const visible = all.filter(isVisible);
+
+                // 1) localizar o controle visual "Page 1"
                 let pageControl = null;
-                for (const el of all) {
-                    const txt = textOf(el);
-                    if (/^Page\\s+\\d+$/i.test(txt) && isVisible(el)) {
+                for (const el of visible) {
+                    const t = txt(el);
+                    if (/^Page\\s+\\d+$/i.test(t)) {
                         pageControl = el;
                         break;
                     }
                 }
 
                 if (!pageControl) {
-                    return { clicked: false, reason: 'page control not found' };
+                    return { ok: false, reason: 'page control not found' };
                 }
 
-                const controlRect = pageControl.getBoundingClientRect();
+                const pr = pageControl.getBoundingClientRect();
 
-                // procurar elemento clicável à direita, na mesma linha
-                const candidates = [];
-                for (const el of all) {
+                // 2) procurar algo à direita dele, na mesma linha
+                let candidates = [];
+
+                for (const el of visible) {
                     if (el === pageControl) continue;
-                    if (!isVisible(el)) continue;
 
-                    const rect = el.getBoundingClientRect();
-                    const txt = textOf(el);
-                    const cls = clsOf(el);
+                    const r = el.getBoundingClientRect();
+                    const t = txt(el);
+                    const c = cls(el);
 
-                    const sameRow = Math.abs(rect.top - controlRect.top) < 40;
-                    const toRight = rect.left >= (controlRect.right - 5);
+                    const sameRow = Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2)) < 35;
+                    const onRight = r.left >= (pr.right - 2);
+                    const notTooFar = r.left <= (pr.right + 220);
 
-                    if (!sameRow || !toRight) continue;
+                    if (!sameRow || !onRight || !notTooFar) continue;
 
-                    const score =
-                        (txt === '>' ? 100 : 0) +
-                        (txt === '›' ? 100 : 0) +
-                        (txt === '»' ? 100 : 0) +
-                        (cls.includes('next') ? 60 : 0) +
-                        (cls.includes('icon') ? 25 : 0) +
-                        (cls.includes('glyph') ? 25 : 0) +
-                        (el.querySelector('i, svg, img') ? 20 : 0) +
-                        (rect.width > 20 && rect.width < 120 ? 10 : 0);
+                    let score = 0;
+
+                    if (t === '>' || t === '›' || t === '»') score += 200;
+                    if (c.includes('next')) score += 120;
+                    if (c.includes('right')) score += 80;
+                    if (c.includes('arrow')) score += 80;
+                    if (c.includes('chevron')) score += 80;
+                    if (c.includes('glyph')) score += 40;
+                    if (c.includes('icon')) score += 30;
+                    if (el.querySelector('img, svg, i')) score += 50;
+
+                    // botões pequenos à direita do pager costumam ser o next
+                    if (r.width >= 18 && r.width <= 80 && r.height >= 18 && r.height <= 60) score += 25;
 
                     if (score > 0) {
                         candidates.push({
-                            el,
-                            txt,
-                            cls,
-                            left: rect.left,
-                            top: rect.top,
-                            score
+                            x: centerOf(r).x,
+                            y: centerOf(r).y,
+                            score,
+                            text: t,
+                            className: c,
+                            left: r.left
                         });
                     }
                 }
@@ -632,46 +669,97 @@ def click_next_page(page) -> bool:
                     return a.left - b.left;
                 });
 
-                if (!candidates.length) {
-                    return { clicked: false, reason: 'no next candidate found' };
+                if (candidates.length > 0) {
+                    return {
+                        ok: true,
+                        method: 'candidate-right-of-page-control',
+                        x: candidates[0].x,
+                        y: candidates[0].y,
+                        text: candidates[0].text,
+                        className: candidates[0].className
+                    };
                 }
 
-                const target = candidates[0].el;
-                target.click();
-
+                // 3) fallback: clicar em um ponto fixo relativo ao controle "Page X"
+                // normalmente o botão next fica logo à direita
                 return {
-                    clicked: true,
-                    reason: 'clicked best candidate',
-                    chosen_text: textOf(target),
-                    chosen_class: clsOf(target)
+                    ok: true,
+                    method: 'relative-to-page-control',
+                    x: pr.right + 55,
+                    y: pr.top + (pr.height / 2),
+                    text: '',
+                    className: ''
                 };
             }
             """
         )
 
-        log.info("NEXT click result: %s", result)
+        log.info("NEXT target detection: %s", next_target)
 
-        if not result or not result.get("clicked"):
-            log.warning("Could not click NEXT page button")
-            return False
+        if next_target and next_target.get("ok"):
+            page.mouse.click(next_target["x"], next_target["y"])
+            page.wait_for_timeout(12000)
 
+            if wait_for_page_change(page, current_before, timeout_ms=22000):
+                return True
     except Exception as e:
-        log.warning("Could not click NEXT page button: %s", str(e))
-        return False
+        log.warning("NEXT target JS detection/click failed: %s", str(e))
 
-    page.wait_for_timeout(12000)
+    # tentativa 2: clicar por coordenada relativa a um pager/container conhecido
+    pager_selectors = [
+        "div:has-text('Page 1')",
+        "div:has-text('Page 2')",
+        "div:has-text('Page')",
+        "span:has-text('Page')",
+    ]
 
+    for sel in pager_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+
+            box = loc.first.bounding_box()
+            if not box:
+                continue
+
+            click_x = box["x"] + box["width"] + 55
+            click_y = box["y"] + (box["height"] / 2)
+
+            log.info(
+                "Trying pager-relative NEXT click: selector=%s x=%s y=%s",
+                sel, click_x, click_y
+            )
+
+            page.mouse.click(click_x, click_y)
+            page.wait_for_timeout(12000)
+
+            if wait_for_page_change(page, current_before, timeout_ms=22000):
+                return True
+        except Exception as e:
+            log.warning("Pager-relative NEXT click failed for %s: %s", sel, str(e))
+
+    # tentativa 3: fallback por coordenada aproximada da viewport
     try:
-        wait_for_case_rows(page, timeout_ms=20000)
-    except Exception:
-        pass
+        vp = page.viewport_size or {"width": 1366, "height": 900}
 
-    page.wait_for_timeout(2000)
+        # região aproximada do pager no layout desktop
+        click_x = int(vp["width"] * 0.755)
+        click_y = int(vp["height"] * 0.405)
 
-    current_after = get_active_page_number(page)
-    log.info("Current Miami page after NEXT click: %s", current_after)
+        log.info("Trying viewport fallback NEXT click at x=%s y=%s", click_x, click_y)
 
-    return current_after > current_before
+        page.mouse.click(click_x, click_y)
+        page.wait_for_timeout(12000)
+
+        if wait_for_page_change(page, current_before, timeout_ms=22000):
+            return True
+    except Exception as e:
+        log.warning("Viewport fallback NEXT click failed: %s", str(e))
+
+    log.warning("Could not click NEXT page button")
+    return False
+
 
 def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
@@ -694,8 +782,7 @@ def go_to_page_number(page, page_num: int) -> bool:
         current = get_active_page_number(page)
 
     return current == page_num
-
-
+    
 # =========================
 # DETAIL PARSING
 # =========================
