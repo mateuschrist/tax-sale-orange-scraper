@@ -269,37 +269,133 @@ def supabase_upsert_property(payload: dict) -> dict:
 # =========================
 # UI HELPERS
 # =========================
-def click_safe(page, selector, name, timeout=6000):
+def click_safe(page, selector, name, timeout=6000, allow_navigation=False):
     try:
         page.click(selector, timeout=timeout)
         log.info("%s clicked (normal)", name)
+
+        if allow_navigation:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
         return True
-    except Exception:
-        pass
+    except Exception as e:
+        msg = str(e)
+
+        # Se a navegação começou logo após o clique, consideramos sucesso
+        if allow_navigation and (
+            "Execution context was destroyed" in msg
+            or "Target closed" in msg
+            or "has been closed" in msg
+            or "Most likely the page has been closed" in msg
+        ):
+            log.info("%s click triggered navigation (normal)", name)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            return True
 
     try:
         page.locator(selector).first.click(force=True, timeout=timeout)
         log.info("%s clicked (force)", name)
-        return True
-    except Exception:
-        pass
 
-    try:
-        page.evaluate(
-            """(sel) => {
-                const el = document.querySelector(sel);
-                if (!el) throw new Error(`not found: ${sel}`);
-                el.click();
-            }""",
-            selector,
-        )
-        log.info("%s clicked (JS fallback)", name)
+        if allow_navigation:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
         return True
     except Exception as e:
-        log.error("%s FAILED: %s", name, e)
-        return False
+        msg = str(e)
 
+        if allow_navigation and (
+            "Execution context was destroyed" in msg
+            or "Target closed" in msg
+            or "has been closed" in msg
+            or "Most likely the page has been closed" in msg
+        ):
+            log.info("%s click triggered navigation (force)", name)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            return True
 
+    # JS fallback só deve ser usado quando NÃO esperamos navegação
+    if not allow_navigation:
+        try:
+            page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) throw new Error(`not found: ${sel}`);
+                    el.click();
+                }""",
+                selector,
+            )
+            log.info("%s clicked (JS fallback)", name)
+            return True
+        except Exception as e:
+            log.error("%s FAILED: %s", name, e)
+            return False
+
+    log.error("%s FAILED", name)
+    return False
+
+def click_search_button(page) -> bool:
+    selectors = [
+        "button.filters-submit",
+        "button[type='submit']",
+        "text=Search",
+    ]
+
+    for sel in selectors:
+        try:
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+
+            try:
+                locator.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+
+            try:
+                locator.click(timeout=8000)
+                log.info("SEARCH BUTTON clicked (normal) selector=%s", sel)
+            except Exception:
+                locator.click(force=True, timeout=8000)
+                log.info("SEARCH BUTTON clicked (force) selector=%s", sel)
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            msg = str(e)
+
+            if (
+                "Execution context was destroyed" in msg
+                or "Target closed" in msg
+                or "has been closed" in msg
+            ):
+                log.info("SEARCH BUTTON triggered navigation selector=%s", sel)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                return True
+
+            log.warning("SEARCH BUTTON selector failed %s: %s", sel, e)
+
+    return False
+    
 def click_element_handle_safe(el, page, name):
     try:
         el.click(timeout=6000)
@@ -451,12 +547,13 @@ def run_search_flow(page):
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
-    if not click_safe(page, "button.filters-submit", "SEARCH BUTTON"):
+    if not click_search_button(page):
         raise RuntimeError("Could not click search")
 
+    page.wait_for_timeout(3000)
     wait_for_case_rows(page)
-
-
+    
+    
 def open_list_and_apply_filter(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(6000)
