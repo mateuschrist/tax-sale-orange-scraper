@@ -463,6 +463,21 @@ def open_list_and_apply_filter(page):
     run_search_flow(page)
 
 
+def return_to_results(page):
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(8000)
+        wait_for_case_rows(page, timeout_ms=20000)
+        return True
+    except Exception as e:
+        log.warning("go_back failed, reloading filtered list: %s", str(e))
+        try:
+            open_list_and_apply_filter(page)
+            return True
+        except Exception:
+            return False
+
+
 # =========================
 # PAGINATION
 # =========================
@@ -569,23 +584,100 @@ def wait_for_page_change(page, old_page: int, timeout_ms: int = 22000) -> bool:
     return False
 
 
+def click_page_link_direct(page, page_num: int) -> bool:
+    current_before = get_active_page_number(page)
+
+    try:
+        result = page.evaluate(
+            """
+            (targetPage) => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return !!s &&
+                        s.display !== 'none' &&
+                        s.visibility !== 'hidden' &&
+                        r.width > 0 &&
+                        r.height > 0;
+                }
+
+                function text(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
+                const visible = all.filter(isVisible);
+
+                const exactPrefix = `Page ${targetPage}`;
+                let candidates = visible.filter(el => text(el).startsWith(exactPrefix));
+
+                candidates.sort((a, b) => text(a).length - text(b).length);
+
+                if (!candidates.length) {
+                    return { ok: false, reason: 'page link not found' };
+                }
+
+                const target = candidates[0];
+                const rect = target.getBoundingClientRect();
+
+                target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                target.click();
+
+                return {
+                    ok: true,
+                    text: text(target),
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2
+                };
+            }
+            """,
+            page_num,
+        )
+
+        log.info("Direct page-link click result for page %s: %s", page_num, result)
+
+        if not result or not result.get("ok"):
+            return False
+
+        page.wait_for_timeout(12000)
+
+        if wait_for_page_change(page, current_before, timeout_ms=22000):
+            return True
+
+        try:
+            page.mouse.click(result["x"], result["y"])
+            page.wait_for_timeout(12000)
+            if wait_for_page_change(page, current_before, timeout_ms=22000):
+                return True
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.warning("Direct page-link click failed for page %s: %s", page_num, str(e))
+
+    return False
+
+
 def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
     log.info("Current Miami page before NEXT click: %s", current_before)
 
-    # tentativa 1: achar coordenada do botão NEXT pelo pager visual
     try:
-        next_target = page.evaluate(
+        result = page.evaluate(
             """
             () => {
                 function isVisible(el) {
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
                     return !!s &&
                         s.display !== 'none' &&
                         s.visibility !== 'hidden' &&
-                        el.getBoundingClientRect().width > 0 &&
-                        el.getBoundingClientRect().height > 0;
+                        r.width > 0 &&
+                        r.height > 0;
                 }
 
                 function txt(el) {
@@ -596,48 +688,19 @@ def click_next_page(page) -> bool:
                     return ((el && el.className) || '').toString().toLowerCase();
                 }
 
-                function centerOf(rect) {
-                    return {
-                        x: rect.left + (rect.width / 2),
-                        y: rect.top + (rect.height / 2)
-                    };
-                }
-
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td'));
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td, img'));
                 const visible = all.filter(isVisible);
 
-                // 1) localizar o controle visual "Page 1"
-                let pageControl = null;
-                for (const el of visible) {
-                    const t = txt(el);
-                    if (/^Page\\s+\\d+$/i.test(t)) {
-                        pageControl = el;
-                        break;
-                    }
+                const pageControls = visible.filter(el => /^Page\\s+\\d+/.test(txt(el)));
+                if (!pageControls.length) {
+                    return { ok: false, reason: 'page controls not found' };
                 }
 
-                if (!pageControl) {
-                    return { ok: false, reason: 'page control not found' };
-                }
-
-                const pr = pageControl.getBoundingClientRect();
-
-                // 2) procurar algo à direita dele, na mesma linha
-                let candidates = [];
+                let best = null;
 
                 for (const el of visible) {
-                    if (el === pageControl) continue;
-
-                    const r = el.getBoundingClientRect();
                     const t = txt(el);
                     const c = cls(el);
-
-                    const sameRow = Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2)) < 35;
-                    const onRight = r.left >= (pr.right - 2);
-                    const notTooFar = r.left <= (pr.right + 220);
-
-                    if (!sameRow || !onRight || !notTooFar) continue;
-
                     let score = 0;
 
                     if (t === '>' || t === '›' || t === '»') score += 200;
@@ -645,117 +708,44 @@ def click_next_page(page) -> bool:
                     if (c.includes('right')) score += 80;
                     if (c.includes('arrow')) score += 80;
                     if (c.includes('chevron')) score += 80;
-                    if (c.includes('glyph')) score += 40;
-                    if (c.includes('icon')) score += 30;
-                    if (el.querySelector('img, svg, i')) score += 50;
+                    if (el.tagName.toLowerCase() === 'img') score += 40;
+                    if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
 
-                    // botões pequenos à direita do pager costumam ser o next
-                    if (r.width >= 18 && r.width <= 80 && r.height >= 18 && r.height <= 60) score += 25;
+                    if (score <= 0) continue;
 
-                    if (score > 0) {
-                        candidates.push({
-                            x: centerOf(r).x,
-                            y: centerOf(r).y,
-                            score,
-                            text: t,
-                            className: c,
-                            left: r.left
-                        });
+                    const r = el.getBoundingClientRect();
+                    const candidate = {
+                        score,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        text: t,
+                        className: c
+                    };
+
+                    if (!best || candidate.score > best.score) {
+                        best = candidate;
                     }
                 }
 
-                candidates.sort((a, b) => {
-                    if (b.score !== a.score) return b.score - a.score;
-                    return a.left - b.left;
-                });
-
-                if (candidates.length > 0) {
-                    return {
-                        ok: true,
-                        method: 'candidate-right-of-page-control',
-                        x: candidates[0].x,
-                        y: candidates[0].y,
-                        text: candidates[0].text,
-                        className: candidates[0].className
-                    };
+                if (!best) {
+                    return { ok: false, reason: 'no next candidate found' };
                 }
 
-                // 3) fallback: clicar em um ponto fixo relativo ao controle "Page X"
-                // normalmente o botão next fica logo à direita
-                return {
-                    ok: true,
-                    method: 'relative-to-page-control',
-                    x: pr.right + 55,
-                    y: pr.top + (pr.height / 2),
-                    text: '',
-                    className: ''
-                };
+                return { ok: true, ...best };
             }
             """
         )
 
-        log.info("NEXT target detection: %s", next_target)
+        log.info("NEXT target detection: %s", result)
 
-        if next_target and next_target.get("ok"):
-            page.mouse.click(next_target["x"], next_target["y"])
+        if result and result.get("ok"):
+            page.mouse.click(result["x"], result["y"])
             page.wait_for_timeout(12000)
 
             if wait_for_page_change(page, current_before, timeout_ms=22000):
                 return True
     except Exception as e:
-        log.warning("NEXT target JS detection/click failed: %s", str(e))
-
-    # tentativa 2: clicar por coordenada relativa a um pager/container conhecido
-    pager_selectors = [
-        "div:has-text('Page 1')",
-        "div:has-text('Page 2')",
-        "div:has-text('Page')",
-        "span:has-text('Page')",
-    ]
-
-    for sel in pager_selectors:
-        try:
-            loc = page.locator(sel)
-            if loc.count() == 0:
-                continue
-
-            box = loc.first.bounding_box()
-            if not box:
-                continue
-
-            click_x = box["x"] + box["width"] + 55
-            click_y = box["y"] + (box["height"] / 2)
-
-            log.info(
-                "Trying pager-relative NEXT click: selector=%s x=%s y=%s",
-                sel, click_x, click_y
-            )
-
-            page.mouse.click(click_x, click_y)
-            page.wait_for_timeout(12000)
-
-            if wait_for_page_change(page, current_before, timeout_ms=22000):
-                return True
-        except Exception as e:
-            log.warning("Pager-relative NEXT click failed for %s: %s", sel, str(e))
-
-    # tentativa 3: fallback por coordenada aproximada da viewport
-    try:
-        vp = page.viewport_size or {"width": 1366, "height": 900}
-
-        # região aproximada do pager no layout desktop
-        click_x = int(vp["width"] * 0.755)
-        click_y = int(vp["height"] * 0.405)
-
-        log.info("Trying viewport fallback NEXT click at x=%s y=%s", click_x, click_y)
-
-        page.mouse.click(click_x, click_y)
-        page.wait_for_timeout(12000)
-
-        if wait_for_page_change(page, current_before, timeout_ms=22000):
-            return True
-    except Exception as e:
-        log.warning("Viewport fallback NEXT click failed: %s", str(e))
+        log.warning("NEXT click failed: %s", str(e))
 
     log.warning("Could not click NEXT page button")
     return False
@@ -763,7 +753,6 @@ def click_next_page(page) -> bool:
 
 def go_to_page_number(page, page_num: int) -> bool:
     current = get_active_page_number(page)
-
     if current == page_num:
         return True
 
@@ -776,13 +765,23 @@ def go_to_page_number(page, page_num: int) -> bool:
         return False
 
     while current < page_num:
-        ok = click_next_page(page)
+        next_page = current + 1
+
+        if next_page == page_num:
+            ok = click_page_link_direct(page, page_num)
+            if not ok:
+                ok = click_next_page(page)
+        else:
+            ok = click_next_page(page)
+
         if not ok:
             return False
+
         current = get_active_page_number(page)
 
     return current == page_num
-    
+
+
 # =========================
 # DETAIL PARSING
 # =========================
@@ -1015,7 +1014,7 @@ def build_properties_payload(record: dict) -> dict:
         "state": "FL",
         "node": str(record.get("caseid") or ""),
         "pdf_url": record.get("parcel_appraiser_url") or None,
-        "auction_source_url": "https://www.miamidade.realforeclose.com/index.cfm",
+        "auction_source_url": AUCTION_URL,
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
         "sale_date": record.get("sale_date"),
@@ -1033,7 +1032,7 @@ def build_properties_payload(record: dict) -> dict:
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V4 + PAGE-BY-PAGE + SUPABASE CLEAN ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V5 + DIRECT PAGE LINKS + BACK NAV ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1075,7 +1074,8 @@ def run_miami():
             if total_processed >= MAX_LOTS:
                 break
 
-            if page_num > 1:
+            current_page = get_active_page_number(page)
+            if current_page != page_num:
                 ok = go_to_page_number(page, page_num)
                 if not ok:
                     log.warning("Could not navigate to page %s", page_num)
@@ -1088,12 +1088,11 @@ def run_miami():
 
             log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
 
-            for row in rows:
+            page_caseids = [r.get("caseid") for r in rows if r.get("caseid")]
+
+            for row_index, caseid in enumerate(page_caseids):
                 if total_processed >= MAX_LOTS:
                     break
-
-                caseid = row.get("caseid")
-                row_index = row.get("index")
 
                 total_processed += 1
                 log.info(
@@ -1106,11 +1105,6 @@ def run_miami():
                 )
 
                 try:
-                    if page_num > 1:
-                        ok = go_to_page_number(page, page_num)
-                        if not ok:
-                            raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
-
                     base_case = open_case_by_caseid(page, caseid)
                     case_detail = extract_case_detail(page, base_case)
 
@@ -1126,12 +1120,6 @@ def run_miami():
 
                     log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
 
-                    open_list_and_apply_filter(page)
-                    if page_num > 1:
-                        ok = go_to_page_number(page, page_num)
-                        if not ok:
-                            raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
-
                 except Exception as e:
                     log.exception("FAILED CASE caseid=%s: %s", caseid, e)
                     failures.append({
@@ -1141,16 +1129,28 @@ def run_miami():
                         "error": str(e),
                     })
 
-                    try:
-                        open_list_and_apply_filter(page)
-                        if page_num > 1:
-                            go_to_page_number(page, page_num)
-                    except Exception:
-                        pass
+                finally:
+                    if total_processed < MAX_LOTS:
+                        ok_back = return_to_results(page)
+                        if not ok_back:
+                            raise RuntimeError(f"Could not return to results after caseid={caseid}")
+
+                        current_after_back = get_active_page_number(page)
+                        if current_after_back != page_num:
+                            log.warning(
+                                "Returned to wrong page after case %s. Expected=%s got=%s. Re-navigating...",
+                                caseid, page_num, current_after_back
+                            )
+                            ok = go_to_page_number(page, page_num)
+                            if not ok:
+                                raise RuntimeError(f"Could not restore page {page_num} after caseid={caseid}")
+
+            if total_processed >= MAX_LOTS:
+                break
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v4_page_by_page_supabase_clean",
+            "mode": "final_operational_v5_direct_page_links_back_nav",
             "total_pages_detected": total_pages,
             "rows_detected": len(results) + len(failures),
             "records_count": len(results),
