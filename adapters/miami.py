@@ -106,7 +106,7 @@ def send_to_app(payload: dict) -> bool:
 
 
 # =========================
-# SUPABASE DEDUP
+# SUPABASE DEDUP / FAST PRECHECK
 # =========================
 def sb_headers():
     return {
@@ -114,6 +114,18 @@ def sb_headers():
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
     }
+
+
+def normalize_sale_date_value(value: str) -> Optional[str]:
+    v = clean_text(value or "")
+    if not v:
+        return None
+
+    low = v.lower()
+    if low in ("not assigned", "null", "none", "n/a", "na"):
+        return None
+
+    return v
 
 
 def supabase_find_existing_case(node: str):
@@ -124,7 +136,7 @@ def supabase_find_existing_case(node: str):
         f"{SUPABASE_URL}/rest/v1/properties"
         f"?county=eq.Miami-Dade"
         f"&node=eq.{quote(str(node), safe='')}"
-        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,tax_sale_id"
         f"&limit=1"
     )
 
@@ -149,7 +161,7 @@ def supabase_find_existing_property(parcel_number: str, sale_date: str):
         f"?county=eq.Miami-Dade"
         f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
         f"&sale_date=eq.{quote(str(sale_date), safe='')}"
-        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,tax_sale_id"
         f"&limit=1"
     )
 
@@ -163,6 +175,110 @@ def supabase_find_existing_property(parcel_number: str, sale_date: str):
         log.warning("supabase_find_existing_property failed: %s", str(e))
 
     return None
+
+
+def supabase_find_by_tax_sale_and_parcel(tax_sale_id: str, parcel_number: str):
+    if not CAN_CHECK_SUPABASE or not tax_sale_id or not parcel_number:
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/properties"
+        f"?county=eq.Miami-Dade"
+        f"&tax_sale_id=eq.{quote(str(tax_sale_id), safe='')}"
+        f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
+        f"&select=id,node,tax_sale_id,parcel_number,sale_date"
+        f"&limit=1"
+    )
+
+    try:
+        r = requests.get(url, headers=sb_headers(), timeout=20)
+        if r.status_code == 200:
+            arr = r.json()
+            return arr[0] if arr else None
+
+        log.warning(
+            "supabase_find_by_tax_sale_and_parcel non-200 status=%s body=%s",
+            r.status_code,
+            r.text[:300],
+        )
+    except Exception as e:
+        log.warning("supabase_find_by_tax_sale_and_parcel failed: %s", str(e))
+
+    return None
+
+
+def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
+    if not CAN_CHECK_SUPABASE:
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
+        }
+
+    if not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": "Missing record id",
+        }
+
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation"
+
+    payload = {
+        "sale_date": sale_date
+    }
+
+    try:
+        r = requests.patch(url, headers=headers, json=payload, timeout=20)
+        ok = r.status_code in (200, 204)
+
+        if ok:
+            log.info(
+                "SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s",
+                record_id,
+                sale_date,
+                r.status_code,
+            )
+        else:
+            log.warning(
+                "SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s",
+                record_id,
+                r.status_code,
+                r.text[:500],
+            )
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "response_text": r.text[:1000],
+        }
+
+    except Exception as e:
+        log.warning("SUPABASE SALE_DATE UPDATE EXCEPTION id=%s error=%s", record_id, str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": str(e),
+        }
+
+
+def payload_quality_score(payload: dict) -> int:
+    fields = [
+        "node",
+        "parcel_number",
+        "sale_date",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "opening_bid",
+        "deed_status",
+    ]
+    return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
 
 
 def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
@@ -266,6 +382,48 @@ def supabase_upsert_property(payload: dict) -> dict:
             "node": payload.get("node"),
             "response_text": str(e),
         }
+
+
+def decide_list_action(row: dict) -> dict:
+    row_text = row.get("row_text", "")
+    parsed = parse_row_text(row_text)
+
+    tax_sale_id = clean_text(parsed.get("case_number", ""))
+    parcel_number = clean_text(parsed.get("parcel_number", ""))
+    site_sale_date = normalize_sale_date_value(parsed.get("sale_date", ""))
+
+    existing = supabase_find_by_tax_sale_and_parcel(tax_sale_id, parcel_number)
+
+    if not existing:
+        return {
+            "action": "open_detail",
+            "reason": "record not found in supabase",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+            "existing": None,
+        }
+
+    db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
+
+    if db_sale_date == site_sale_date:
+        return {
+            "action": "skip",
+            "reason": "sale_date unchanged",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+            "existing": existing,
+        }
+
+    return {
+        "action": "update_sale_date_only",
+        "reason": f"sale_date changed from {db_sale_date} to {site_sale_date}",
+        "tax_sale_id": tax_sale_id,
+        "parcel_number": parcel_number,
+        "site_sale_date": site_sale_date,
+        "existing": existing,
+    }
 
 
 # =========================
@@ -1298,10 +1456,10 @@ def build_properties_payload(record: dict) -> dict:
         "state": "FL",
         "node": str(record.get("caseid") or ""),
         "pdf_url": record.get("parcel_appraiser_url") or None,
-        "auction_source_url": AUCTION_URL,
+        "auction_source_url": "https://www.miamidade.realforeclose.com/index.cfm",
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
-        "sale_date": record.get("sale_date"),
+        "sale_date": normalize_sale_date_value(record.get("sale_date")),
         "opening_bid": normalize_money(record.get("opening_bid")),
         "deed_status": record.get("case_status"),
         "applicant_name": record.get("applicant_number"),
@@ -1313,9 +1471,7 @@ def build_properties_payload(record: dict) -> dict:
 
 
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V6 + COUNT ONLY SENT ===")
-
-    MAX_VISITS = int(os.getenv("MAX_VISITS", "1000"))
+    log.info("=== MIAMI FINAL OPERATIONAL V6 + FAST LIST PRECHECK ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1351,28 +1507,13 @@ def run_miami():
         results = []
         failures = []
         supabase_results = []
+        fast_updates = []
+        skipped_rows = []
 
-        visited_count = 0
-        extracted_count = 0
-        sent_count = 0
+        total_rows_seen = 0
+        total_detail_processed = 0
 
         for page_num in range(1, total_pages + 1):
-            if sent_count >= MAX_LOTS:
-                log.info(
-                    "Stopping pagination because sent_count=%s reached MAX_LOTS=%s",
-                    sent_count,
-                    MAX_LOTS,
-                )
-                break
-
-            if visited_count >= MAX_VISITS:
-                log.warning(
-                    "Stopping pagination because visited_count=%s reached MAX_VISITS=%s",
-                    visited_count,
-                    MAX_VISITS,
-                )
-                break
-
             if page_num > 1:
                 ok = go_to_page_number(page, page_num)
                 if not ok:
@@ -1384,99 +1525,93 @@ def run_miami():
                 log.warning("No rows found on page %s", page_num)
                 continue
 
-            log.info(
-                "Processing all %s rows from page %s before moving forward",
-                len(rows),
-                page_num,
-            )
+            log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
 
             for row in rows:
-                if sent_count >= MAX_LOTS:
-                    log.info(
-                        "Stopping row loop because sent_count=%s reached MAX_LOTS=%s",
-                        sent_count,
-                        MAX_LOTS,
-                    )
-                    break
-
-                if visited_count >= MAX_VISITS:
-                    log.warning(
-                        "Stopping row loop because visited_count=%s reached MAX_VISITS=%s",
-                        visited_count,
-                        MAX_VISITS,
-                    )
-                    break
-
                 caseid = row.get("caseid")
                 row_index = row.get("index")
+                row_text = row.get("row_text", "")
 
-                visited_count += 1
-
-                log.info(
-                    "[visited=%s extracted=%s sent=%s/%s] Scraping caseid=%s page=%s row=%s ...",
-                    visited_count,
-                    extracted_count,
-                    sent_count,
-                    MAX_LOTS,
-                    caseid,
-                    page_num,
-                    row_index,
-                )
+                total_rows_seen += 1
 
                 try:
+                    decision = decide_list_action(row)
+
+                    log.info(
+                        "LIST PRECHECK caseid=%s page=%s row=%s action=%s reason=%s",
+                        caseid,
+                        page_num,
+                        row_index,
+                        decision["action"],
+                        decision["reason"],
+                    )
+
+                    if decision["action"] == "skip":
+                        skipped_rows.append({
+                            "caseid": caseid,
+                            "page_num": page_num,
+                            "row_index": row_index,
+                            "row_text": row_text,
+                            "reason": decision["reason"],
+                            "tax_sale_id": decision.get("tax_sale_id"),
+                            "parcel_number": decision.get("parcel_number"),
+                            "site_sale_date": decision.get("site_sale_date"),
+                        })
+                        continue
+
+                    if decision["action"] == "update_sale_date_only":
+                        existing = decision.get("existing") or {}
+                        record_id = existing.get("id")
+                        site_sale_date = decision.get("site_sale_date")
+
+                        update_result = supabase_update_sale_date(record_id, site_sale_date)
+
+                        fast_updates.append({
+                            "caseid": caseid,
+                            "page_num": page_num,
+                            "row_index": row_index,
+                            "tax_sale_id": decision.get("tax_sale_id"),
+                            "parcel_number": decision.get("parcel_number"),
+                            "sale_date": site_sale_date,
+                            "update_result": update_result,
+                        })
+
+                        continue
+
+                    total_detail_processed += 1
+                    log.info(
+                        "[detail %s] Scraping caseid=%s page=%s row=%s ...",
+                        total_detail_processed,
+                        caseid,
+                        page_num,
+                        row_index,
+                    )
+
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
                         if not ok:
-                            raise RuntimeError(
-                                f"Could not re-open page {page_num} for caseid={caseid}"
-                            )
+                            raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
 
                     base_case = open_case_by_caseid(page, caseid)
                     case_detail = extract_case_detail(page, base_case)
 
                     record = build_final_record(case_detail)
                     results.append(record)
-                    extracted_count += 1
 
                     prop_payload = build_properties_payload(record)
 
                     sb_result = supabase_upsert_property(prop_payload)
                     supabase_results.append(sb_result)
 
-                    app_sent_ok = send_to_app(prop_payload)
+                    send_to_app(prop_payload)
 
-                    if sb_result.get("sent"):
-                        sent_count += 1
-                        log.info(
-                            "COUNTED AS SENT: sent_count=%s node=%s status_code=%s",
-                            sent_count,
-                            prop_payload.get("node"),
-                            sb_result.get("status_code"),
-                        )
-                    else:
-                        log.info(
-                            "NOT COUNTED AS SENT: node=%s reason=%s app_sent=%s",
-                            prop_payload.get("node"),
-                            sb_result.get("response_text"),
-                            app_sent_ok,
-                        )
-
-                    log.info(
-                        "SUCCESS CASE visited=%s extracted=%s sent=%s node=%s",
-                        visited_count,
-                        extracted_count,
-                        sent_count,
-                        prop_payload.get("node"),
-                    )
+                    log.info("SUCCESS DETAIL CASE node=%s", prop_payload.get("node"))
 
                     open_list_and_apply_filter(page)
-
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
                         if not ok:
-                            raise RuntimeError(
-                                f"Could not return to page {page_num} after caseid={caseid}"
-                            )
+                            raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
 
                 except Exception as e:
                     log.exception("FAILED CASE caseid=%s: %s", caseid, e)
@@ -1484,6 +1619,7 @@ def run_miami():
                         "caseid": caseid,
                         "page_num": page_num,
                         "row_index": row_index,
+                        "row_text": row_text,
                         "error": str(e),
                     })
 
@@ -1496,16 +1632,17 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v6_count_only_sent",
+            "mode": "final_operational_v6_fast_list_precheck",
             "total_pages_detected": total_pages,
-            "visited_count": visited_count,
-            "extracted_count": extracted_count,
-            "sent_count": sent_count,
-            "max_lots": MAX_LOTS,
-            "max_visits": MAX_VISITS,
-            "records_count": len(results),
+            "rows_detected": total_rows_seen,
+            "detail_records_count": len(results),
+            "detail_processed_count": total_detail_processed,
+            "fast_updates_count": len(fast_updates),
+            "skipped_rows_count": len(skipped_rows),
             "failures_count": len(failures),
             "supabase_results": supabase_results,
+            "fast_updates": fast_updates,
+            "skipped_rows": skipped_rows,
             "page_summary": summary,
             "records": results,
             "failures": failures,
