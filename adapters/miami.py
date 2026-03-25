@@ -546,24 +546,8 @@ def open_list_and_apply_filter(page):
 
 
 # =========================
-# PAGINATION - DIAGNOSTICS + ROBUST NAV
+# PAGINATION
 # =========================
-def get_first_caseid(page) -> str:
-    try:
-        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
-        return row.get_attribute("data-caseid") or ""
-    except Exception:
-        return ""
-
-
-def get_first_row_text(page) -> str:
-    try:
-        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
-        return clean_text(row.inner_text())
-    except Exception:
-        return ""
-
-
 def get_results_summary(page) -> Dict:
     return page.evaluate(
         """
@@ -571,7 +555,7 @@ def get_results_summary(page) -> Dict:
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, li'))
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
@@ -588,89 +572,6 @@ def get_results_summary(page) -> Dict:
     )
 
 
-def dump_pagination_diagnostics(page) -> Dict:
-    try:
-        data = page.evaluate(
-            """
-            () => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return !!s &&
-                        s.display !== 'none' &&
-                        s.visibility !== 'hidden' &&
-                        r.width > 0 &&
-                        r.height > 0;
-                }
-
-                function txt(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
-                }
-
-                function short(v) {
-                    return (v || '').toString().slice(0, 500);
-                }
-
-                const all = Array.from(document.querySelectorAll('a, button, li, span, div, td'));
-                const pagerNodes = all
-                    .map((el, idx) => {
-                        const text = txt(el);
-                        const href = el.getAttribute ? (el.getAttribute('href') || '') : '';
-                        const dataPage = el.getAttribute ? (el.getAttribute('data-page') || '') : '';
-                        const onclick = el.getAttribute ? (el.getAttribute('onclick') || '') : '';
-                        const cls = ((el.className || '') + '').trim();
-                        const visible = isVisible(el);
-
-                        if (!text && !href && !dataPage && !onclick) return null;
-
-                        const looksPager =
-                            /^Page\\s+\\d+/i.test(text) ||
-                            dataPage ||
-                            (href && href.toLowerCase().includes('javascript:void')) ||
-                            cls.toLowerCase().includes('page');
-
-                        if (!looksPager) return null;
-
-                        const r = el.getBoundingClientRect();
-                        return {
-                            idx,
-                            tag: el.tagName.toLowerCase(),
-                            text,
-                            href,
-                            data_page: dataPage,
-                            onclick: short(onclick),
-                            class_name: cls,
-                            visible,
-                            x: Math.round(r.left),
-                            y: Math.round(r.top),
-                            w: Math.round(r.width),
-                            h: Math.round(r.height),
-                        };
-                    })
-                    .filter(Boolean);
-
-                return {
-                    pager_nodes: pagerNodes,
-                    anchors_with_data_page: Array.from(document.querySelectorAll('a[data-page]')).map(a => ({
-                        text: txt(a),
-                        href: a.getAttribute('href') || '',
-                        data_page: a.getAttribute('data-page') || '',
-                        class_name: ((a.className || '') + '').trim(),
-                        visible: isVisible(a),
-                    })),
-                    body_sample: (document.body.innerText || '').slice(0, 4000)
-                };
-            }
-            """
-        )
-        log.info("PAGINATION DIAGNOSTICS: %s", json.dumps(data, ensure_ascii=False)[:12000])
-        return data
-    except Exception as e:
-        log.warning("dump_pagination_diagnostics failed: %s", str(e))
-        return {}
-
-
 def get_active_page_number(page) -> int:
     try:
         active = page.evaluate(
@@ -680,16 +581,7 @@ def get_active_page_number(page) -> int:
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
-                const selectedOption = document.querySelector('a[data-page] i.icon-ok');
-                if (selectedOption) {
-                    const anchor = selectedOption.closest('a[data-page]');
-                    if (anchor) {
-                        const p = parseInt(anchor.getAttribute('data-page') || '', 10);
-                        if (!isNaN(p)) return p;
-                    }
-                }
-
-                const els = Array.from(document.querySelectorAll('button, a, div, span, li'));
+                const els = Array.from(document.querySelectorAll('button, a, div, span'));
                 for (const el of els) {
                     const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                     const mm = txt.match(/^Page\\s+(\\d+)$/i);
@@ -729,13 +621,7 @@ def parse_total_pages(page) -> int:
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-
-                let maxPage = 1;
-                document.querySelectorAll('a[data-page]').forEach(a => {
-                    const p = parseInt(a.getAttribute('data-page') || '', 10);
-                    if (!isNaN(p) && p > maxPage) maxPage = p;
-                });
-                return maxPage;
+                return 1;
             }
             """
         )
@@ -744,12 +630,32 @@ def parse_total_pages(page) -> int:
         return 1
 
 
+def get_first_caseid(page) -> str:
+    try:
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        if row.count() == 0:
+            return ""
+        return row.get_attribute("data-caseid") or ""
+    except Exception:
+        return ""
+
+
+def get_first_row_text(page) -> str:
+    try:
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        if row.count() == 0:
+            return ""
+        return clean_text(row.inner_text())
+    except Exception:
+        return ""
+
+
 def wait_for_page_change(
     page,
     old_page: int,
     old_first_caseid: str = "",
     old_first_row_text: str = "",
-    timeout_ms: int = 30000,
+    timeout_ms: int = 22000,
 ) -> bool:
     waited = 0
     step = 1000
@@ -757,21 +663,21 @@ def wait_for_page_change(
     while waited < timeout_ms:
         try:
             current = get_active_page_number(page)
-            rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-            current_first_caseid = get_first_caseid(page)
-            current_first_row_text = get_first_row_text(page)
+            rows_count = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+            new_first_caseid = get_first_caseid(page)
+            new_first_row_text = get_first_row_text(page)
 
-            page_changed = current != old_page
-            case_changed = bool(old_first_caseid and current_first_caseid and current_first_caseid != old_first_caseid)
-            row_changed = bool(old_first_row_text and current_first_row_text and current_first_row_text != old_first_row_text)
+            page_changed = current != old_page and rows_count > 0
+            first_case_changed = bool(old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid)
+            first_text_changed = bool(old_first_row_text and new_first_row_text and new_first_row_text != old_first_row_text)
 
-            if rows > 0 and (page_changed or case_changed or row_changed):
+            if page_changed or first_case_changed or first_text_changed:
                 log.info(
                     "Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
                     old_page,
                     current,
                     old_first_caseid,
-                    current_first_caseid,
+                    new_first_caseid,
                 )
                 return True
         except Exception:
@@ -785,261 +691,26 @@ def wait_for_page_change(
 
 def open_pager_dropdown(page) -> bool:
     selectors = [
-        'button[aria-haspopup="true"]',
         'text=/^Page\\s+\\d+\\s*$/',
-        'text=/^Page\\s+\\d+\\s*\\(results/i',
+        'text=/^Page\\s+\\d+\\s*\\(results.*\\)$/i',
+        'div:has-text("Page 1")',
+        'div:has-text("Page 2")',
+        'span:has-text("Page 1")',
+        'span:has-text("Page 2")',
     ]
 
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
+            loc = page.locator(sel)
             if loc.count() == 0:
                 continue
 
-            try:
-                loc.click(timeout=5000)
-                page.wait_for_timeout(1200)
-            except Exception:
-                try:
-                    loc.click(force=True, timeout=5000)
-                    page.wait_for_timeout(1200)
-                except Exception:
-                    try:
-                        handle = loc.element_handle()
-                        if handle is not None:
-                            page.evaluate(
-                                """(el) => {
-                                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                                    el.click();
-                                }""",
-                                handle,
-                            )
-                            page.wait_for_timeout(1200)
-                        else:
-                            continue
-                    except Exception:
-                        continue
-
-            visible = page.evaluate(
-                """
-                () => {
-                    const anchors = Array.from(document.querySelectorAll('a[data-page]'));
-                    return anchors.some(a => {
-                        const s = window.getComputedStyle(a);
-                        const r = a.getBoundingClientRect();
-                        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                    });
-                }
-                """
-            )
-            if visible:
-                log.info("Opened pager dropdown using selector: %s", sel)
-                return True
-        except Exception as e:
-            log.warning("open_pager_dropdown selector failed %s: %s", sel, str(e))
-
-    try:
-        result = page.evaluate(
-            """
-            () => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                }
-
-                function txt(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
-                }
-
-                const candidates = Array.from(document.querySelectorAll('button, a, div, span'))
-                    .filter(isVisible)
-                    .map(el => {
-                        const text = txt(el);
-                        const r = el.getBoundingClientRect();
-                        let score = 0;
-                        if (/^Page\\s+\\d+$/i.test(text)) score += 200;
-                        if (/^Page\\s+\\d+\\s*\\(/i.test(text)) score += 180;
-                        if (text.includes('Page')) score += 50;
-                        if (el.querySelector('i')) score += 10;
-                        return {
-                            score,
-                            x: r.left + r.width / 2,
-                            y: r.top + r.height / 2,
-                            text
-                        };
-                    })
-                    .filter(x => x.score > 0)
-                    .sort((a, b) => b.score - a.score);
-
-                return candidates.length ? { ok: true, ...candidates[0] } : { ok: false };
-            }
-            """
-        )
-
-        if result and result.get("ok"):
-            page.mouse.click(result["x"], result["y"])
+            loc.first.click(timeout=4000)
             page.wait_for_timeout(1200)
-
-            visible = page.evaluate(
-                """
-                () => Array.from(document.querySelectorAll('a[data-page]')).some(a => {
-                    const s = window.getComputedStyle(a);
-                    const r = a.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                })
-                """
-            )
-            if visible:
-                log.info("Opened pager dropdown using XY fallback: %s", result)
-                return True
-    except Exception as e:
-        log.warning("open_pager_dropdown XY fallback failed: %s", str(e))
-
-    return False
-
-
-def click_page_option_from_dropdown(page, target_page: int) -> bool:
-    current_before = get_active_page_number(page)
-    old_first_caseid = get_first_caseid(page)
-    old_first_row_text = get_first_row_text(page)
-
-    js_result = None
-
-    # 1) método principal: a[data-page="X"]
-    try:
-        js_result = page.evaluate(
-            """
-            (targetPage) => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           r.width > 0 &&
-                           r.height > 0;
-                }
-
-                function txt(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
-                }
-
-                const selector = `a[data-page="${targetPage}"]`;
-                const anchor = document.querySelector(selector);
-
-                if (!anchor) {
-                    return { ok: false, reason: `anchor ${selector} not found` };
-                }
-
-                const rect = anchor.getBoundingClientRect();
-                const li = anchor.closest('li');
-
-                const tries = [];
-
-                try {
-                    anchor.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                    anchor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    anchor.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    anchor.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    tries.push('anchor mouse events');
-                } catch (e) {}
-
-                try {
-                    anchor.click();
-                    tries.push('anchor.click()');
-                } catch (e) {}
-
-                try {
-                    if (typeof anchor.onclick === 'function') {
-                        anchor.onclick();
-                        tries.push('anchor.onclick()');
-                    }
-                } catch (e) {}
-
-                try {
-                    if (li) {
-                        li.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                        li.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                        li.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                        li.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                        tries.push('li mouse events');
-                    }
-                } catch (e) {}
-
-                try {
-                    if (window.jQuery) {
-                        window.jQuery(anchor).trigger('click');
-                        tries.push('jquery anchor trigger click');
-                    }
-                } catch (e) {}
-
-                return {
-                    ok: true,
-                    text: txt(anchor),
-                    href: anchor.getAttribute('href') || '',
-                    data_page: anchor.getAttribute('data-page') || '',
-                    visible: isVisible(anchor),
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2,
-                    tries
-                };
-            }
-            """,
-            int(target_page),
-        )
-
-        log.info("Dropdown page option click result for page %s: %s", target_page, js_result)
-
-        if js_result and js_result.get("ok"):
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
-                return True
-    except Exception as e:
-        log.warning("click_page_option_from_dropdown JS block failed for page %s: %s", target_page, str(e))
-
-    # 2) click por coordenada do anchor encontrado
-    if js_result and js_result.get("ok"):
-        try:
-            page.mouse.click(js_result["x"], js_result["y"])
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
-                return True
-        except Exception as e:
-            log.warning("XY click on dropdown option failed for page %s: %s", target_page, str(e))
-
-    # 3) locator direto playwright no a[data-page="X"]
-    try:
-        sel = f'a[data-page="{int(target_page)}"]'
-        loc = page.locator(sel).first
-        if loc.count() > 0:
-            try:
-                loc.click(timeout=5000)
-            except Exception:
-                loc.click(force=True, timeout=5000)
-
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
-                return True
-    except Exception as e:
-        log.warning("Locator click on dropdown option failed for page %s: %s", target_page, str(e))
+            log.info("Opened pager dropdown using selector: %s", sel)
+            return True
+        except Exception:
+            continue
 
     return False
 
@@ -1053,40 +724,50 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
         result = page.evaluate(
             """
             (targetPage) => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           r.width > 0 &&
-                           r.height > 0;
-                }
-
                 function txt(el) {
                     return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
                 }
 
-                const anchor = document.querySelector(`a[data-page="${targetPage}"]`);
-                if (!anchor) {
-                    return { ok: false, reason: 'a[data-page] not found' };
+                const selectors = [
+                    `a[data-page="${targetPage}"]`,
+                    `[data-page="${targetPage}"]`,
+                    `a[title*="Page ${targetPage}"]`
+                ];
+
+                let target = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        target = el;
+                        break;
+                    }
                 }
 
-                const r = anchor.getBoundingClientRect();
+                if (!target) {
+                    const all = Array.from(document.querySelectorAll('a, button, div, span, td'));
+                    target = all.find(el => {
+                        const t = txt(el);
+                        return t === `Page ${targetPage}` || t.startsWith(`Page ${targetPage} `);
+                    }) || null;
+                }
 
-                try { anchor.click(); } catch (e) {}
-                try {
-                    anchor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    anchor.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    anchor.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                } catch (e) {}
+                if (!target) {
+                    return { ok: false, reason: 'target page element not found' };
+                }
+
+                const r = target.getBoundingClientRect();
+
+                try { target.click(); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
 
                 return {
                     ok: true,
-                    text: txt(anchor),
-                    visible: isVisible(anchor),
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2
+                    text: txt(target),
+                    visible: !!(r.width > 0 && r.height > 0),
+                    x: r.left + (r.width / 2),
+                    y: r.top + (r.height / 2)
                 };
             }
             """,
@@ -1094,6 +775,79 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
         )
 
         log.info("Direct hidden/visible page option result for page %s: %s", target_page, result)
+
+        if result and result.get("ok"):
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
+
+            try:
+                if result.get("visible"):
+                    page.mouse.click(result["x"], result["y"])
+                    if wait_for_page_change(
+                        page,
+                        old_page=current_before,
+                        old_first_caseid=old_first_caseid,
+                        old_first_row_text=old_first_row_text,
+                        timeout_ms=16000,
+                    ):
+                        return True
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.warning("click_page_option_direct_without_dropdown failed for page %s: %s", target_page, str(e))
+
+    return False
+
+
+def click_page_option_from_dropdown(page, target_page: int) -> bool:
+    current_before = get_active_page_number(page)
+    old_first_caseid = get_first_caseid(page)
+    old_first_row_text = get_first_row_text(page)
+
+    try:
+        result = page.evaluate(
+            """
+            (targetPage) => {
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                const all = Array.from(document.querySelectorAll('a, button, div, span, td, li'));
+                const option = all.find(el => {
+                    const t = txt(el);
+                    return t === `Page ${targetPage}` || t.startsWith(`Page ${targetPage} (results`);
+                });
+
+                if (!option) {
+                    return { ok: false, reason: 'dropdown option not found' };
+                }
+
+                const r = option.getBoundingClientRect();
+
+                try { option.click(); } catch (e) {}
+                try { option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+                try { option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+                try { option.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
+
+                return {
+                    ok: true,
+                    text: txt(option),
+                    x: r.left + (r.width / 2),
+                    y: r.top + (r.height / 2)
+                };
+            }
+            """,
+            int(target_page),
+        )
+
+        log.info("Dropdown page option click result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
             if wait_for_page_change(
@@ -1117,8 +871,9 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
                     return True
             except Exception:
                 pass
+
     except Exception as e:
-        log.warning("click_page_option_direct_without_dropdown failed for page %s: %s", target_page, str(e))
+        log.warning("click_page_option_from_dropdown failed for page %s: %s", target_page, str(e))
 
     return False
 
@@ -1130,34 +885,6 @@ def click_next_page(page) -> bool:
 
     log.info("Current Miami page before NEXT click: %s", current_before)
 
-    selectors = [
-        "text=›",
-        "text=>",
-        "text=»",
-    ]
-
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
-
-            try:
-                loc.click(timeout=4000)
-            except Exception:
-                loc.click(force=True, timeout=4000)
-
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
-                return True
-        except Exception:
-            pass
-
     try:
         result = page.evaluate(
             """
@@ -1166,10 +893,11 @@ def click_next_page(page) -> bool:
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
                     const r = el.getBoundingClientRect();
-                    return s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           r.width > 0 &&
-                           r.height > 0;
+                    return !!s &&
+                        s.display !== 'none' &&
+                        s.visibility !== 'hidden' &&
+                        r.width > 0 &&
+                        r.height > 0;
                 }
 
                 function txt(el) {
@@ -1180,7 +908,7 @@ def click_next_page(page) -> bool:
                     return ((el && el.className) || '').toString().toLowerCase();
                 }
 
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td, li'));
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td, img'));
                 const visible = all.filter(isVisible);
 
                 let best = null;
@@ -1195,6 +923,8 @@ def click_next_page(page) -> bool:
                     if (c.includes('right')) score += 80;
                     if (c.includes('arrow')) score += 80;
                     if (c.includes('chevron')) score += 80;
+                    if (el.tagName.toLowerCase() === 'img') score += 40;
+                    if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
 
                     if (score <= 0) continue;
 
@@ -1212,7 +942,11 @@ def click_next_page(page) -> bool:
                     }
                 }
 
-                return best ? { ok: true, ...best } : { ok: false, reason: 'no next candidate found' };
+                if (!best) {
+                    return { ok: false, reason: 'no next candidate found' };
+                }
+
+                return { ok: true, ...best };
             }
             """
         )
@@ -1221,6 +955,7 @@ def click_next_page(page) -> bool:
 
         if result and result.get("ok"):
             page.mouse.click(result["x"], result["y"])
+
             if wait_for_page_change(
                 page,
                 old_page=current_before,
@@ -1234,6 +969,51 @@ def click_next_page(page) -> bool:
 
     log.warning("Could not click NEXT page button")
     return False
+
+
+def log_pagination_diagnostics(page):
+    try:
+        data = page.evaluate(
+            """
+            () => {
+                const nodes = Array.from(document.querySelectorAll('[data-page], a, button, div, span, td'))
+                    .map((el, idx) => {
+                        const r = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        const text = ((el.innerText || '')).replace(/\\s+/g, ' ').trim();
+
+                        if (
+                            !text.includes('Page') &&
+                            !el.getAttribute('data-page') &&
+                            !((el.getAttribute('href') || '').includes('javascript:void(0)'))
+                        ) {
+                            return null;
+                        }
+
+                        return {
+                            idx,
+                            tag: el.tagName.toLowerCase(),
+                            text,
+                            href: el.getAttribute('href') || '',
+                            data_page: el.getAttribute('data-page') || '',
+                            onclick: el.getAttribute('onclick') || '',
+                            class_name: el.className || '',
+                            visible: !(style.display === 'none' || style.visibility === 'hidden' || r.width <= 0 || r.height <= 0),
+                            x: r.x,
+                            y: r.y,
+                            w: r.width,
+                            h: r.height
+                        };
+                    })
+                    .filter(Boolean);
+
+                return { pager_nodes: nodes.slice(0, 200) };
+            }
+            """
+        )
+        log.info("PAGINATION DIAGNOSTICS: %s", json.dumps(data))
+    except Exception as e:
+        log.warning("Could not collect pagination diagnostics: %s", str(e))
 
 
 def go_to_page_number(page, page_num: int) -> bool:
@@ -1257,15 +1037,15 @@ def go_to_page_number(page, page_num: int) -> bool:
 
         log.info("Trying to navigate from page %s to page %s (attempt %s)", current, page_num, attempt)
 
-        # Diagnóstico útil sempre que falhar
-        dump_pagination_diagnostics(page)
+        if attempt == 1:
+            log_pagination_diagnostics(page)
 
-        # 1) tentar direto no a[data-page="X"] sem abrir dropdown
+        # 1) principal: clicar direto no item a[data-page="X"], mesmo invisível
         if click_page_option_direct_without_dropdown(page, page_num):
             page.wait_for_timeout(1200)
-            return get_active_page_number(page) == page_num or get_first_caseid(page) != ""
+            return True
 
-        # 2) abrir dropdown e clicar na opção do page target
+        # 2) fallback: abrir dropdown visual e clicar na opção
         if open_pager_dropdown(page):
             if click_page_option_from_dropdown(page, page_num):
                 page.wait_for_timeout(1200)
@@ -1273,7 +1053,7 @@ def go_to_page_number(page, page_num: int) -> bool:
         else:
             log.warning("Could not open pager dropdown on attempt %s", attempt)
 
-        # 3) fallback pelo next se target for current+1
+        # 3) fallback final: next, apenas se for próxima página
         current = get_active_page_number(page)
         if page_num == current + 1:
             if click_next_page(page):
