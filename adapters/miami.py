@@ -15,7 +15,7 @@ LIST_URL = f"{BASE_URL}/public/cases/list"
 AUCTION_URL = "https://www.miamidade.realforeclose.com/index.cfm"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-## MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
+MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
 
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
@@ -1312,11 +1312,10 @@ def build_properties_payload(record: dict) -> dict:
     }
 
 
-# =========================
-# MAIN
-# =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V6 + DROPDOWN DATA-PAGE + DIAGNOSTICS ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V6 + COUNT ONLY SENT ===")
+
+    MAX_VISITS = int(os.getenv("MAX_VISITS", "1000"))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1349,35 +1348,35 @@ def run_miami():
 
         log.info("Detected total Miami pages: %s", total_pages)
 
-        if PAGINATION_DIAGNOSTIC_MODE:
-            diag = dump_pagination_diagnostics(page)
-            payload = {
-                "source": "MiamiDade",
-                "mode": "pagination_diagnostic_only",
-                "total_pages_detected": total_pages,
-                "page_summary": summary,
-                "diagnostic": diag,
-            }
-            log.info("===== PAGINATION DIAGNOSTIC PAYLOAD =====")
-            log.info(json.dumps(payload, indent=2))
-            print(json.dumps(payload, indent=2))
-            browser.close()
-            return
-
         results = []
         failures = []
         supabase_results = []
-        total_processed = 0
+
+        visited_count = 0
+        extracted_count = 0
+        sent_count = 0
 
         for page_num in range(1, total_pages + 1):
-            if total_processed >= MAX_LOTS:
+            if sent_count >= MAX_LOTS:
+                log.info(
+                    "Stopping pagination because sent_count=%s reached MAX_LOTS=%s",
+                    sent_count,
+                    MAX_LOTS,
+                )
+                break
+
+            if visited_count >= MAX_VISITS:
+                log.warning(
+                    "Stopping pagination because visited_count=%s reached MAX_VISITS=%s",
+                    visited_count,
+                    MAX_VISITS,
+                )
                 break
 
             if page_num > 1:
                 ok = go_to_page_number(page, page_num)
                 if not ok:
                     log.warning("Could not navigate to page %s", page_num)
-                    dump_pagination_diagnostics(page)
                     break
 
             rows = collect_case_rows(page)
@@ -1385,19 +1384,39 @@ def run_miami():
                 log.warning("No rows found on page %s", page_num)
                 continue
 
-            log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
+            log.info(
+                "Processing all %s rows from page %s before moving forward",
+                len(rows),
+                page_num,
+            )
 
             for row in rows:
-                if total_processed >= MAX_LOTS:
+                if sent_count >= MAX_LOTS:
+                    log.info(
+                        "Stopping row loop because sent_count=%s reached MAX_LOTS=%s",
+                        sent_count,
+                        MAX_LOTS,
+                    )
+                    break
+
+                if visited_count >= MAX_VISITS:
+                    log.warning(
+                        "Stopping row loop because visited_count=%s reached MAX_VISITS=%s",
+                        visited_count,
+                        MAX_VISITS,
+                    )
                     break
 
                 caseid = row.get("caseid")
                 row_index = row.get("index")
 
-                total_processed += 1
+                visited_count += 1
+
                 log.info(
-                    "[%s/%s] Scraping caseid=%s page=%s row=%s ...",
-                    total_processed,
+                    "[visited=%s extracted=%s sent=%s/%s] Scraping caseid=%s page=%s row=%s ...",
+                    visited_count,
+                    extracted_count,
+                    sent_count,
                     MAX_LOTS,
                     caseid,
                     page_num,
@@ -1408,28 +1427,56 @@ def run_miami():
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
                         if not ok:
-                            raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
+                            raise RuntimeError(
+                                f"Could not re-open page {page_num} for caseid={caseid}"
+                            )
 
                     base_case = open_case_by_caseid(page, caseid)
                     case_detail = extract_case_detail(page, base_case)
 
                     record = build_final_record(case_detail)
                     results.append(record)
+                    extracted_count += 1
 
                     prop_payload = build_properties_payload(record)
 
                     sb_result = supabase_upsert_property(prop_payload)
                     supabase_results.append(sb_result)
 
-                    send_to_app(prop_payload)
+                    app_sent_ok = send_to_app(prop_payload)
 
-                    log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
+                    if sb_result.get("sent"):
+                        sent_count += 1
+                        log.info(
+                            "COUNTED AS SENT: sent_count=%s node=%s status_code=%s",
+                            sent_count,
+                            prop_payload.get("node"),
+                            sb_result.get("status_code"),
+                        )
+                    else:
+                        log.info(
+                            "NOT COUNTED AS SENT: node=%s reason=%s app_sent=%s",
+                            prop_payload.get("node"),
+                            sb_result.get("response_text"),
+                            app_sent_ok,
+                        )
+
+                    log.info(
+                        "SUCCESS CASE visited=%s extracted=%s sent=%s node=%s",
+                        visited_count,
+                        extracted_count,
+                        sent_count,
+                        prop_payload.get("node"),
+                    )
 
                     open_list_and_apply_filter(page)
+
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
                         if not ok:
-                            raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
+                            raise RuntimeError(
+                                f"Could not return to page {page_num} after caseid={caseid}"
+                            )
 
                 except Exception as e:
                     log.exception("FAILED CASE caseid=%s: %s", caseid, e)
@@ -1449,9 +1496,13 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v6_dropdown_data_page_diagnostics",
+            "mode": "final_operational_v6_count_only_sent",
             "total_pages_detected": total_pages,
-            "rows_detected": len(results) + len(failures),
+            "visited_count": visited_count,
+            "extracted_count": extracted_count,
+            "sent_count": sent_count,
+            "max_lots": MAX_LOTS,
+            "max_visits": MAX_VISITS,
             "records_count": len(results),
             "failures_count": len(failures),
             "supabase_results": supabase_results,
@@ -1465,11 +1516,3 @@ def run_miami():
         print(json.dumps(final_payload, indent=2))
 
         browser.close()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-    run_miami()
