@@ -25,6 +25,8 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 CAN_CHECK_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
+PAGINATION_DIAGNOSTIC_MODE = os.getenv("MIAMI_PAGINATION_DIAGNOSTIC_MODE", "false").lower() == "true"
+
 
 # =========================
 # BASIC HELPERS
@@ -269,106 +271,37 @@ def supabase_upsert_property(payload: dict) -> dict:
 # =========================
 # UI HELPERS
 # =========================
-def click_safe(page, selector, name, timeout=6000, allow_navigation=False):
+def click_safe(page, selector, name, timeout=6000):
     try:
         page.click(selector, timeout=timeout)
         log.info("%s clicked (normal)", name)
-
-        if allow_navigation:
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
         return True
-    except Exception as e:
-        msg = str(e)
-
-        # Se a navegação começou logo após o clique, consideramos sucesso
-        if allow_navigation and (
-            "Execution context was destroyed" in msg
-            or "Target closed" in msg
-            or "has been closed" in msg
-            or "Most likely the page has been closed" in msg
-        ):
-            log.info("%s click triggered navigation (normal)", name)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-            return True
+    except Exception:
+        pass
 
     try:
         page.locator(selector).first.click(force=True, timeout=timeout)
         log.info("%s clicked (force)", name)
+        return True
+    except Exception:
+        pass
 
-        if allow_navigation:
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
+    try:
+        page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error(`not found: ${sel}`);
+                el.click();
+            }""",
+            selector,
+        )
+        log.info("%s clicked (JS fallback)", name)
         return True
     except Exception as e:
-        msg = str(e)
+        log.error("%s FAILED: %s", name, e)
+        return False
 
-        if allow_navigation and (
-            "Execution context was destroyed" in msg
-            or "Target closed" in msg
-            or "has been closed" in msg
-            or "Most likely the page has been closed" in msg
-        ):
-            log.info("%s click triggered navigation (force)", name)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-            return True
 
-    # JS fallback só deve ser usado quando NÃO esperamos navegação
-    if not allow_navigation:
-        try:
-            page.evaluate(
-                """(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) throw new Error(`not found: ${sel}`);
-                    el.click();
-                }""",
-                selector,
-            )
-            log.info("%s clicked (JS fallback)", name)
-            return True
-        except Exception as e:
-            log.error("%s FAILED: %s", name, e)
-            return False
-
-    log.error("%s FAILED", name)
-    return False
-
-def click_search_button(page) -> bool:
-    selectors = [
-        "button.filters-submit",
-        "text=Search",
-    ]
-
-    for sel in selectors:
-        try:
-            with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                page.locator(sel).first.click(timeout=5000)
-            log.info("SEARCH BUTTON clicked with navigation: %s", sel)
-            return True
-        except Exception:
-            pass
-
-        try:
-            page.locator(sel).first.click(timeout=5000)
-            log.info("SEARCH BUTTON clicked without navigation: %s", sel)
-            return True
-        except Exception:
-            pass
-
-    return False
-    
 def click_element_handle_safe(el, page, name):
     try:
         el.click(timeout=6000)
@@ -500,6 +433,86 @@ def wait_for_case_rows(page, timeout_ms=25000):
     raise RuntimeError("No case rows found after Miami search")
 
 
+def click_search_button(page) -> bool:
+    selectors = [
+        "button.filters-submit",
+        "text=Search",
+        "button:has-text('Search')",
+    ]
+
+    for sel in selectors:
+        try:
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    locator.click(timeout=6000)
+                log.info("SEARCH BUTTON clicked with navigation: %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                locator.click(timeout=6000)
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (normal): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                locator.click(force=True, timeout=6000)
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (force): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    page.evaluate(
+                        """(selector) => {
+                            const el = document.querySelector(selector);
+                            if (!el) throw new Error('search button not found');
+                            el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            el.click();
+                        }""",
+                        sel,
+                    )
+                log.info("SEARCH BUTTON clicked (JS + navigation): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                page.evaluate(
+                    """(selector) => {
+                        const el = document.querySelector(selector);
+                        if (!el) throw new Error('search button not found');
+                        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        el.click();
+                    }""",
+                    sel,
+                )
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (JS fallback): %s", sel)
+                return True
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
+
+    log.error("SEARCH BUTTON FAILED")
+    return False
+
+
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
@@ -523,34 +536,34 @@ def run_search_flow(page):
     if not click_search_button(page):
         raise RuntimeError("Could not click search")
 
-    page.wait_for_timeout(3000)
     wait_for_case_rows(page)
-    
-    
+
+
 def open_list_and_apply_filter(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(6000)
     run_search_flow(page)
 
 
-def return_to_results(page):
+# =========================
+# PAGINATION - DIAGNOSTICS + ROBUST NAV
+# =========================
+def get_first_caseid(page) -> str:
     try:
-        page.go_back(wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
-        wait_for_case_rows(page, timeout_ms=20000)
-        return True
-    except Exception as e:
-        log.warning("go_back failed, reloading filtered list: %s", str(e))
-        try:
-            open_list_and_apply_filter(page)
-            return True
-        except Exception:
-            return False
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        return row.get_attribute("data-caseid") or ""
+    except Exception:
+        return ""
 
 
-# =========================
-# PAGINATION
-# =========================
+def get_first_row_text(page) -> str:
+    try:
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        return clean_text(row.inner_text())
+    except Exception:
+        return ""
+
+
 def get_results_summary(page) -> Dict:
     return page.evaluate(
         """
@@ -558,7 +571,7 @@ def get_results_summary(page) -> Dict:
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
-            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
+            const pageLinks = Array.from(document.querySelectorAll('a, button, span, div, li'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
@@ -575,6 +588,89 @@ def get_results_summary(page) -> Dict:
     )
 
 
+def dump_pagination_diagnostics(page) -> Dict:
+    try:
+        data = page.evaluate(
+            """
+            () => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return !!s &&
+                        s.display !== 'none' &&
+                        s.visibility !== 'hidden' &&
+                        r.width > 0 &&
+                        r.height > 0;
+                }
+
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                function short(v) {
+                    return (v || '').toString().slice(0, 500);
+                }
+
+                const all = Array.from(document.querySelectorAll('a, button, li, span, div, td'));
+                const pagerNodes = all
+                    .map((el, idx) => {
+                        const text = txt(el);
+                        const href = el.getAttribute ? (el.getAttribute('href') || '') : '';
+                        const dataPage = el.getAttribute ? (el.getAttribute('data-page') || '') : '';
+                        const onclick = el.getAttribute ? (el.getAttribute('onclick') || '') : '';
+                        const cls = ((el.className || '') + '').trim();
+                        const visible = isVisible(el);
+
+                        if (!text && !href && !dataPage && !onclick) return null;
+
+                        const looksPager =
+                            /^Page\\s+\\d+/i.test(text) ||
+                            dataPage ||
+                            (href && href.toLowerCase().includes('javascript:void')) ||
+                            cls.toLowerCase().includes('page');
+
+                        if (!looksPager) return null;
+
+                        const r = el.getBoundingClientRect();
+                        return {
+                            idx,
+                            tag: el.tagName.toLowerCase(),
+                            text,
+                            href,
+                            data_page: dataPage,
+                            onclick: short(onclick),
+                            class_name: cls,
+                            visible,
+                            x: Math.round(r.left),
+                            y: Math.round(r.top),
+                            w: Math.round(r.width),
+                            h: Math.round(r.height),
+                        };
+                    })
+                    .filter(Boolean);
+
+                return {
+                    pager_nodes: pagerNodes,
+                    anchors_with_data_page: Array.from(document.querySelectorAll('a[data-page]')).map(a => ({
+                        text: txt(a),
+                        href: a.getAttribute('href') || '',
+                        data_page: a.getAttribute('data-page') || '',
+                        class_name: ((a.className || '') + '').trim(),
+                        visible: isVisible(a),
+                    })),
+                    body_sample: (document.body.innerText || '').slice(0, 4000)
+                };
+            }
+            """
+        )
+        log.info("PAGINATION DIAGNOSTICS: %s", json.dumps(data, ensure_ascii=False)[:12000])
+        return data
+    except Exception as e:
+        log.warning("dump_pagination_diagnostics failed: %s", str(e))
+        return {}
+
+
 def get_active_page_number(page) -> int:
     try:
         active = page.evaluate(
@@ -584,7 +680,16 @@ def get_active_page_number(page) -> int:
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
-                const els = Array.from(document.querySelectorAll('button, a, div, span'));
+                const selectedOption = document.querySelector('a[data-page] i.icon-ok');
+                if (selectedOption) {
+                    const anchor = selectedOption.closest('a[data-page]');
+                    if (anchor) {
+                        const p = parseInt(anchor.getAttribute('data-page') || '', 10);
+                        if (!isNaN(p)) return p;
+                    }
+                }
+
+                const els = Array.from(document.querySelectorAll('button, a, div, span, li'));
                 for (const el of els) {
                     const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                     const mm = txt.match(/^Page\\s+(\\d+)$/i);
@@ -624,7 +729,13 @@ def parse_total_pages(page) -> int:
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-                return 1;
+
+                let maxPage = 1;
+                document.querySelectorAll('a[data-page]').forEach(a => {
+                    const p = parseInt(a.getAttribute('data-page') || '', 10);
+                    if (!isNaN(p) && p > maxPage) maxPage = p;
+                });
+                return maxPage;
             }
             """
         )
@@ -633,7 +744,13 @@ def parse_total_pages(page) -> int:
         return 1
 
 
-def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeout_ms: int = 45000) -> bool:
+def wait_for_page_change(
+    page,
+    old_page: int,
+    old_first_caseid: str = "",
+    old_first_row_text: str = "",
+    timeout_ms: int = 30000,
+) -> bool:
     waited = 0
     step = 1000
 
@@ -641,32 +758,22 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeou
         try:
             current = get_active_page_number(page)
             rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+            current_first_caseid = get_first_caseid(page)
+            current_first_row_text = get_first_row_text(page)
 
-            new_first_caseid = ""
-            if rows > 0:
-                try:
-                    new_first_caseid = (
-                        page.locator('tr.load-case.table-row.link[data-caseid]')
-                        .first
-                        .get_attribute("data-caseid") or ""
-                    )
-                except Exception:
-                    pass
+            page_changed = current != old_page
+            case_changed = bool(old_first_caseid and current_first_caseid and current_first_caseid != old_first_caseid)
+            row_changed = bool(old_first_row_text and current_first_row_text and current_first_row_text != old_first_row_text)
 
-            if current != old_page and rows > 0:
+            if rows > 0 and (page_changed or case_changed or row_changed):
                 log.info(
-                    "Miami page changed by page number: %s -> %s | first_caseid=%s",
-                    old_page, current, new_first_caseid
+                    "Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
+                    old_page,
+                    current,
+                    old_first_caseid,
+                    current_first_caseid,
                 )
                 return True
-
-            if old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid:
-                log.info(
-                    "Miami page changed by first row: %s -> %s",
-                    old_first_caseid, new_first_caseid
-                )
-                return True
-
         except Exception:
             pass
 
@@ -678,69 +785,134 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", timeou
 
 def open_pager_dropdown(page) -> bool:
     selectors = [
-        "text=/^Page\\s+\\d+\\s*$/",
-        "text=/^Page\\s+\\d+$/",
-        "div:has-text('Page ')",
-        "span:has-text('Page ')",
-        "button:has-text('Page ')",
+        'button[aria-haspopup="true"]',
+        'text=/^Page\\s+\\d+\\s*$/',
+        'text=/^Page\\s+\\d+\\s*\\(results/i',
     ]
 
     for sel in selectors:
         try:
-            loc = page.locator(sel)
+            loc = page.locator(sel).first
             if loc.count() == 0:
                 continue
 
-            target = loc.first
-            target.scroll_into_view_if_needed()
-            page.wait_for_timeout(30000)
-
             try:
-                target.click(timeout=40000)
+                loc.click(timeout=5000)
+                page.wait_for_timeout(1200)
             except Exception:
                 try:
-                    target.click(timeout=40000, force=True)
+                    loc.click(force=True, timeout=5000)
+                    page.wait_for_timeout(1200)
                 except Exception:
-                    box = target.bounding_box()
-                    if not box:
+                    try:
+                        handle = loc.element_handle()
+                        if handle is not None:
+                            page.evaluate(
+                                """(el) => {
+                                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                    el.click();
+                                }""",
+                                handle,
+                            )
+                            page.wait_for_timeout(1200)
+                        else:
+                            continue
+                    except Exception:
                         continue
-                    page.mouse.click(
-                        box["x"] + box["width"] / 2,
-                        box["y"] + box["height"] / 2
-                    )
 
-            page.wait_for_timeout(12000)
-
-            options = page.locator("text=/^Page\\s+\\d+\\s+\\(results/i")
-            if options.count() > 0:
+            visible = page.evaluate(
+                """
+                () => {
+                    const anchors = Array.from(document.querySelectorAll('a[data-page]'));
+                    return anchors.some(a => {
+                        const s = window.getComputedStyle(a);
+                        const r = a.getBoundingClientRect();
+                        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                    });
+                }
+                """
+            )
+            if visible:
                 log.info("Opened pager dropdown using selector: %s", sel)
                 return True
+        except Exception as e:
+            log.warning("open_pager_dropdown selector failed %s: %s", sel, str(e))
 
-        except Exception:
-            pass
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                }
+
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                const candidates = Array.from(document.querySelectorAll('button, a, div, span'))
+                    .filter(isVisible)
+                    .map(el => {
+                        const text = txt(el);
+                        const r = el.getBoundingClientRect();
+                        let score = 0;
+                        if (/^Page\\s+\\d+$/i.test(text)) score += 200;
+                        if (/^Page\\s+\\d+\\s*\\(/i.test(text)) score += 180;
+                        if (text.includes('Page')) score += 50;
+                        if (el.querySelector('i')) score += 10;
+                        return {
+                            score,
+                            x: r.left + r.width / 2,
+                            y: r.top + r.height / 2,
+                            text
+                        };
+                    })
+                    .filter(x => x.score > 0)
+                    .sort((a, b) => b.score - a.score);
+
+                return candidates.length ? { ok: true, ...candidates[0] } : { ok: false };
+            }
+            """
+        )
+
+        if result and result.get("ok"):
+            page.mouse.click(result["x"], result["y"])
+            page.wait_for_timeout(1200)
+
+            visible = page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('a[data-page]')).some(a => {
+                    const s = window.getComputedStyle(a);
+                    const r = a.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                })
+                """
+            )
+            if visible:
+                log.info("Opened pager dropdown using XY fallback: %s", result)
+                return True
+    except Exception as e:
+        log.warning("open_pager_dropdown XY fallback failed: %s", str(e))
 
     return False
 
 
 def click_page_option_from_dropdown(page, target_page: int) -> bool:
-    old_page = get_active_page_number(page)
+    current_before = get_active_page_number(page)
+    old_first_caseid = get_first_caseid(page)
+    old_first_row_text = get_first_row_text(page)
 
-    old_first_caseid = ""
-    try:
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-        if rows.count() > 0:
-            old_first_caseid = rows.first.get_attribute("data-caseid") or ""
-    except Exception:
-        pass
+    js_result = None
 
+    # 1) método principal: a[data-page="X"]
     try:
-        result = page.evaluate(
+        js_result = page.evaluate(
             """
             (targetPage) => {
-                function clean(txt) {
-                    return (txt || '').replace(/\\s+/g, ' ').trim();
-                }
-
                 function isVisible(el) {
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
@@ -751,166 +923,314 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                            r.height > 0;
                 }
 
-                function clickableAncestor(el) {
-                    let cur = el;
-                    for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) {
-                        const tag = (cur.tagName || '').toLowerCase();
-                        const cls = (cur.className || '').toString().toLowerCase();
-                        const role = (cur.getAttribute && cur.getAttribute('role')) || '';
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
 
-                        if (
-                            tag === 'a' ||
-                            tag === 'button' ||
-                            tag === 'li' ||
-                            role === 'option' ||
-                            role === 'menuitem' ||
-                            !!cur.onclick ||
-                            cls.includes('item') ||
-                            cls.includes('option') ||
-                            cls.includes('menu')
-                        ) {
-                            return cur;
-                        }
+                const selector = `a[data-page="${targetPage}"]`;
+                const anchor = document.querySelector(selector);
+
+                if (!anchor) {
+                    return { ok: false, reason: `anchor ${selector} not found` };
+                }
+
+                const rect = anchor.getBoundingClientRect();
+                const li = anchor.closest('li');
+
+                const tries = [];
+
+                try {
+                    anchor.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    anchor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    anchor.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    anchor.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    tries.push('anchor mouse events');
+                } catch (e) {}
+
+                try {
+                    anchor.click();
+                    tries.push('anchor.click()');
+                } catch (e) {}
+
+                try {
+                    if (typeof anchor.onclick === 'function') {
+                        anchor.onclick();
+                        tries.push('anchor.onclick()');
                     }
-                    return el;
-                }
+                } catch (e) {}
 
-                const exactRe = new RegExp("^Page\\\\s+" + String(targetPage) + "\\\\s+\\\\(results", "i");
-
-                const all = Array.from(document.querySelectorAll('*')).filter(isVisible);
-
-                let textNode = null;
-                for (const el of all) {
-                    const txt = clean(el.innerText);
-                    if (exactRe.test(txt)) {
-                        textNode = el;
-                        break;
+                try {
+                    if (li) {
+                        li.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        li.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        li.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        li.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        tries.push('li mouse events');
                     }
-                }
+                } catch (e) {}
 
-                if (!textNode) {
-                    return { ok: false, reason: 'page option not found' };
-                }
-
-                const target = clickableAncestor(textNode);
-                const r = target.getBoundingClientRect();
-
-                target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                try {
+                    if (window.jQuery) {
+                        window.jQuery(anchor).trigger('click');
+                        tries.push('jquery anchor trigger click');
+                    }
+                } catch (e) {}
 
                 return {
                     ok: true,
-                    text: clean(textNode.innerText),
-                    target_tag: target.tagName,
-                    target_class: (target.className || '').toString(),
+                    text: txt(anchor),
+                    href: anchor.getAttribute('href') || '',
+                    data_page: anchor.getAttribute('data-page') || '',
+                    visible: isVisible(anchor),
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    tries
+                };
+            }
+            """,
+            int(target_page),
+        )
+
+        log.info("Dropdown page option click result for page %s: %s", target_page, js_result)
+
+        if js_result and js_result.get("ok"):
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
+    except Exception as e:
+        log.warning("click_page_option_from_dropdown JS block failed for page %s: %s", target_page, str(e))
+
+    # 2) click por coordenada do anchor encontrado
+    if js_result and js_result.get("ok"):
+        try:
+            page.mouse.click(js_result["x"], js_result["y"])
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
+        except Exception as e:
+            log.warning("XY click on dropdown option failed for page %s: %s", target_page, str(e))
+
+    # 3) locator direto playwright no a[data-page="X"]
+    try:
+        sel = f'a[data-page="{int(target_page)}"]'
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            try:
+                loc.click(timeout=5000)
+            except Exception:
+                loc.click(force=True, timeout=5000)
+
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
+    except Exception as e:
+        log.warning("Locator click on dropdown option failed for page %s: %s", target_page, str(e))
+
+    return False
+
+
+def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
+    current_before = get_active_page_number(page)
+    old_first_caseid = get_first_caseid(page)
+    old_first_row_text = get_first_row_text(page)
+
+    try:
+        result = page.evaluate(
+            """
+            (targetPage) => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           r.width > 0 &&
+                           r.height > 0;
+                }
+
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                const anchor = document.querySelector(`a[data-page="${targetPage}"]`);
+                if (!anchor) {
+                    return { ok: false, reason: 'a[data-page] not found' };
+                }
+
+                const r = anchor.getBoundingClientRect();
+
+                try { anchor.click(); } catch (e) {}
+                try {
+                    anchor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    anchor.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    anchor.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                } catch (e) {}
+
+                return {
+                    ok: true,
+                    text: txt(anchor),
+                    visible: isVisible(anchor),
                     x: r.left + r.width / 2,
                     y: r.top + r.height / 2
                 };
             }
             """,
-            target_page,
+            int(target_page),
         )
 
-        log.info("Dropdown page option click result for page %s: %s", target_page, result)
+        log.info("Direct hidden/visible page option result for page %s: %s", target_page, result)
 
-        if not result or not result.get("ok"):
-            return False
+        if result and result.get("ok"):
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
-
-        page.wait_for_timeout(30000)
-
-        if wait_for_page_change(
-            page,
-            old_page=old_page,
-            old_first_caseid=old_first_caseid,
-            timeout_ms=45000,
-        ):
-            return True
-
-        try:
-            page.mouse.click(result["x"], result["y"])
-        except Exception:
-            return False
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
-
-        page.wait_for_timeout(30000)
-
-        if wait_for_page_change(
-            page,
-            old_page=old_page,
-            old_first_caseid=old_first_caseid,
-            timeout_ms=45000,
-        ):
-            return True
-
+            try:
+                page.mouse.click(result["x"], result["y"])
+                if wait_for_page_change(
+                    page,
+                    old_page=current_before,
+                    old_first_caseid=old_first_caseid,
+                    old_first_row_text=old_first_row_text,
+                    timeout_ms=16000,
+                ):
+                    return True
+            except Exception:
+                pass
     except Exception as e:
-        log.warning("Dropdown option click failed for page %s: %s", target_page, str(e))
+        log.warning("click_page_option_direct_without_dropdown failed for page %s: %s", target_page, str(e))
 
     return False
 
 
 def click_next_page(page) -> bool:
     current_before = get_active_page_number(page)
-    old_first_caseid = ""
-
-    try:
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-        if rows.count() > 0:
-            old_first_caseid = rows.first.get_attribute("data-caseid") or ""
-    except Exception:
-        pass
+    old_first_caseid = get_first_caseid(page)
+    old_first_row_text = get_first_row_text(page)
 
     log.info("Current Miami page before NEXT click: %s", current_before)
 
-    next_selectors = [
-        "text='›'",
-        "text='>'",
-        "text='»'",
+    selectors = [
+        "text=›",
+        "text=>",
+        "text=»",
     ]
 
-    for sel in next_selectors:
+    for sel in selectors:
         try:
-            loc = page.locator(sel)
+            loc = page.locator(sel).first
             if loc.count() == 0:
                 continue
 
-            target = loc.first
-            target.scroll_into_view_if_needed()
-            page.wait_for_timeout(300)
-
             try:
-                target.click(timeout=40000)
+                loc.click(timeout=4000)
             except Exception:
-                target.click(timeout=40000, force=True)
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(30000)
+                loc.click(force=True, timeout=4000)
 
             if wait_for_page_change(
                 page,
                 old_page=current_before,
                 old_first_caseid=old_first_caseid,
-                timeout_ms=45000,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
             ):
                 return True
-
         except Exception:
             pass
+
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' &&
+                           s.visibility !== 'hidden' &&
+                           r.width > 0 &&
+                           r.height > 0;
+                }
+
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                function cls(el) {
+                    return ((el && el.className) || '').toString().toLowerCase();
+                }
+
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td, li'));
+                const visible = all.filter(isVisible);
+
+                let best = null;
+
+                for (const el of visible) {
+                    const t = txt(el);
+                    const c = cls(el);
+                    let score = 0;
+
+                    if (t === '>' || t === '›' || t === '»') score += 200;
+                    if (c.includes('next')) score += 120;
+                    if (c.includes('right')) score += 80;
+                    if (c.includes('arrow')) score += 80;
+                    if (c.includes('chevron')) score += 80;
+
+                    if (score <= 0) continue;
+
+                    const r = el.getBoundingClientRect();
+                    const candidate = {
+                        score,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        text: t,
+                        className: c
+                    };
+
+                    if (!best || candidate.score > best.score) {
+                        best = candidate;
+                    }
+                }
+
+                return best ? { ok: true, ...best } : { ok: false, reason: 'no next candidate found' };
+            }
+            """
+        )
+
+        log.info("NEXT target detection: %s", result)
+
+        if result and result.get("ok"):
+            page.mouse.click(result["x"], result["y"])
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
+    except Exception as e:
+        log.warning("NEXT click failed: %s", str(e))
 
     log.warning("Could not click NEXT page button")
     return False
@@ -930,35 +1250,42 @@ def go_to_page_number(page, page_num: int) -> bool:
         )
         return False
 
-    while current < page_num:
-        next_page = current + 1
-        success = False
-
-        for attempt in range(1, 4):
-            log.info(
-                "Trying to navigate from page %s to page %s (attempt %s)",
-                current, next_page, attempt
-            )
-
-            if not open_pager_dropdown(page):
-                log.warning("Could not open pager dropdown on attempt %s", attempt)
-                page.wait_for_timeout(10000)
-                continue
-
-            if click_page_option_from_dropdown(page, next_page):
-                success = True
-                break
-
-            page.wait_for_timeout(10000)
-
-        if not success:
-            log.warning("Failed navigating from page %s to page %s", current, next_page)
-            return False
-
+    for attempt in range(1, 4):
         current = get_active_page_number(page)
+        if current == page_num:
+            return True
 
-    return current == page_num
-    
+        log.info("Trying to navigate from page %s to page %s (attempt %s)", current, page_num, attempt)
+
+        # Diagnóstico útil sempre que falhar
+        dump_pagination_diagnostics(page)
+
+        # 1) tentar direto no a[data-page="X"] sem abrir dropdown
+        if click_page_option_direct_without_dropdown(page, page_num):
+            page.wait_for_timeout(1200)
+            return get_active_page_number(page) == page_num or get_first_caseid(page) != ""
+
+        # 2) abrir dropdown e clicar na opção do page target
+        if open_pager_dropdown(page):
+            if click_page_option_from_dropdown(page, page_num):
+                page.wait_for_timeout(1200)
+                return True
+        else:
+            log.warning("Could not open pager dropdown on attempt %s", attempt)
+
+        # 3) fallback pelo next se target for current+1
+        current = get_active_page_number(page)
+        if page_num == current + 1:
+            if click_next_page(page):
+                page.wait_for_timeout(1200)
+                return True
+
+        page.wait_for_timeout(1000)
+
+    log.warning("Failed navigating from page %s to page %s", get_active_page_number(page), page_num)
+    return False
+
+
 # =========================
 # DETAIL PARSING
 # =========================
@@ -1209,7 +1536,7 @@ def build_properties_payload(record: dict) -> dict:
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V5 + DIRECT PAGE LINKS + BACK NAV ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V6 + DROPDOWN DATA-PAGE + DIAGNOSTICS ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1242,6 +1569,21 @@ def run_miami():
 
         log.info("Detected total Miami pages: %s", total_pages)
 
+        if PAGINATION_DIAGNOSTIC_MODE:
+            diag = dump_pagination_diagnostics(page)
+            payload = {
+                "source": "MiamiDade",
+                "mode": "pagination_diagnostic_only",
+                "total_pages_detected": total_pages,
+                "page_summary": summary,
+                "diagnostic": diag,
+            }
+            log.info("===== PAGINATION DIAGNOSTIC PAYLOAD =====")
+            log.info(json.dumps(payload, indent=2))
+            print(json.dumps(payload, indent=2))
+            browser.close()
+            return
+
         results = []
         failures = []
         supabase_results = []
@@ -1251,11 +1593,11 @@ def run_miami():
             if total_processed >= MAX_LOTS:
                 break
 
-            current_page = get_active_page_number(page)
-            if current_page != page_num:
+            if page_num > 1:
                 ok = go_to_page_number(page, page_num)
                 if not ok:
                     log.warning("Could not navigate to page %s", page_num)
+                    dump_pagination_diagnostics(page)
                     break
 
             rows = collect_case_rows(page)
@@ -1265,11 +1607,12 @@ def run_miami():
 
             log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
 
-            page_caseids = [r.get("caseid") for r in rows if r.get("caseid")]
-
-            for row_index, caseid in enumerate(page_caseids):
+            for row in rows:
                 if total_processed >= MAX_LOTS:
                     break
+
+                caseid = row.get("caseid")
+                row_index = row.get("index")
 
                 total_processed += 1
                 log.info(
@@ -1282,6 +1625,11 @@ def run_miami():
                 )
 
                 try:
+                    if page_num > 1:
+                        ok = go_to_page_number(page, page_num)
+                        if not ok:
+                            raise RuntimeError(f"Could not re-open page {page_num} for caseid={caseid}")
+
                     base_case = open_case_by_caseid(page, caseid)
                     case_detail = extract_case_detail(page, base_case)
 
@@ -1297,6 +1645,12 @@ def run_miami():
 
                     log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
 
+                    open_list_and_apply_filter(page)
+                    if page_num > 1:
+                        ok = go_to_page_number(page, page_num)
+                        if not ok:
+                            raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
+
                 except Exception as e:
                     log.exception("FAILED CASE caseid=%s: %s", caseid, e)
                     failures.append({
@@ -1306,28 +1660,16 @@ def run_miami():
                         "error": str(e),
                     })
 
-                finally:
-                    if total_processed < MAX_LOTS:
-                        ok_back = return_to_results(page)
-                        if not ok_back:
-                            raise RuntimeError(f"Could not return to results after caseid={caseid}")
-
-                        current_after_back = get_active_page_number(page)
-                        if current_after_back != page_num:
-                            log.warning(
-                                "Returned to wrong page after case %s. Expected=%s got=%s. Re-navigating...",
-                                caseid, page_num, current_after_back
-                            )
-                            ok = go_to_page_number(page, page_num)
-                            if not ok:
-                                raise RuntimeError(f"Could not restore page {page_num} after caseid={caseid}")
-
-            if total_processed >= MAX_LOTS:
-                break
+                    try:
+                        open_list_and_apply_filter(page)
+                        if page_num > 1:
+                            go_to_page_number(page, page_num)
+                    except Exception:
+                        pass
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v5_direct_page_links_back_nav",
+            "mode": "final_operational_v6_dropdown_data_page_diagnostics",
             "total_pages_detected": total_pages,
             "rows_detected": len(results) + len(failures),
             "records_count": len(results),
