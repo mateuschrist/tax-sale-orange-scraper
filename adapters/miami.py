@@ -15,7 +15,7 @@ LIST_URL = f"{BASE_URL}/public/cases/list"
 AUCTION_URL = "https://www.miamidade.realforeclose.com/index.cfm"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
+## MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
 
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
