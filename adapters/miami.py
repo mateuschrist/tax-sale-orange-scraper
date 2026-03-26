@@ -1468,10 +1468,172 @@ def build_properties_payload(record: dict) -> dict:
         "state_address": state_address,
         "zip": zip_code,
     }
+def parse_total_items(page) -> int:
+    try:
+        total = page.evaluate(
+            """
+            () => {
+                const body = document.body.innerText || '';
 
+                const patterns = [
+                    /Cases List\\s*»\\s*(\\d+)\\s*Cases/i,
+                    /(\\d+)\\s*Cases/i
+                ];
+
+                for (const rx of patterns) {
+                    const m = body.match(rx);
+                    if (m) return parseInt(m[1], 10);
+                }
+
+                return 0;
+            }
+            """
+        )
+        return int(total or 0)
+    except Exception as e:
+        log.warning("parse_total_items failed: %s", str(e))
+        return 0
+
+
+def supabase_list_all_nodes() -> List[str]:
+    if not CAN_CHECK_SUPABASE:
+        return []
+
+    nodes = []
+    offset = 0
+    page_size = 1000
+
+    try:
+        while True:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/properties"
+                f"?county=eq.Miami-Dade"
+                f"&select=node"
+                f"&offset={offset}"
+                f"&limit={page_size}"
+            )
+
+            r = requests.get(url, headers=sb_headers(), timeout=60)
+
+            if r.status_code != 200:
+                log.warning(
+                    "supabase_list_all_nodes non-200 status=%s body=%s",
+                    r.status_code,
+                    r.text[:500],
+                )
+                break
+
+            arr = r.json() or []
+            if not arr:
+                break
+
+            for item in arr:
+                node = str(item.get("node") or "").strip()
+                if node:
+                    nodes.append(node)
+
+            if len(arr) < page_size:
+                break
+
+            offset += page_size
+
+    except Exception as e:
+        log.warning("supabase_list_all_nodes failed: %s", str(e))
+
+    return nodes
+
+
+def supabase_delete_nodes(nodes: List[str]) -> Dict:
+    if not CAN_CHECK_SUPABASE:
+        return {
+            "executed": False,
+            "deleted_count": 0,
+            "reason": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
+        }
+
+    nodes = [str(x).strip() for x in nodes if str(x).strip()]
+    if not nodes:
+        return {
+            "executed": True,
+            "deleted_count": 0,
+            "reason": "no nodes to delete",
+        }
+
+    deleted_count = 0
+    errors = []
+
+    # delete em lotes menores para evitar URL gigante
+    batch_size = 100
+
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i:i + batch_size]
+
+        try:
+            in_clause = ",".join(f'"{quote(node, safe="")}"' for node in batch)
+
+            url = (
+                f"{SUPABASE_URL}/rest/v1/properties"
+                f"?county=eq.Miami-Dade"
+                f"&node=in.({in_clause})"
+            )
+
+            r = requests.delete(url, headers=sb_headers(), timeout=60)
+
+            if r.status_code in (200, 204):
+                deleted_count += len(batch)
+                log.info("SUPABASE DELETE batch ok count=%s", len(batch))
+            else:
+                msg = f"status={r.status_code} body={r.text[:500]}"
+                errors.append(msg)
+                log.warning("SUPABASE DELETE batch failed: %s", msg)
+
+        except Exception as e:
+            msg = str(e)
+            errors.append(msg)
+            log.warning("SUPABASE DELETE batch exception: %s", msg)
+
+    return {
+        "executed": True,
+        "deleted_count": deleted_count,
+        "requested_delete_count": len(nodes),
+        "errors": errors,
+    }
+
+
+def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
+    try:
+        existing_nodes = set(supabase_list_all_nodes())
+        site_nodes = {str(x).strip() for x in seen_nodes_this_run if str(x).strip()}
+
+        to_delete = sorted(existing_nodes - site_nodes)
+
+        log.info(
+            "RECONCILE MIAMI: supabase=%s site=%s delete=%s",
+            len(existing_nodes),
+            len(site_nodes),
+            len(to_delete),
+        )
+
+        delete_result = supabase_delete_nodes(to_delete)
+
+        return {
+            "executed": True,
+            "supabase_nodes_count": len(existing_nodes),
+            "site_nodes_count": len(site_nodes),
+            "delete_candidates_count": len(to_delete),
+            "delete_candidates_sample": to_delete[:50],
+            "delete_result": delete_result,
+        }
+
+    except Exception as e:
+        log.exception("reconcile_supabase_to_site failed: %s", str(e))
+        return {
+            "executed": False,
+            "reason": str(e),
+        }
 
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V6 + FAST LIST PRECHECK ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V6 + SAFE DELETE RECONCILE ===")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1499,21 +1661,31 @@ def run_miami():
 
         open_list_and_apply_filter(page)
 
-        total_pages = parse_total_pages(page)
+        expected_total_pages = parse_total_pages(page)
+        expected_total_items = parse_total_items(page)
         summary = get_results_summary(page)
 
-        log.info("Detected total Miami pages: %s", total_pages)
+        log.info("Detected total Miami pages: %s", expected_total_pages)
+        log.info("Detected total Miami items: %s", expected_total_items)
 
         results = []
         failures = []
         supabase_results = []
-        fast_updates = []
-        skipped_rows = []
 
-        total_rows_seen = 0
-        total_detail_processed = 0
+        total_processed = 0
+        processed_pages = 0
+        completed_all_pages = False
+        can_delete_missing = False
+        seen_nodes_this_run = set()
 
-        for page_num in range(1, total_pages + 1):
+        for page_num in range(1, expected_total_pages + 1):
+            if total_processed >= MAX_LOTS:
+                log.warning(
+                    "MAX_LOTS limit reached (%s). Safe delete will be blocked.",
+                    MAX_LOTS,
+                )
+                break
+
             if page_num > 1:
                 ok = go_to_page_number(page, page_num)
                 if not ok:
@@ -1523,70 +1695,92 @@ def run_miami():
             rows = collect_case_rows(page)
             if not rows:
                 log.warning("No rows found on page %s", page_num)
-                continue
+                break
 
-            log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
+            processed_pages += 1
+            log.info(
+                "Processing all %s rows from page %s before moving forward",
+                len(rows),
+                page_num,
+            )
+
+            # registra todos os nodes vistos nesta página
+            for row in rows:
+                caseid = str(row.get("caseid") or "").strip()
+                if caseid:
+                    seen_nodes_this_run.add(caseid)
 
             for row in rows:
-                caseid = row.get("caseid")
-                row_index = row.get("index")
-                row_text = row.get("row_text", "")
+                if total_processed >= MAX_LOTS:
+                    break
 
-                total_rows_seen += 1
+                caseid = str(row.get("caseid") or "").strip()
+                row_index = row.get("index")
+
+                total_processed += 1
+                log.info(
+                    "[%s/%s] Scraping caseid=%s page=%s row=%s ...",
+                    total_processed,
+                    MAX_LOTS,
+                    caseid,
+                    page_num,
+                    row_index,
+                )
 
                 try:
-                    decision = decide_list_action(row)
+                    # =========================================================
+                    # FAST PRECHECK FROM LIST ROW
+                    # =========================================================
+                    row_parsed = parse_row_text(row.get("row_text", ""))
 
-                    log.info(
-                        "LIST PRECHECK caseid=%s page=%s row=%s action=%s reason=%s",
-                        caseid,
-                        page_num,
-                        row_index,
-                        decision["action"],
-                        decision["reason"],
-                    )
+                    precheck_tax_sale_id = clean_text(row_parsed.get("case_number", ""))
+                    precheck_parcel_number = clean_text(row_parsed.get("parcel_number", ""))
+                    precheck_sale_date = clean_text(row_parsed.get("sale_date", ""))
 
-                    if decision["action"] == "skip":
-                        skipped_rows.append({
-                            "caseid": caseid,
-                            "page_num": page_num,
-                            "row_index": row_index,
-                            "row_text": row_text,
-                            "reason": decision["reason"],
-                            "tax_sale_id": decision.get("tax_sale_id"),
-                            "parcel_number": decision.get("parcel_number"),
-                            "site_sale_date": decision.get("site_sale_date"),
-                        })
+                    fast_skip = False
+
+                    existing_case = supabase_find_existing_case(caseid)
+
+                    if existing_case:
+                        existing_tax_sale_id = clean_text(existing_case.get("tax_sale_id", "") or existing_case.get("case_number", ""))
+                        existing_parcel_number = clean_text(existing_case.get("parcel_number", ""))
+                        existing_sale_date = clean_text(existing_case.get("sale_date", ""))
+
+                        same_identity = (
+                            existing_parcel_number == precheck_parcel_number
+                            and (
+                                not existing_tax_sale_id
+                                or existing_tax_sale_id == precheck_tax_sale_id
+                            )
+                        )
+
+                        if same_identity:
+                            # caso 1: ambos null / not assigned / vazio
+                            if (
+                                (not existing_sale_date or existing_sale_date.lower() == "not assigned")
+                                and (not precheck_sale_date or precheck_sale_date.lower() == "not assigned")
+                            ):
+                                log.info(
+                                    "FAST SKIP node=%s reason=same identity and both sale_date empty/not assigned",
+                                    caseid,
+                                )
+                                fast_skip = True
+
+                            # caso 2: datas iguais
+                            elif existing_sale_date == precheck_sale_date:
+                                log.info(
+                                    "FAST SKIP node=%s reason=same identity and same sale_date=%s",
+                                    caseid,
+                                    precheck_sale_date,
+                                )
+                                fast_skip = True
+
+                    if fast_skip:
                         continue
 
-                    if decision["action"] == "update_sale_date_only":
-                        existing = decision.get("existing") or {}
-                        record_id = existing.get("id")
-                        site_sale_date = decision.get("site_sale_date")
-
-                        update_result = supabase_update_sale_date(record_id, site_sale_date)
-
-                        fast_updates.append({
-                            "caseid": caseid,
-                            "page_num": page_num,
-                            "row_index": row_index,
-                            "tax_sale_id": decision.get("tax_sale_id"),
-                            "parcel_number": decision.get("parcel_number"),
-                            "sale_date": site_sale_date,
-                            "update_result": update_result,
-                        })
-
-                        continue
-
-                    total_detail_processed += 1
-                    log.info(
-                        "[detail %s] Scraping caseid=%s page=%s row=%s ...",
-                        total_detail_processed,
-                        caseid,
-                        page_num,
-                        row_index,
-                    )
-
+                    # =========================================================
+                    # FULL OPEN ONLY WHEN NEEDED
+                    # =========================================================
                     if page_num > 1:
                         ok = go_to_page_number(page, page_num)
                         if not ok:
@@ -1605,7 +1799,7 @@ def run_miami():
 
                     send_to_app(prop_payload)
 
-                    log.info("SUCCESS DETAIL CASE node=%s", prop_payload.get("node"))
+                    log.info("SUCCESS CASE %s: node=%s", total_processed, prop_payload.get("node"))
 
                     open_list_and_apply_filter(page)
                     if page_num > 1:
@@ -1619,7 +1813,6 @@ def run_miami():
                         "caseid": caseid,
                         "page_num": page_num,
                         "row_index": row_index,
-                        "row_text": row_text,
                         "error": str(e),
                     })
 
@@ -1630,19 +1823,50 @@ def run_miami():
                     except Exception:
                         pass
 
+        completed_all_pages = (
+            expected_total_pages > 0 and processed_pages == expected_total_pages
+        )
+
+        can_delete_missing = (
+            completed_all_pages
+            and expected_total_items > 0
+            and len(seen_nodes_this_run) == expected_total_items
+            and failures == []
+            and total_processed >= expected_total_items
+        )
+
+        if can_delete_missing:
+            reconcile_result = reconcile_supabase_to_site(seen_nodes_this_run)
+        else:
+            reconcile_result = {
+                "executed": False,
+                "reason": (
+                    f"safe delete blocked: "
+                    f"completed_all_pages={completed_all_pages}, "
+                    f"processed_pages={processed_pages}, "
+                    f"expected_total_pages={expected_total_pages}, "
+                    f"seen_nodes={len(seen_nodes_this_run)}, "
+                    f"expected_total_items={expected_total_items}, "
+                    f"failures_count={len(failures)}, "
+                    f"total_processed={total_processed}, "
+                    f"MAX_LOTS={MAX_LOTS}"
+                ),
+            }
+
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v6_fast_list_precheck",
-            "total_pages_detected": total_pages,
-            "rows_detected": total_rows_seen,
-            "detail_records_count": len(results),
-            "detail_processed_count": total_detail_processed,
-            "fast_updates_count": len(fast_updates),
-            "skipped_rows_count": len(skipped_rows),
+            "mode": "final_operational_v6_safe_delete_reconcile",
+            "expected_total_pages": expected_total_pages,
+            "expected_total_items": expected_total_items,
+            "processed_pages": processed_pages,
+            "seen_nodes_count": len(seen_nodes_this_run),
+            "completed_all_pages": completed_all_pages,
+            "can_delete_missing": can_delete_missing,
+            "rows_detected": len(results) + len(failures),
+            "records_count": len(results),
             "failures_count": len(failures),
             "supabase_results": supabase_results,
-            "fast_updates": fast_updates,
-            "skipped_rows": skipped_rows,
+            "reconcile_result": reconcile_result,
             "page_summary": summary,
             "records": results,
             "failures": failures,
