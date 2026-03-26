@@ -5,7 +5,7 @@ import time
 import random
 import logging
 from io import BytesIO
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 
 import requests
 import pdfplumber
@@ -22,38 +22,29 @@ LOGIN_URL = f"{BASE_URL}/recorder/web/login.jsp"
 SEARCH_URL = f"{BASE_URL}/recorder/tdsmweb/applicationSearch.jsp"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-MAX_LOTS = int(os.getenv("MAX_LOTS", "100"))
+MAX_LOTS = int(os.getenv("MAX_LOTS", "1000"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
-# Restart browser every N lots (hard reset session)
 RESTART_BROWSER_EVERY = int(os.getenv("RESTART_BROWSER_EVERY", "20"))
 
-# Anti-bot
 MAX_VIEWER_RETRIES = int(os.getenv("MAX_VIEWER_RETRIES", "3"))
 MAX_WAIT = 60_000
 
-# OCR
 OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "3"))
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
 
-# Address filter (skip street-only)
 SKIP_IF_ADDRESS_NOT_NUMBERED = os.getenv("SKIP_IF_ADDRESS_NOT_NUMBERED", "true").lower() == "true"
+START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "false").lower() == "true"
 
-# State behavior
-START_AFTER_LAST_NODE = os.getenv("START_AFTER_LAST_NODE", "true").lower() == "true"
-
-# Supabase state via REST (optional)
 SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
 STATE_KEY = (os.getenv("STATE_KEY", "orange_taxdeed") or "orange_taxdeed").strip()
 USE_STATE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
-# App/API ingest (Vercel) - IMPORTANT: base must be Vercel domain, no /api at end
 APP_API_BASE = (os.getenv("APP_API_BASE", "") or "").strip().rstrip("/")
 APP_API_TOKEN = (os.getenv("APP_API_TOKEN", "") or "").strip()
 SEND_TO_APP = bool(APP_API_BASE and APP_API_TOKEN)
 
-# Optional: set tesseract executable explicitly if PATH issues
 TESSERACT_CMD = (os.getenv("TESSERACT_CMD", "") or "").strip()
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
@@ -63,8 +54,65 @@ log = logging.getLogger("taxdeed-orange-scraper")
 
 
 # =========================
-# PLAYWRIGHT HELPERS
+# HELPERS
 # =========================
+def norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def normalize_money_to_float(value):
+    if value in (None, ""):
+        return None
+    raw = re.sub(r"[^\d.]", "", str(value))
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def normalize_bid_for_payload(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
+    return cleaned if cleaned else None
+
+
+def normalize_sale_date_value(value: str | None) -> str | None:
+    v = clean_text(value or "")
+    if not v:
+        return None
+    if v.lower() in ("null", "none", "n/a", "na", "not assigned"):
+        return None
+    return v
+
+
+def must_be_pdf(headers: dict) -> bool:
+    ct = (headers.get("content-type") or "").lower()
+    return "application/pdf" in ct or ct.endswith("/pdf")
+
+
+def is_check_human(url: str) -> bool:
+    return "/recorder/web/checkHuman.jsp" in (url or "")
+
+
+def human_backoff(idx: int, attempt: int):
+    base = min(5 + idx * 0.15 + attempt * 2.0, 22)
+    sleep_s = base + random.uniform(0.6, 3.0)
+    log.warning("Backoff %.1fs (idx=%d attempt=%d)", sleep_s, idx, attempt)
+    time.sleep(sleep_s)
+
+
 def wait_network(page, timeout=20_000):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
@@ -85,39 +133,7 @@ def click_any(page, selectors: list[str], label: str) -> bool:
     return False
 
 
-def norm_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
-def must_be_pdf(headers: dict) -> bool:
-    ct = (headers.get("content-type") or "").lower()
-    return "application/pdf" in ct or ct.endswith("/pdf")
-
-
-def is_check_human(url: str) -> bool:
-    return "/recorder/web/checkHuman.jsp" in (url or "")
-
-
-def human_backoff(idx: int, attempt: int):
-    # pausa crescente + aleatória
-    base = min(5 + idx * 0.15 + attempt * 2.0, 22)
-    sleep_s = base + random.uniform(0.6, 3.0)
-    log.warning("Backoff %.1fs (idx=%d attempt=%d)", sleep_s, idx, attempt)
-    time.sleep(sleep_s)
-
-
-# =========================
-# ADDRESS FILTER
-# =========================
 def is_numbered_street_address(addr: str | None) -> bool:
-    """
-    True only if address begins with a house number, e.g.:
-      "109 E Church St"
-      "407 Dill Rd"
-    False for street-only:
-      "Dill Rd"
-      "Forest City Rd"
-    """
     if not addr:
         return False
     a = addr.strip()
@@ -125,11 +141,11 @@ def is_numbered_street_address(addr: str | None) -> bool:
 
 
 # =========================
-# SUPABASE STATE (optional)
+# SUPABASE
 # =========================
-def _sb_headers():
+def sb_headers():
     if not USE_STATE:
-        raise RuntimeError("Supabase state disabled.")
+        raise RuntimeError("Supabase not configured")
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -138,40 +154,41 @@ def _sb_headers():
     }
 
 
-def _sb_get(url: str):
-    return requests.get(url, headers=_sb_headers(), timeout=30)
+def sb_get(url: str, timeout=30):
+    return requests.get(url, headers=sb_headers(), timeout=timeout)
 
 
-def _sb_post(url: str, payload: dict):
-    return requests.post(url, headers=_sb_headers(), json=payload, timeout=30)
+def sb_post(url: str, payload: dict, timeout=30):
+    return requests.post(url, headers=sb_headers(), json=payload, timeout=timeout)
 
 
-def _sb_patch(url: str, payload: dict):
-    return requests.patch(url, headers=_sb_headers(), json=payload, timeout=30)
+def sb_patch(url: str, payload: dict, timeout=30):
+    return requests.patch(url, headers=sb_headers(), json=payload, timeout=timeout)
+
+
+def sb_delete(url: str, timeout=30):
+    return requests.delete(url, headers=sb_headers(), timeout=timeout)
 
 
 def get_state_last_node() -> str | None:
     if not USE_STATE:
         return None
 
-    # schema A: scraper_name
     url_a = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}&select=last_node"
-    r = _sb_get(url_a)
+    r = sb_get(url_a)
     if r.status_code == 200:
         arr = r.json()
-        if not arr:
-            return None
-        return arr[0].get("last_node")
+        if arr:
+            return arr[0].get("last_node")
 
-    # schema B: id
     url_b = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}&select=last_node"
-    r2 = _sb_get(url_b)
-    if r2.status_code != 200:
-        raise RuntimeError(f"GET scraper_state failed: {r2.status_code} {r2.text[:200]}")
-    arr = r2.json()
-    if not arr:
-        return None
-    return arr[0].get("last_node")
+    r2 = sb_get(url_b)
+    if r2.status_code == 200:
+        arr = r2.json()
+        if arr:
+            return arr[0].get("last_node")
+
+    return None
 
 
 def set_state_last_node(last_node: str | None) -> None:
@@ -179,48 +196,290 @@ def set_state_last_node(last_node: str | None) -> None:
         return
 
     url = f"{SUPABASE_URL}/rest/v1/scraper_state"
-    payload_a = {"scraper_name": STATE_KEY, "last_node": last_node}
 
-    r = _sb_post(url, payload_a)
+    payload_a = {"scraper_name": STATE_KEY, "last_node": last_node}
+    r = sb_post(url, payload_a)
     if r.status_code in (200, 201, 204):
         return
 
-    # fallback patch schema A
-    url_pa = f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}"
-    rpa = _sb_patch(url_pa, {"last_node": last_node})
-    if rpa.status_code in (200, 204):
+    r = sb_patch(f"{SUPABASE_URL}/rest/v1/scraper_state?scraper_name=eq.{STATE_KEY}", {"last_node": last_node})
+    if r.status_code in (200, 204):
         return
 
-    # schema B
     payload_b = {"id": STATE_KEY, "last_node": last_node}
-    r2 = _sb_post(url, payload_b)
-    if r2.status_code in (200, 201, 204):
+    r = sb_post(url, payload_b)
+    if r.status_code in (200, 201, 204):
         return
 
-    url_pb = f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}"
-    rpb = _sb_patch(url_pb, {"last_node": last_node})
-    if rpb.status_code not in (200, 204):
-        raise RuntimeError(
-            f"SET scraper_state failed: POST {r.status_code} {r.text[:200]} / "
-            f"PATCHA {rpa.status_code} {rpa.text[:200]} / "
-            f"POSTB {r2.status_code} {r2.text[:200]} / "
-            f"PATCHB {rpb.status_code} {rpb.text[:200]}"
+    r = sb_patch(f"{SUPABASE_URL}/rest/v1/scraper_state?id=eq.{STATE_KEY}", {"last_node": last_node})
+    if r.status_code in (200, 204):
+        return
+
+    raise RuntimeError("Could not update scraper_state")
+
+
+def load_orange_index_from_supabase() -> dict:
+    """
+    Carrega tudo do Orange uma vez e monta índice em memória:
+    key = (tax_sale_id, parcel_number)
+    """
+    if not USE_STATE:
+        return {}
+
+    index = {}
+    offset = 0
+    page_size = 1000
+
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.Orange"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,pdf_url,address,city,state_address,zip,opening_bid,deed_status,applicant_name,auction_source_url"
+            f"&offset={offset}"
+            f"&limit={page_size}"
         )
 
+        r = sb_get(url, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"load_orange_index_from_supabase failed: {r.status_code} {r.text[:300]}")
+
+        rows = r.json() or []
+        if not rows:
+            break
+
+        for item in rows:
+            key = (
+                clean_text(item.get("tax_sale_id")),
+                clean_text(item.get("parcel_number")),
+            )
+            if key[0] and key[1]:
+                index[key] = item
+
+        if len(rows) < page_size:
+            break
+
+        offset += page_size
+
+    log.info("Loaded Orange index from Supabase: %s records", len(index))
+    return index
+
+
+def update_sale_date_only(record_id: str, sale_date: str | None) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    payload = {"sale_date": normalize_sale_date_value(sale_date)}
+
+    try:
+        r = sb_patch(url, payload, timeout=20)
+        ok = r.status_code in (200, 204)
+        if ok:
+            log.info("SUPABASE sale_date-only update OK id=%s sale_date=%s", record_id, payload["sale_date"])
+        else:
+            log.warning("SUPABASE sale_date-only update failed id=%s status=%s body=%s", record_id, r.status_code, r.text[:300])
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "response_text": r.text[:500],
+        }
+    except Exception as e:
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": str(e),
+        }
+
+
+def payload_quality_score(payload: dict) -> int:
+    fields = [
+        "node",
+        "parcel_number",
+        "sale_date",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "opening_bid",
+        "deed_status",
+    ]
+    return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
+
+
+def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
+    new_score = payload_quality_score(payload)
+    old_score = payload_quality_score(existing)
+
+    if new_score > old_score:
+        return True
+
+    important_fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+    ]
+
+    for f in important_fields:
+        old_val = clean_text(existing.get(f))
+        new_val = clean_text(payload.get(f))
+        if not old_val and new_val:
+            return True
+
+    return False
+
+
+def supabase_upsert_property(payload: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/properties"
+
+    try:
+        r = sb_post(url, payload, timeout=30)
+        ok = r.status_code in (200, 201)
+        if ok:
+            log.info("SUPABASE UPSERT OK node=%s", payload.get("node"))
+        else:
+            log.warning("SUPABASE UPSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:500])
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "response_text": r.text[:1000],
+        }
+    except Exception as e:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "response_text": str(e),
+        }
+
+
+def list_all_orange_nodes_from_supabase() -> list[str]:
+    if not USE_STATE:
+        return []
+
+    nodes = []
+    offset = 0
+    page_size = 1000
+
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.Orange"
+            f"&select=node"
+            f"&offset={offset}"
+            f"&limit={page_size}"
+        )
+
+        r = sb_get(url, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"list_all_orange_nodes_from_supabase failed: {r.status_code} {r.text[:300]}")
+
+        rows = r.json() or []
+        if not rows:
+            break
+
+        for item in rows:
+            node = clean_text(item.get("node"))
+            if node:
+                nodes.append(node)
+
+        if len(rows) < page_size:
+            break
+
+        offset += page_size
+
+    return nodes
+
+
+def delete_nodes_from_supabase(county: str, nodes: list[str]) -> dict:
+    if not USE_STATE:
+        return {
+            "executed": False,
+            "deleted_count": 0,
+            "reason": "supabase not configured",
+        }
+
+    nodes = [clean_text(n) for n in nodes if clean_text(n)]
+    if not nodes:
+        return {
+            "executed": True,
+            "deleted_count": 0,
+            "reason": "no nodes to delete",
+        }
+
+    deleted_count = 0
+    errors = []
+    batch_size = 100
+
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i:i + batch_size]
+        encoded = ",".join(f'"{quote(node, safe="")}"' for node in batch)
+
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.{quote(county, safe='')}"
+            f"&node=in.({encoded})"
+        )
+
+        try:
+            r = sb_delete(url, timeout=60)
+            if r.status_code in (200, 204):
+                deleted_count += len(batch)
+                log.info("Deleted %s stale nodes from Supabase", len(batch))
+            else:
+                errors.append(f"status={r.status_code} body={r.text[:400]}")
+        except Exception as e:
+            errors.append(str(e))
+
+    return {
+        "executed": True,
+        "requested_delete_count": len(nodes),
+        "deleted_count": deleted_count,
+        "errors": errors,
+    }
+
+
+def reconcile_supabase_to_site(site_nodes_seen: set[str]) -> dict:
+    try:
+        existing_nodes = set(list_all_orange_nodes_from_supabase())
+        site_nodes = {clean_text(x) for x in site_nodes_seen if clean_text(x)}
+
+        to_delete = sorted(existing_nodes - site_nodes)
+
+        log.info(
+            "RECONCILE ORANGE: supabase=%s site=%s delete_candidates=%s",
+            len(existing_nodes),
+            len(site_nodes),
+            len(to_delete),
+        )
+
+        delete_result = delete_nodes_from_supabase("Orange", to_delete)
+
+        return {
+            "executed": True,
+            "supabase_nodes_count": len(existing_nodes),
+            "site_nodes_count": len(site_nodes),
+            "delete_candidates_count": len(to_delete),
+            "delete_candidates_sample": to_delete[:50],
+            "delete_result": delete_result,
+        }
+    except Exception as e:
+        log.exception("reconcile_supabase_to_site failed: %s", str(e))
+        return {
+            "executed": False,
+            "reason": str(e),
+        }
+
 
 # =========================
-# APP INGEST (Vercel)
+# APP INGEST
 # =========================
-def normalize_bid_for_payload(v):
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
-    return cleaned if cleaned else None
-
-
 def post_to_app(payload: dict) -> dict | None:
     if not SEND_TO_APP:
         log.info("SEND_TO_APP=False → skipping ingest")
@@ -275,12 +534,12 @@ def parse_fields_from_row_text(row_text: str) -> dict:
     applicant = pick(r"Applicant Name:\s*(.+?)(?:\s+Status:|$)")
 
     return {
-        "tax_sale_id": tax_sale_id,
-        "sale_date": sale_date,
-        "deed_status": status,
-        "parcel_number": parcel,
-        "opening_bid": min_bid,
-        "applicant_name": applicant,
+        "tax_sale_id": clean_text(tax_sale_id),
+        "sale_date": normalize_sale_date_value(sale_date),
+        "deed_status": clean_text(status),
+        "parcel_number": clean_text(parcel),
+        "opening_bid": clean_text(min_bid),
+        "applicant_name": clean_text(applicant),
     }
 
 
@@ -305,10 +564,13 @@ def extract_lots_from_printable(page) -> list[dict]:
         except Exception:
             row_text = ""
 
+        fields = parse_fields_from_row_text(norm_ws(row_text))
+
         lots.append({
-            "node": node,
+            "node": clean_text(node),
             "tax_sale_url": full,
             "row_text": norm_ws(row_text),
+            "list_fields": fields,
         })
 
     return [l for l in lots if l.get("node")]
@@ -387,7 +649,6 @@ def parse_best_address_from_text(text: str) -> dict:
             "snippet": after[:700],
         }
 
-    # fallback: first match anywhere
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
@@ -408,14 +669,103 @@ def parse_best_address_from_text(text: str) -> dict:
 
 
 # =========================
-# BOOTSTRAP (fresh session)
+# PAYLOAD / DECISION
+# =========================
+def build_payload_from_detail(
+    node: str,
+    viewer_url: str,
+    pdf_url: str,
+    list_fields: dict,
+    addr: dict,
+) -> dict:
+    notes = None
+    if not addr.get("marker_found"):
+        notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
+
+    return {
+        "county": "Orange",
+        "state": "FL",
+        "node": node,
+        "auction_source_url": viewer_url,
+        "tax_sale_id": list_fields.get("tax_sale_id") or None,
+        "parcel_number": list_fields.get("parcel_number") or None,
+        "sale_date": normalize_sale_date_value(list_fields.get("sale_date")),
+        "opening_bid": normalize_bid_for_payload(list_fields.get("opening_bid")),
+        "deed_status": list_fields.get("deed_status") or None,
+        "applicant_name": list_fields.get("applicant_name") or None,
+        "pdf_url": pdf_url,
+        "address": addr.get("address"),
+        "city": addr.get("city"),
+        "state_address": addr.get("state"),
+        "zip": addr.get("zip"),
+        "address_source_marker": addr.get("marker_used"),
+        "status": "new",
+        "notes": notes,
+    }
+
+
+def record_needs_enrichment(existing: dict) -> bool:
+    important_fields = [
+        "pdf_url",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+        "auction_source_url",
+    ]
+    return any(not clean_text(existing.get(f)) for f in important_fields)
+
+
+def decide_list_action(list_fields: dict, existing: dict | None) -> dict:
+    site_sale_date = normalize_sale_date_value(list_fields.get("sale_date"))
+    tax_sale_id = clean_text(list_fields.get("tax_sale_id"))
+    parcel_number = clean_text(list_fields.get("parcel_number"))
+
+    if not existing:
+        return {
+            "action": "open_detail_and_upsert",
+            "reason": "record not found",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
+
+    if record_needs_enrichment(existing):
+        return {
+            "action": "open_detail_and_upsert",
+            "reason": "record exists but needs enrichment",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    if db_sale_date == site_sale_date:
+        return {
+            "action": "skip",
+            "reason": "sale_date unchanged and record already enriched",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    return {
+        "action": "update_sale_date_only",
+        "reason": f"sale_date changed from {db_sale_date} to {site_sale_date}",
+        "tax_sale_id": tax_sale_id,
+        "parcel_number": parcel_number,
+        "site_sale_date": site_sale_date,
+    }
+
+
+# =========================
+# BOOTSTRAP
 # =========================
 def bootstrap_to_printable(p, headless: bool):
-    """
-    Opens a brand new browser+context+page and navigates:
-    login -> acknowledge -> search -> printable
-    Returns: (browser, context, page, printable_url)
-    """
     browser = p.chromium.launch(headless=headless)
     context = browser.new_context()
     page = context.new_page()
@@ -491,7 +841,7 @@ def safe_close(browser=None, context=None, page=None):
 
 
 # =========================
-# VIEWER OPEN WITH RETRY
+# VIEWER
 # =========================
 def open_viewer_with_retry(page, printable_url: str, tax_sale_url: str, idx: int) -> str:
     viewer_url = ""
@@ -507,7 +857,6 @@ def open_viewer_with_retry(page, printable_url: str, tax_sale_url: str, idx: int
         log.warning("Hit checkHuman.jsp (attempt %d/%d).", attempt, MAX_VIEWER_RETRIES)
         human_backoff(idx, attempt)
 
-        # reset by returning to printable
         page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
         wait_network(page, 30_000)
 
@@ -523,29 +872,36 @@ def run():
     log.info("MAX_LOTS=%s RESTART_BROWSER_EVERY=%s HEADLESS=%s", MAX_LOTS, RESTART_BROWSER_EVERY, HEADLESS)
     log.info("OCR_MAX_PAGES=%s OCR_SCALE=%s", OCR_MAX_PAGES, OCR_SCALE)
 
-    # State
     last_node = None
     if USE_STATE:
         try:
             last_node = get_state_last_node()
             log.info("STATE last_node=%s", last_node)
         except Exception as e:
-            log.warning("STATE read failed (continuing without state): %s", str(e))
+            log.warning("STATE read failed: %s", str(e))
+
+    supabase_index = {}
+    if USE_STATE:
+        try:
+            supabase_index = load_orange_index_from_supabase()
+        except Exception as e:
+            log.exception("Failed loading Orange index from Supabase: %s", str(e))
+            raise
 
     with sync_playwright() as p:
         browser = context = page = None
         printable_url = ""
 
-        # Start fresh
         browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
 
-        # Load lots
         lots = extract_lots_from_printable(page)
         if not lots:
             safe_close(browser, context, page)
             raise RuntimeError("No lots found on printable page.")
 
-        # Continue after last_node?
+        total_site_items = len(lots)
+        log.info("Total lots found in Orange printable: %s", total_site_items)
+
         if START_AFTER_LAST_NODE and last_node:
             pos = next((i for i, l in enumerate(lots) if l["node"] == last_node), None)
             if pos is not None:
@@ -558,34 +914,63 @@ def run():
         log.info("Selected lots count=%d", len(selected))
         log.info("First nodes: %s", [l["node"] for l in selected[:10]])
 
-        for idx, lot in enumerate(selected, start=1):
+        results = []
+        failures = []
+        supabase_results = []
+        seen_nodes_this_run = set()
 
-            # Restart browser every N lots
+        completed_all_selected = False
+        can_delete_missing = False
+
+        for idx, lot in enumerate(selected, start=1):
             if RESTART_BROWSER_EVERY > 0 and idx > 1 and (idx - 1) % RESTART_BROWSER_EVERY == 0:
-                log.warning("Restarting browser after %d lots (hard reset session)...", idx - 1)
+                log.warning("Restarting browser after %d lots...", idx - 1)
                 safe_close(browser, context, page)
                 browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
 
-            node = lot["node"]
+            node = clean_text(lot["node"])
             row_text = lot["row_text"]
             tax_sale_url = lot["tax_sale_url"]
-            fields = parse_fields_from_row_text(row_text)
+            list_fields = lot["list_fields"]
+
+            seen_nodes_this_run.add(node)
 
             log.info("----- LOT %d/%d node=%s -----", idx, len(selected), node)
             log.info("Row text: %s", row_text[:220])
 
             try:
-                # Open viewer with retry
-                viewer_url = open_viewer_with_retry(page, printable_url, tax_sale_url, idx)
-                if is_check_human(viewer_url):
-                    log.error("Blocked by checkHuman.jsp after retries. Skipping node=%s", node)
-                    # reset to printable and continue
-                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                    wait_network(page, 30_000)
-                    time.sleep(1.0)
+                key = (
+                    clean_text(list_fields.get("tax_sale_id")),
+                    clean_text(list_fields.get("parcel_number")),
+                )
+                existing = supabase_index.get(key)
+
+                action_decision = decide_list_action(list_fields, existing)
+                action = action_decision["action"]
+
+                log.info("DECISION node=%s action=%s reason=%s", node, action, action_decision["reason"])
+
+                if action == "skip":
                     continue
 
-                # Find PDF link
+                if action == "update_sale_date_only":
+                    if existing and existing.get("id"):
+                        sb_result = update_sale_date_only(existing["id"], list_fields.get("sale_date"))
+                        supabase_results.append({
+                            "node": node,
+                            "mode": "sale_date_only",
+                            **sb_result,
+                        })
+
+                        if sb_result.get("sent"):
+                            existing["sale_date"] = normalize_sale_date_value(list_fields.get("sale_date"))
+                            supabase_index[key] = existing
+                        continue
+
+                viewer_url = open_viewer_with_retry(page, printable_url, tax_sale_url, idx)
+                if is_check_human(viewer_url):
+                    raise RuntimeError(f"Blocked by checkHuman.jsp after retries for node={node}")
+
                 pdf_a = page.locator("a[href*='Property_Information.pdf']")
                 href_pdf = pdf_a.first.get_attribute("href") if pdf_a.count() else None
 
@@ -595,58 +980,36 @@ def run():
                     href_pdf = m.group(1) if m else None
 
                 if not href_pdf:
-                    log.error("PDF link not found in viewer for node=%s", node)
-                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                    wait_network(page, 30_000)
-                    time.sleep(1.0)
-                    continue
+                    raise RuntimeError(f"PDF link not found for node={node}")
 
                 pdf_url = urljoin(viewer_url, href_pdf)
                 log.info("PDF URL: %s", pdf_url)
 
-                # Download PDF
                 pdf_resp = context.request.get(pdf_url, timeout=MAX_WAIT)
                 log.info("PDF HTTP status: %s", pdf_resp.status)
                 log.info("PDF content-type: %s", pdf_resp.headers.get("content-type"))
 
                 if not pdf_resp.ok:
                     preview = (pdf_resp.text() or "")[:600]
-                    log.error("PDF download failed preview:\n%s", preview)
-                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                    wait_network(page, 30_000)
-                    time.sleep(1.0)
-                    continue
+                    raise RuntimeError(f"PDF download failed for node={node}: {preview}")
 
                 if not must_be_pdf(pdf_resp.headers):
                     preview = (pdf_resp.text() or "")[:800]
-                    log.error("Response is not PDF preview:\n%s", preview)
-                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                    wait_network(page, 30_000)
-                    time.sleep(1.0)
-                    continue
+                    raise RuntimeError(f"Response is not PDF for node={node}: {preview}")
 
                 pdf_bytes = pdf_resp.body()
                 log.info("PDF bytes: %d", len(pdf_bytes))
 
-                # Extract address
                 text = try_pdfplumber_text(pdf_bytes)
                 if text:
-                    log.info("pdfplumber text length: %d (using text parse)", len(text))
+                    log.info("pdfplumber text length: %d", len(text))
                     addr = parse_best_address_from_text(text)
                 else:
                     log.info("pdfplumber empty. OCR first %d pages...", OCR_MAX_PAGES)
-                    try:
-                        ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
-                        log.info("OCR text length: %d", len(ocr_text))
-                        addr = parse_best_address_from_text(ocr_text)
-                    except Exception as e:
-                        log.error("OCR failed: %s", str(e))
-                        addr = {
-                            "address": None, "city": None, "state": None, "zip": None,
-                            "marker_used": None, "marker_found": False, "snippet": ""
-                        }
+                    ocr_text = ocr_pdf_bytes(pdf_bytes, max_pages=OCR_MAX_PAGES, scale=OCR_SCALE)
+                    log.info("OCR text length: %d", len(ocr_text))
+                    addr = parse_best_address_from_text(ocr_text)
 
-                # Address filter
                 if SKIP_IF_ADDRESS_NOT_NUMBERED:
                     if not is_numbered_street_address(addr.get("address")):
                         log.warning("Skipping node=%s because address is not numbered: %r", node, addr.get("address"))
@@ -655,41 +1018,44 @@ def run():
                         time.sleep(1.0)
                         continue
 
-                notes = None
-                if not addr.get("marker_found"):
-                    notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
-
-                payload = {
-                    "county": "Orange",
-                    "state": "FL",
-                    "node": node,
-
-                    "auction_source_url": viewer_url,
-
-                    "tax_sale_id": fields.get("tax_sale_id") or None,
-                    "parcel_number": fields.get("parcel_number") or None,
-                    "sale_date": fields.get("sale_date") or None,
-                    "opening_bid": normalize_bid_for_payload(fields.get("opening_bid")),
-                    "deed_status": fields.get("deed_status") or None,
-                    "applicant_name": fields.get("applicant_name") or None,
-
-                    "pdf_url": pdf_url,
-                    "address": addr.get("address"),
-                    "city": addr.get("city"),
-                    "state_address": addr.get("state"),
-                    "zip": addr.get("zip"),
-                    "address_source_marker": addr.get("marker_used"),
-
-                    "status": "new",
-                    "notes": notes,
-                }
+                payload = build_payload_from_detail(
+                    node=node,
+                    viewer_url=viewer_url,
+                    pdf_url=pdf_url,
+                    list_fields=list_fields,
+                    addr=addr,
+                )
 
                 print("\n" + "=" * 100)
                 print(f"RESULT LOT {idx}")
                 print("=" * 100)
                 print(json.dumps(payload, indent=2))
 
-                # Send to app
+                sb_result = supabase_upsert_property(payload)
+                supabase_results.append({
+                    "node": node,
+                    "mode": "full_upsert",
+                    **sb_result,
+                })
+
+                if sb_result.get("sent"):
+                    supabase_index[key] = {
+                        "id": existing.get("id") if existing else None,
+                        "node": payload.get("node"),
+                        "tax_sale_id": payload.get("tax_sale_id"),
+                        "parcel_number": payload.get("parcel_number"),
+                        "sale_date": payload.get("sale_date"),
+                        "pdf_url": payload.get("pdf_url"),
+                        "address": payload.get("address"),
+                        "city": payload.get("city"),
+                        "state_address": payload.get("state_address"),
+                        "zip": payload.get("zip"),
+                        "opening_bid": payload.get("opening_bid"),
+                        "deed_status": payload.get("deed_status"),
+                        "applicant_name": payload.get("applicant_name"),
+                        "auction_source_url": payload.get("auction_source_url"),
+                    }
+
                 ingest_ok = True
                 ingest_result = None
                 if SEND_TO_APP:
@@ -699,7 +1065,6 @@ def run():
                 if ingest_result:
                     log.info("INGEST OK: %s", ingest_result)
 
-                # Update state only if ingest ok OR ingest disabled
                 if ingest_ok:
                     try:
                         set_state_last_node(node)
@@ -707,20 +1072,71 @@ def run():
                     except Exception as e:
                         log.warning("STATE write failed: %s", str(e))
 
+                results.append(payload)
+
             except Exception as e:
                 log.exception("LOT FAILED node=%s error=%s", node, str(e))
+                failures.append({
+                    "node": node,
+                    "error": str(e),
+                })
 
-            # Back to printable
             try:
                 page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
                 wait_network(page, 30_000)
             except Exception:
-                # if navigation fails, hard reset session
                 log.warning("Failed to return printable. Hard reset session.")
                 safe_close(browser, context, page)
                 browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
 
             time.sleep(1.0)
+
+        completed_all_selected = (
+            len(selected) > 0
+            and len(seen_nodes_this_run) == len(selected)
+            and len(failures) == 0
+        )
+
+        can_delete_missing = (
+            completed_all_selected
+            and len(selected) == total_site_items
+        )
+
+        if can_delete_missing:
+            reconcile_result = reconcile_supabase_to_site(seen_nodes_this_run)
+        else:
+            reconcile_result = {
+                "executed": False,
+                "reason": (
+                    f"safe delete blocked: "
+                    f"completed_all_selected={completed_all_selected}, "
+                    f"selected_count={len(selected)}, "
+                    f"total_site_items={total_site_items}, "
+                    f"seen_nodes={len(seen_nodes_this_run)}, "
+                    f"failures_count={len(failures)}, "
+                    f"MAX_LOTS={MAX_LOTS}"
+                )
+            }
+
+        final_payload = {
+            "source": "Orange",
+            "mode": "orange_fast_precheck_in_memory_index_safe_delete",
+            "total_site_items": total_site_items,
+            "selected_count": len(selected),
+            "seen_nodes_count": len(seen_nodes_this_run),
+            "completed_all_selected": completed_all_selected,
+            "can_delete_missing": can_delete_missing,
+            "records_count": len(results),
+            "failures_count": len(failures),
+            "supabase_results": supabase_results,
+            "reconcile_result": reconcile_result,
+            "records": results,
+            "failures": failures,
+        }
+
+        log.info("===== FINAL PAYLOAD =====")
+        log.info(json.dumps(final_payload, indent=2))
+        print(json.dumps(final_payload, indent=2))
 
         log.info("DONE.")
         safe_close(browser, context, page)
