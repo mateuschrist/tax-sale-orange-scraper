@@ -33,60 +33,37 @@ SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").s
 CAN_CHECK_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
-STATE_FILE = os.getenv("PALM_BEACH_STATE_FILE", "state_palm_beach.json")
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 PALM_BEACH_MAX_CASES = int(os.getenv("PALM_BEACH_MAX_CASES", "500"))
 PALM_BEACH_FROM_DATE = (os.getenv("PALM_BEACH_FROM_DATE", "") or "").strip()
 PALM_BEACH_TO_DATE = (os.getenv("PALM_BEACH_TO_DATE", "") or "").strip()
 
-
-# =========================
-# STATE
-# =========================
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(data):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-def get_seen_cases():
-    st = load_state()
-    seen = st.get("seen_case_numbers", [])
-    if isinstance(seen, list):
-        return set(str(x) for x in seen if x)
-    return set()
-
-
-def add_seen_case(case_number: str):
-    if not case_number:
-        return
-    st = load_state()
-    seen = set(st.get("seen_case_numbers", []))
-    seen.add(str(case_number))
-    st["seen_case_numbers"] = sorted(seen)
-    st["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_state(st)
+SAFE_DELETE_ENABLED = os.getenv("PALM_BEACH_SAFE_DELETE_ENABLED", "true").lower() == "true"
 
 
 # =========================
-# HELPERS
+# GENERIC HELPERS
 # =========================
 def norm(s):
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 def clean_bid(v):
-    return re.sub(r"[^\d.]", "", str(v or ""))
+    if v is None:
+        return None
+    cleaned = re.sub(r"[^\d.]", "", str(v))
+    return cleaned or None
+
+
+def normalize_sale_date_value(value: str | None) -> str | None:
+    v = norm(value or "")
+    if not v:
+        return None
+    low = v.lower()
+    if low in ("null", "none", "n/a", "na", "not assigned"):
+        return None
+    return v
 
 
 def empty_addr():
@@ -117,7 +94,7 @@ def looks_like_garbage_address(addr: str) -> bool:
     a = norm(addr)
     upper = a.upper()
 
-    if len(a) < 4 or len(a) > 80:
+    if len(a) < 4 or len(a) > 120:
         return True
 
     if is_po_box(a):
@@ -143,9 +120,6 @@ def looks_like_garbage_address(addr: str) -> bool:
         if marker in upper:
             return True
 
-    if upper.count(" ") > 12:
-        return True
-
     return False
 
 
@@ -161,7 +135,7 @@ def is_valid_property_address(addr: str) -> bool:
     if re.match(r"^\d{1,6}\s+[A-Z0-9 .'\-#/]+$", a, re.I):
         return True
 
-    if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 6:
+    if re.match(r"^[0-9A-Z .'\-#/]+$", a, re.I) and len(a.split()) <= 8:
         return True
 
     return False
@@ -197,8 +171,35 @@ def payload_quality_score(payload: dict) -> int:
         "opening_bid",
         "deed_status",
         "applicant_name",
+        "tax_sale_id",
+        "node",
     ]
-    return sum(1 for f in fields if payload.get(f) not in (None, ""))
+    return sum(1 for f in fields if payload.get(f) not in (None, "", []))
+
+
+def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
+    new_score = payload_quality_score(payload)
+    old_score = payload_quality_score(existing)
+
+    if new_score > old_score:
+        return True
+
+    important_fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+    ]
+
+    for f in important_fields:
+        old_val = norm(existing.get(f) or "")
+        new_val = norm(payload.get(f) or "")
+        if not old_val and new_val:
+            return True
+
+    return False
 
 
 def human_pause(a=0.20, b=0.60):
@@ -291,17 +292,17 @@ def send(payload):
             headers={"Authorization": f"Bearer {APP_API_TOKEN}"},
             timeout=30,
         )
-        log.info("INGEST status=%s", r.status_code)
+        log.info("INGEST status=%s node=%s", r.status_code, payload.get("node"))
         if r.text:
             log.info("INGEST response=%s", r.text[:250].replace("\n", " "))
         return r.status_code in (200, 201)
     except Exception as e:
-        log.warning("INGEST failed: %s", str(e))
+        log.warning("INGEST failed node=%s error=%s", payload.get("node"), str(e))
         return False
 
 
 # =========================
-# SUPABASE DEDUP
+# SUPABASE
 # =========================
 def sb_headers():
     return {
@@ -311,96 +312,228 @@ def sb_headers():
     }
 
 
-def supabase_find_existing_case(node: str):
-    if not CAN_CHECK_SUPABASE or not node:
-        return None
+def supabase_fetch_all_palm_beach_records() -> list[dict]:
+    if not CAN_CHECK_SUPABASE:
+        return []
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.PalmBeach"
-        f"&node=eq.{quote(str(node), safe='')}"
-        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
+    all_rows = []
+    offset = 0
+    page_size = 1000
+
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.PalmBeach"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+            f"&offset={offset}"
+            f"&limit={page_size}"
+        )
+
+        try:
+            r = requests.get(url, headers=sb_headers(), timeout=60)
+            if r.status_code != 200:
+                log.warning("supabase_fetch_all_palm_beach_records failed status=%s body=%s", r.status_code, r.text[:500])
+                break
+
+            arr = r.json() or []
+            if not arr:
+                break
+
+            all_rows.extend(arr)
+
+            if len(arr) < page_size:
+                break
+
+            offset += page_size
+
+        except Exception as e:
+            log.warning("supabase_fetch_all_palm_beach_records exception: %s", str(e))
+            break
+
+    log.info("Loaded %s Palm Beach records from Supabase", len(all_rows))
+    return all_rows
+
+
+def build_supabase_indexes(rows: list[dict]) -> dict:
+    by_node = {}
+    by_tax_sale_parcel = {}
+
+    for row in rows:
+        node = norm(row.get("node") or "")
+        tax_sale_id = norm(row.get("tax_sale_id") or "")
+        parcel_number = norm(row.get("parcel_number") or "")
+
+        if node:
+            by_node[node] = row
+
+        if tax_sale_id and parcel_number:
+            by_tax_sale_parcel[(tax_sale_id, parcel_number)] = row
+
+    return {
+        "by_node": by_node,
+        "by_tax_sale_parcel": by_tax_sale_parcel,
+    }
+
+
+def supabase_update_sale_date(record_id: str, sale_date: str | None) -> dict:
+    if not CAN_CHECK_SUPABASE or not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": "missing config or record id",
+        }
+
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation"
+
+    payload = {
+        "sale_date": sale_date
+    }
 
     try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
+        r = requests.patch(url, headers=headers, json=payload, timeout=30)
+        ok = r.status_code in (200, 204)
+        if ok:
+            log.info("SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s", record_id, sale_date)
+        else:
+            log.warning("SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s", record_id, r.status_code, r.text[:500])
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "response_text": r.text[:1000],
+        }
     except Exception as e:
-        log.warning("supabase_find_existing_case failed: %s", str(e))
+        log.warning("SUPABASE SALE_DATE UPDATE EXCEPTION id=%s error=%s", record_id, str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "response_text": str(e),
+        }
 
-    return None
 
+def supabase_upsert_property(payload: dict) -> dict:
+    if not CAN_CHECK_SUPABASE:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "response_text": "SUPABASE not configured",
+        }
 
-def supabase_find_existing_property(parcel_number: str, sale_date: str):
-    if not CAN_CHECK_SUPABASE or not parcel_number or not sale_date:
-        return None
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.PalmBeach"
-        f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
-        f"&sale_date=eq.{quote(str(sale_date), safe='')}"
-        f"&select=id,node,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
+    url = f"{SUPABASE_URL}/rest/v1/properties"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
 
     try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        ok = r.status_code in (200, 201)
+
+        if ok:
+            log.info("SUPABASE UPSERT OK node=%s status=%s", payload.get("node"), r.status_code)
+        else:
+            log.warning("SUPABASE UPSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:600])
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "response_text": r.text[:1000],
+        }
     except Exception as e:
-        log.warning("supabase_find_existing_property failed: %s", str(e))
-
-    return None
-
-
-def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
-    new_score = payload_quality_score(payload)
-    old_score = payload_quality_score(existing)
-
-    if new_score > old_score:
-        return True
-
-    important_fields = [
-        "address",
-        "city",
-        "state_address",
-        "zip",
-        "pdf_url",
-        "auction_source_url",
-    ]
-
-    for f in important_fields:
-        old_val = (existing.get(f) or "").strip() if existing.get(f) else ""
-        new_val = (payload.get(f) or "").strip() if payload.get(f) else ""
-        if not old_val and new_val:
-            return True
-
-    return False
+        log.warning("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "response_text": str(e),
+        }
 
 
-def should_send_payload(payload: dict):
-    node = payload.get("node")
-    parcel = payload.get("parcel_number")
-    sale_date = payload.get("sale_date")
+def supabase_delete_nodes(nodes: list[str]) -> dict:
+    if not CAN_CHECK_SUPABASE:
+        return {
+            "executed": False,
+            "deleted_count": 0,
+            "reason": "SUPABASE not configured",
+        }
 
-    existing_case = supabase_find_existing_case(node)
-    if existing_case:
-        if payload_is_better_than_existing(payload, existing_case):
-            return True, "existing case found, but new payload is better"
-        return False, "duplicate case/node already exists"
+    nodes = [str(x).strip() for x in nodes if str(x).strip()]
+    if not nodes:
+        return {
+            "executed": True,
+            "deleted_count": 0,
+            "reason": "no nodes to delete",
+        }
 
-    existing_prop = supabase_find_existing_property(parcel, sale_date)
-    if existing_prop:
-        if payload_is_better_than_existing(payload, existing_prop):
-            return True, "existing parcel_number + sale_date found, but new payload is better"
-        return False, "duplicate parcel_number + sale_date already exists"
+    deleted_count = 0
+    errors = []
+    batch_size = 100
 
-    return True, "new record"
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i:i + batch_size]
+
+        try:
+            quoted = ",".join(f'"{quote(node, safe="")}"' for node in batch)
+            url = (
+                f"{SUPABASE_URL}/rest/v1/properties"
+                f"?county=eq.PalmBeach"
+                f"&node=in.({quoted})"
+            )
+
+            r = requests.delete(url, headers=sb_headers(), timeout=60)
+            if r.status_code in (200, 204):
+                deleted_count += len(batch)
+                log.info("SUPABASE DELETE batch ok count=%s", len(batch))
+            else:
+                msg = f"status={r.status_code} body={r.text[:500]}"
+                errors.append(msg)
+                log.warning("SUPABASE DELETE batch failed: %s", msg)
+
+        except Exception as e:
+            msg = str(e)
+            errors.append(msg)
+            log.warning("SUPABASE DELETE batch exception: %s", msg)
+
+    return {
+        "executed": True,
+        "deleted_count": deleted_count,
+        "requested_delete_count": len(nodes),
+        "errors": errors,
+    }
+
+
+def reconcile_supabase_to_site(seen_nodes_this_run: set[str], indexes: dict) -> dict:
+    try:
+        supabase_nodes = set(indexes["by_node"].keys())
+        site_nodes = {str(x).strip() for x in seen_nodes_this_run if str(x).strip()}
+        to_delete = sorted(supabase_nodes - site_nodes)
+
+        log.info(
+            "RECONCILE PALM BEACH: supabase=%s site=%s delete=%s",
+            len(supabase_nodes),
+            len(site_nodes),
+            len(to_delete),
+        )
+
+        delete_result = supabase_delete_nodes(to_delete)
+
+        return {
+            "executed": True,
+            "supabase_nodes_count": len(supabase_nodes),
+            "site_nodes_count": len(site_nodes),
+            "delete_candidates_count": len(to_delete),
+            "delete_candidates_sample": to_delete[:50],
+            "delete_result": delete_result,
+        }
+
+    except Exception as e:
+        log.exception("reconcile_supabase_to_site failed: %s", str(e))
+        return {
+            "executed": False,
+            "reason": str(e),
+        }
 
 
 # =========================
@@ -661,7 +794,7 @@ def fetch_address_from_property_appraiser_url(browser, url: str) -> dict:
         try:
             page.locator("text=LOCATION ADDRESS").first.wait_for(timeout=10000)
         except PWTimeout:
-            log.info("LOCATION ADDRESS not explicitly found within 10s; parsing full body anyway")
+            log.info("LOCATION ADDRESS not found within 10s; parsing body anyway")
 
         page.wait_for_timeout(1200)
 
@@ -712,21 +845,22 @@ def click_search_for_status_resilient(page):
                 target.scroll_into_view_if_needed(timeout=5000)
             except Exception:
                 pass
-            try:
-                target.click(timeout=10000)
-                return True
-            except Exception:
-                pass
-            try:
-                target.click(force=True, timeout=10000)
-                return True
-            except Exception:
-                pass
-            try:
-                target.evaluate("(el) => el.click()")
-                return True
-            except Exception:
-                pass
+            for _ in range(3):
+                try:
+                    target.click(timeout=10000)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    target.click(force=True, timeout=10000)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    target.evaluate("(el) => el.click()")
+                    return True
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -738,60 +872,22 @@ def click_search_for_status_resilient(page):
                 target.scroll_into_view_if_needed(timeout=5000)
             except Exception:
                 pass
-            try:
-                target.click(timeout=10000)
-                return True
-            except Exception:
-                pass
-            try:
-                target.click(force=True, timeout=10000)
-                return True
-            except Exception:
-                pass
-            try:
-                target.evaluate("(el) => el.click()")
-                return True
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        buttons = page.locator("button")
-        count = buttons.count()
-        for i in range(count):
-            btn = buttons.nth(i)
-            try:
-                name = (btn.get_attribute("name") or "").strip()
-                btype = (btn.get_attribute("type") or "").strip()
-                text = (btn.inner_text() or "").strip()
-
-                if (
-                    name == "buttonSubmitStatus"
-                    or (btype == "submit" and text == "Search for Status")
-                    or text == "Search for Status"
-                ):
-                    try:
-                        btn.scroll_into_view_if_needed(timeout=5000)
-                    except Exception:
-                        pass
-                    try:
-                        btn.click(timeout=10000)
-                        return True
-                    except Exception:
-                        pass
-                    try:
-                        btn.click(force=True, timeout=10000)
-                        return True
-                    except Exception:
-                        pass
-                    try:
-                        btn.evaluate("(el) => el.click()")
-                        return True
-                    except Exception:
-                        pass
-            except Exception:
-                continue
+            for _ in range(3):
+                try:
+                    target.click(timeout=10000)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    target.click(force=True, timeout=10000)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    target.evaluate("(el) => el.click()")
+                    return True
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -821,13 +917,30 @@ def do_status_search_like_human(page):
     page.wait_for_timeout(2200)
 
 
-def extract_case_links_from_current_results(page) -> list[str]:
-    """
-    The grid rows look like:
-    <tr role="row" id="53539" ...>
-    We build /Home/Details?id=<row_id>
-    """
-    links = []
+def parse_summary_from_row_text(row_text: str) -> dict:
+    txt = norm(row_text)
+
+    def pick(pattern):
+        m = re.search(pattern, txt, re.I)
+        return norm(m.group(1)) if m else ""
+
+    case_number = pick(r"(?:Case Number|Case)\s*[:#]?\s*([A-Z0-9\-\/]+)")
+    parcel_number = pick(r"(?:Parcel ID|Parcel|PCN)\s*[:#]?\s*([A-Z0-9\-]+)")
+    sale_date = pick(r"(?:Auction Date|Sale Date|Date)\s*[:#]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})")
+    status = pick(r"Status\s*[:#]?\s*([A-Z ]+)")
+    opening_bid = pick(r"(?:Opening Bid|Min Bid|Minimum Bid)\s*[:#]?\s*\$?\s*([0-9,]+\.\d{2}|[0-9,]+)")
+
+    return {
+        "tax_sale_id": case_number or None,
+        "parcel_number": parcel_number or None,
+        "sale_date": normalize_sale_date_value(sale_date),
+        "deed_status": status or None,
+        "opening_bid": clean_bid(opening_bid),
+    }
+
+
+def extract_case_rows_from_current_results(page) -> list[dict]:
+    rows_out = []
     seen = set()
 
     rows = page.locator("tr[role='row'][id]")
@@ -836,8 +949,7 @@ def extract_case_links_from_current_results(page) -> list[str]:
     for i in range(count):
         try:
             row = rows.nth(i)
-            row_id = (row.get_attribute("id") or "").strip()
-
+            row_id = norm(row.get_attribute("id") or "")
             if not row_id:
                 continue
             if row_id.lower() == "jqgfirstrow":
@@ -845,14 +957,25 @@ def extract_case_links_from_current_results(page) -> list[str]:
             if not row_id.isdigit():
                 continue
 
-            full = f"{BASE_URL}/Home/Details?id={row_id}"
-            if full not in seen:
-                seen.add(full)
-                links.append(full)
+            case_url = f"{BASE_URL}/Home/Details?id={row_id}"
+            row_text = norm(row.inner_text() or "")
+            parsed = parse_summary_from_row_text(row_text)
+
+            key = (row_id, case_url)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            rows_out.append({
+                "node": row_id,
+                "case_url": case_url,
+                "row_text": row_text,
+                "summary": parsed,
+            })
         except Exception:
             continue
 
-    return links
+    return rows_out
 
 
 def goto_next_results_page(page) -> bool:
@@ -882,6 +1005,13 @@ def goto_next_results_page(page) -> bool:
                         except Exception:
                             pass
 
+                        old_first = ""
+                        try:
+                            first_row = page.locator("tr[role='row'][id]").nth(1)
+                            old_first = norm(first_row.inner_text() or "")
+                        except Exception:
+                            pass
+
                         try:
                             item.click(timeout=5000)
                         except Exception:
@@ -892,6 +1022,17 @@ def goto_next_results_page(page) -> bool:
 
                         wait_network_quiet(page, 12000)
                         page.wait_for_timeout(1500)
+
+                        new_first = ""
+                        try:
+                            first_row = page.locator("tr[role='row'][id]").nth(1)
+                            new_first = norm(first_row.inner_text() or "")
+                        except Exception:
+                            pass
+
+                        if new_first and new_first != old_first:
+                            return True
+
                         return True
                 except Exception:
                     continue
@@ -901,7 +1042,7 @@ def goto_next_results_page(page) -> bool:
     return False
 
 
-def discover_sale_case_links(page) -> list[str]:
+def discover_sale_rows(page) -> tuple[list[dict], int]:
     do_status_search_like_human(page)
 
     try:
@@ -911,29 +1052,35 @@ def discover_sale_case_links(page) -> list[str]:
 
     page.wait_for_timeout(2000)
 
-    all_links = []
-    seen = set()
+    all_rows = []
+    seen_nodes = set()
+    pages_processed = 0
 
     for _ in range(50):
-        page_links = extract_case_links_from_current_results(page)
+        page_rows = extract_case_rows_from_current_results(page)
+        if not page_rows:
+            break
 
-        for h in page_links:
-            if h not in seen:
-                seen.add(h)
-                all_links.append(h)
+        pages_processed += 1
 
-        if PALM_BEACH_MAX_CASES > 0 and len(all_links) >= PALM_BEACH_MAX_CASES:
-            return all_links[:PALM_BEACH_MAX_CASES]
+        for row in page_rows:
+            node = row["node"]
+            if node not in seen_nodes:
+                seen_nodes.add(node)
+                all_rows.append(row)
+
+        if PALM_BEACH_MAX_CASES > 0 and len(all_rows) >= PALM_BEACH_MAX_CASES:
+            return all_rows[:PALM_BEACH_MAX_CASES], pages_processed
 
         moved = goto_next_results_page(page)
         if not moved:
             break
 
-    return all_links[:PALM_BEACH_MAX_CASES] if PALM_BEACH_MAX_CASES > 0 else all_links
+    return all_rows[:PALM_BEACH_MAX_CASES] if PALM_BEACH_MAX_CASES > 0 else all_rows, pages_processed
 
 
 # =========================
-# CASE HTML
+# CASE DETAIL HTML
 # =========================
 def is_valid_case(html: str) -> bool:
     t = html.lower()
@@ -983,12 +1130,111 @@ def parse_case(html: str, url: str) -> dict:
 
 
 # =========================
+# LIST PRECHECK DECISION
+# =========================
+def decide_list_action(row: dict, indexes: dict) -> dict:
+    node = norm(row.get("node") or "")
+    summary = row.get("summary") or {}
+
+    tax_sale_id = norm(summary.get("tax_sale_id") or "")
+    parcel_number = norm(summary.get("parcel_number") or "")
+    site_sale_date = normalize_sale_date_value(summary.get("sale_date"))
+
+    existing = None
+
+    if tax_sale_id and parcel_number:
+        existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
+
+    if not existing and node:
+        existing = indexes["by_node"].get(node)
+
+    if not existing:
+        return {
+            "action": "open_detail",
+            "reason": "record not found in supabase",
+            "existing": None,
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
+
+    same_identity = (
+        norm(existing.get("tax_sale_id") or "") == tax_sale_id
+        and norm(existing.get("parcel_number") or "") == parcel_number
+    ) if tax_sale_id and parcel_number else True
+
+    if same_identity and db_sale_date == site_sale_date:
+        return {
+            "action": "skip",
+            "reason": "sale_date unchanged",
+            "existing": existing,
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    if same_identity and payload_quality_score(existing) >= 8:
+        return {
+            "action": "update_sale_date_only",
+            "reason": f"sale_date changed from {db_sale_date} to {site_sale_date}",
+            "existing": existing,
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    return {
+        "action": "open_detail",
+        "reason": "existing record incomplete or needs enrich",
+        "existing": existing,
+        "tax_sale_id": tax_sale_id,
+        "parcel_number": parcel_number,
+        "site_sale_date": site_sale_date,
+    }
+
+
+# =========================
+# PAYLOAD BUILD
+# =========================
+def build_payload_from_case(case: dict, addr: dict) -> dict:
+    return {
+        "county": "PalmBeach",
+        "state": "FL",
+        "node": case.get("case"),
+        "auction_source_url": case.get("property_appraiser") or case.get("tax"),
+        "tax_sale_id": case.get("case"),
+        "parcel_number": case.get("parcel"),
+        "sale_date": normalize_sale_date_value(case.get("date")),
+        "opening_bid": clean_bid(case.get("bid")),
+        "deed_status": case.get("status"),
+        "applicant_name": case.get("applicant"),
+        "pdf_url": case.get("pdf"),
+        "address": addr.get("address"),
+        "city": addr.get("city"),
+        "state_address": addr.get("state"),
+        "zip": addr.get("zip"),
+        "address_source": addr.get("source"),
+    }
+
+
+# =========================
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach V6.7 direct-status-dates + resilient search click + jqgrid rows ===")
+    log.info("=== Palm Beach FINAL V1 aligned with Miami/Orange logic ===")
 
-    seen_cases = get_seen_cases()
+    supabase_rows = supabase_fetch_all_palm_beach_records() if CAN_CHECK_SUPABASE else []
+    indexes = build_supabase_indexes(supabase_rows)
+
+    seen_nodes_this_run = set()
+    results = []
+    failures = []
+    supabase_results = []
+    fast_skips = 0
+    sale_date_only_updates = 0
+    detail_opens = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -996,16 +1242,16 @@ def run_palm_beach():
         page = context.new_page()
 
         try:
-            case_links = discover_sale_case_links(page)
-            log.info("Discovered %s SALE case links from search", len(case_links))
+            discovered_rows, pages_processed = discover_sale_rows(page)
+            log.info("Discovered %s case rows from search across %s page(s)", len(discovered_rows), pages_processed)
         finally:
             try:
                 page.close()
             except Exception:
                 pass
 
-        if not case_links:
-            log.warning("No SALE case links discovered from search")
+        if not discovered_rows:
+            log.warning("No case rows discovered from search")
             try:
                 browser.close()
             except Exception:
@@ -1015,29 +1261,51 @@ def run_palm_beach():
         s = requests.Session()
         s.headers.update(HEADERS)
 
-        for idx, case_url in enumerate(case_links, start=1):
-            log.info("Palm Beach case %s/%s → %s", idx, len(case_links), case_url)
+        for idx, row in enumerate(discovered_rows, start=1):
+            node = norm(row.get("node") or "")
+            case_url = row.get("case_url")
+            summary = row.get("summary") or {}
+
+            if node:
+                seen_nodes_this_run.add(node)
+
+            log.info("Palm Beach row %s/%s → node=%s case_url=%s", idx, len(discovered_rows), node, case_url)
 
             try:
-                r = s.get(case_url, timeout=30)
+                decision = decide_list_action(row, indexes)
+                log.info("PRECHECK node=%s action=%s reason=%s", node, decision["action"], decision["reason"])
 
-                if r.status_code != 200 or not is_valid_case(r.text):
-                    log.warning("Invalid case page at %s", case_url)
+                if decision["action"] == "skip":
+                    fast_skips += 1
                     continue
+
+                if decision["action"] == "update_sale_date_only":
+                    existing = decision["existing"]
+                    upd = supabase_update_sale_date(existing["id"], decision["site_sale_date"])
+                    sale_date_only_updates += 1
+                    supabase_results.append({
+                        "node": node,
+                        "mode": "update_sale_date_only",
+                        **upd,
+                    })
+
+                    if upd.get("sent"):
+                        existing["sale_date"] = decision["site_sale_date"]
+                    continue
+
+                # only now open detail
+                detail_opens += 1
+
+                r = s.get(case_url, timeout=30)
+                if r.status_code != 200 or not is_valid_case(r.text):
+                    raise RuntimeError(f"Invalid case detail page status={r.status_code}")
 
                 case = parse_case(r.text, r.url)
-
                 status_value = (case.get("status") or "").strip().upper()
-                if status_value != "SALE":
-                    log.info(
-                        "SKIPPED case because status is not SALE → %s (%s)",
-                        case.get("status"),
-                        case.get("case"),
-                    )
-                    continue
 
-                if case.get("case") in seen_cases:
-                    log.info("SKIPPED case already seen in current state → %s", case.get("case"))
+                # we only want SALE
+                if status_value != "SALE":
+                    log.info("SKIPPED non-SALE case after detail read → %s (%s)", case.get("status"), case.get("case"))
                     continue
 
                 addr = empty_addr()
@@ -1048,11 +1316,7 @@ def run_palm_beach():
                         if "pdf" in (pdf.headers.get("content-type") or "").lower():
                             addr = extract_pdf_addr(pdf.content)
                         else:
-                            log.warning(
-                                "Non-PDF response for case=%s: %s",
-                                case.get("case"),
-                                pdf.headers.get("content-type")
-                            )
+                            log.warning("Non-PDF response for case=%s: %s", case.get("case"), pdf.headers.get("content-type"))
                     except Exception as e:
                         log.warning("PDF read failed for case=%s: %s", case.get("case"), str(e))
 
@@ -1066,48 +1330,100 @@ def run_palm_beach():
                         addr = pa_addr
                         log.info("Address found from Property Appraiser fallback")
 
-                payload = {
-                    "county": "PalmBeach",
-                    "state": "FL",
-                    "node": case.get("case"),
-                    "auction_source_url": case.get("property_appraiser") or case.get("tax"),
-                    "tax_sale_id": case.get("case"),
-                    "parcel_number": case.get("parcel"),
-                    "sale_date": case.get("date"),
-                    "opening_bid": clean_bid(case.get("bid")),
-                    "deed_status": case.get("status"),
-                    "applicant_name": case.get("applicant"),
-                    "pdf_url": case.get("pdf"),
-                    "address": addr.get("address"),
-                    "city": addr.get("city"),
-                    "state_address": addr.get("state"),
-                    "zip": addr.get("zip"),
-                    "address_source": addr.get("source"),
-                }
+                payload = build_payload_from_case(case, addr)
+                results.append(payload)
 
-                print(json.dumps(payload, indent=2))
+                existing = None
+                tax_sale_id = norm(payload.get("tax_sale_id") or "")
+                parcel_number = norm(payload.get("parcel_number") or "")
+                if tax_sale_id and parcel_number:
+                    existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
+                if not existing and node:
+                    existing = indexes["by_node"].get(node)
 
-                should_send, reason = should_send_payload(payload)
-                log.info("DEDUP CHECK case=%s → %s", case.get("case"), reason)
+                if existing and not payload_is_better_than_existing(payload, existing):
+                    log.info("DETAIL READ but payload not better → skip upsert node=%s", node)
+                    continue
 
-                if should_send:
-                    if send(payload):
-                        add_seen_case(case.get("case"))
-                        seen_cases.add(case.get("case"))
-                        log.info("SENT case=%s", case.get("case"))
-                    else:
-                        log.warning("SEND FAILED case=%s", case.get("case"))
-                else:
-                    add_seen_case(case.get("case"))
-                    seen_cases.add(case.get("case"))
-                    log.info("SKIPPED case=%s because duplicate", case.get("case"))
+                sb_result = supabase_upsert_property(payload)
+                supabase_results.append({
+                    "node": node,
+                    "mode": "full_upsert",
+                    **sb_result,
+                })
 
-                time.sleep(1.0)
+                if sb_result.get("sent"):
+                    indexes["by_node"][norm(payload.get("node") or "")] = payload
+                    if tax_sale_id and parcel_number:
+                        indexes["by_tax_sale_parcel"][(tax_sale_id, parcel_number)] = payload
+
+                    send(payload)
+
+                time.sleep(0.8)
 
             except Exception as e:
-                log.error("ERROR case url=%s: %s", case_url, str(e))
+                log.error("ERROR node=%s url=%s: %s", node, case_url, str(e))
+                failures.append({
+                    "node": node,
+                    "case_url": case_url,
+                    "error": str(e),
+                })
+
+        completed_all_pages = True
+        expected_total_items = len(discovered_rows)
+        can_delete_missing = (
+            SAFE_DELETE_ENABLED
+            and completed_all_pages
+            and expected_total_items > 0
+            and len(seen_nodes_this_run) == expected_total_items
+            and len(failures) == 0
+        )
+
+        if can_delete_missing:
+            reconcile_result = reconcile_supabase_to_site(seen_nodes_this_run, indexes)
+        else:
+            reconcile_result = {
+                "executed": False,
+                "reason": (
+                    f"safe delete blocked: "
+                    f"SAFE_DELETE_ENABLED={SAFE_DELETE_ENABLED}, "
+                    f"completed_all_pages={completed_all_pages}, "
+                    f"expected_total_items={expected_total_items}, "
+                    f"seen_nodes={len(seen_nodes_this_run)}, "
+                    f"failures_count={len(failures)}"
+                ),
+            }
+
+        final_payload = {
+            "source": "PalmBeach",
+            "mode": "final_v1_aligned_with_miami_orange",
+            "expected_total_items": expected_total_items,
+            "seen_nodes_count": len(seen_nodes_this_run),
+            "fast_skips": fast_skips,
+            "sale_date_only_updates": sale_date_only_updates,
+            "detail_opens": detail_opens,
+            "records_count": len(results),
+            "failures_count": len(failures),
+            "can_delete_missing": can_delete_missing,
+            "supabase_results_count": len(supabase_results),
+            "reconcile_result": reconcile_result,
+            "records": results,
+            "failures": failures,
+        }
+
+        log.info("===== FINAL PAYLOAD =====")
+        log.info(json.dumps(final_payload, indent=2))
+        print(json.dumps(final_payload, indent=2))
 
         try:
             browser.close()
         except Exception:
             pass
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    run_palm_beach()
