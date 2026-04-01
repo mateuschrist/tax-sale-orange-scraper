@@ -5,6 +5,7 @@ import time
 import random
 import logging
 from io import BytesIO
+from datetime import datetime
 from urllib.parse import urljoin, urlparse, parse_qs, quote
 
 import requests
@@ -26,7 +27,6 @@ MAX_LOTS = int(os.getenv("MAX_LOTS", "1000"))
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
 RESTART_BROWSER_EVERY = int(os.getenv("RESTART_BROWSER_EVERY", "20"))
-
 MAX_VIEWER_RETRIES = int(os.getenv("MAX_VIEWER_RETRIES", "3"))
 MAX_WAIT = 60_000
 
@@ -56,6 +56,10 @@ log = logging.getLogger("taxdeed-orange-scraper")
 # =========================
 # HELPERS
 # =========================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
@@ -85,7 +89,12 @@ def normalize_bid_for_payload(v):
     if not s:
         return None
     cleaned = re.sub(r"[^0-9.]", "", s.replace(",", ""))
-    return cleaned if cleaned else None
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
 
 
 def normalize_sale_date_value(value: str | None) -> str | None:
@@ -143,31 +152,38 @@ def is_numbered_street_address(addr: str | None) -> bool:
 # =========================
 # SUPABASE
 # =========================
-def sb_headers():
+def sb_headers(prefer_merge: bool = False):
     if not USE_STATE:
         raise RuntimeError("Supabase not configured")
-    return {
+
+    headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation,resolution=merge-duplicates",
     }
+
+    if prefer_merge:
+        headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    else:
+        headers["Prefer"] = "return=representation"
+
+    return headers
 
 
 def sb_get(url: str, timeout=30):
-    return requests.get(url, headers=sb_headers(), timeout=timeout)
+    return requests.get(url, headers=sb_headers(prefer_merge=False), timeout=timeout)
 
 
-def sb_post(url: str, payload: dict, timeout=30):
-    return requests.post(url, headers=sb_headers(), json=payload, timeout=timeout)
+def sb_post(url: str, payload: dict, timeout=30, prefer_merge=False):
+    return requests.post(url, headers=sb_headers(prefer_merge=prefer_merge), json=payload, timeout=timeout)
 
 
 def sb_patch(url: str, payload: dict, timeout=30):
-    return requests.patch(url, headers=sb_headers(), json=payload, timeout=timeout)
+    return requests.patch(url, headers=sb_headers(prefer_merge=False), json=payload, timeout=timeout)
 
 
 def sb_delete(url: str, timeout=30):
-    return requests.delete(url, headers=sb_headers(), timeout=timeout)
+    return requests.delete(url, headers=sb_headers(prefer_merge=False), timeout=timeout)
 
 
 def get_state_last_node() -> str | None:
@@ -198,7 +214,7 @@ def set_state_last_node(last_node: str | None) -> None:
     url = f"{SUPABASE_URL}/rest/v1/scraper_state"
 
     payload_a = {"scraper_name": STATE_KEY, "last_node": last_node}
-    r = sb_post(url, payload_a)
+    r = sb_post(url, payload_a, prefer_merge=True)
     if r.status_code in (200, 201, 204):
         return
 
@@ -207,7 +223,7 @@ def set_state_last_node(last_node: str | None) -> None:
         return
 
     payload_b = {"id": STATE_KEY, "last_node": last_node}
-    r = sb_post(url, payload_b)
+    r = sb_post(url, payload_b, prefer_merge=True)
     if r.status_code in (200, 201, 204):
         return
 
@@ -234,7 +250,8 @@ def load_orange_index_from_supabase() -> dict:
         url = (
             f"{SUPABASE_URL}/rest/v1/properties"
             f"?county=eq.Orange"
-            f"&select=id,node,tax_sale_id,parcel_number,sale_date,pdf_url,address,city,state_address,zip,opening_bid,deed_status,applicant_name,auction_source_url"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,pdf_url,address,city,state_address,zip,"
+            f"opening_bid,deed_status,applicant_name,auction_source_url,is_active,removed_at"
             f"&offset={offset}"
             f"&limit={page_size}"
         )
@@ -266,7 +283,12 @@ def load_orange_index_from_supabase() -> dict:
 
 def update_sale_date_only(record_id: str, sale_date: str | None) -> dict:
     url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
-    payload = {"sale_date": normalize_sale_date_value(sale_date)}
+    payload = {
+        "sale_date": normalize_sale_date_value(sale_date),
+        "updated_at": now_iso(),
+        "is_active": True,
+        "removed_at": None,
+    }
 
     try:
         r = sb_patch(url, payload, timeout=20)
@@ -301,6 +323,7 @@ def payload_quality_score(payload: dict) -> int:
         "auction_source_url",
         "opening_bid",
         "deed_status",
+        "applicant_name",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
 
@@ -333,21 +356,31 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
     return False
 
 
-def supabase_upsert_property(payload: dict) -> dict:
+def insert_property(payload: dict) -> dict:
     url = f"{SUPABASE_URL}/rest/v1/properties"
-
     try:
-        r = sb_post(url, payload, timeout=30)
+        r = sb_post(url, payload, timeout=30, prefer_merge=False)
         ok = r.status_code in (200, 201)
+        body = None
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+
+        record_id = None
+        if isinstance(body, list) and body:
+            record_id = body[0].get("id")
+
         if ok:
-            log.info("SUPABASE UPSERT OK node=%s", payload.get("node"))
+            log.info("SUPABASE INSERT OK node=%s id=%s", payload.get("node"), record_id)
         else:
-            log.warning("SUPABASE UPSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:500])
+            log.warning("SUPABASE INSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:500])
 
         return {
             "sent": ok,
             "status_code": r.status_code,
             "node": payload.get("node"),
+            "record_id": record_id,
             "response_text": r.text[:1000],
         }
     except Exception as e:
@@ -355,8 +388,46 @@ def supabase_upsert_property(payload: dict) -> dict:
             "sent": False,
             "status_code": None,
             "node": payload.get("node"),
+            "record_id": None,
             "response_text": str(e),
         }
+
+
+def update_property_by_id(record_id: str, payload: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    try:
+        r = sb_patch(url, payload, timeout=30)
+        ok = r.status_code in (200, 204)
+        if ok:
+            log.info("SUPABASE PATCH OK id=%s node=%s", record_id, payload.get("node"))
+        else:
+            log.warning("SUPABASE PATCH FAILED id=%s node=%s status=%s body=%s", record_id, payload.get("node"), r.status_code, r.text[:500])
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
+    except Exception as e:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": str(e),
+        }
+
+
+def supabase_save_property(payload: dict, existing: dict | None) -> dict:
+    """
+    Se existe -> PATCH por id
+    Se não existe -> INSERT
+    """
+    if existing and existing.get("id"):
+        return update_property_by_id(existing["id"], payload)
+    return insert_property(payload)
 
 
 def list_all_orange_nodes_from_supabase() -> list[str]:
@@ -618,8 +689,13 @@ def _extract_street_before_city(block: str, city_match_start: int) -> str | None
 def parse_best_address_from_text(text: str) -> dict:
     if not text:
         return {
-            "address": None, "city": None, "state": None, "zip": None,
-            "marker_used": None, "marker_found": False, "snippet": ""
+            "address": None,
+            "city": None,
+            "state": None,
+            "zip": None,
+            "marker_used": None,
+            "marker_found": False,
+            "snippet": ""
         }
 
     markers = [
@@ -652,8 +728,13 @@ def parse_best_address_from_text(text: str) -> dict:
     mcity = re.search(r"([A-Za-z .'-]+)\s*,\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)", text, re.I)
     if not mcity:
         return {
-            "address": None, "city": None, "state": None, "zip": None,
-            "marker_used": None, "marker_found": False, "snippet": text[:900]
+            "address": None,
+            "city": None,
+            "state": None,
+            "zip": None,
+            "marker_used": None,
+            "marker_found": False,
+            "snippet": text[:900]
         }
 
     street = _extract_street_before_city(text, mcity.start())
@@ -664,7 +745,7 @@ def parse_best_address_from_text(text: str) -> dict:
         "zip": mcity.group(3),
         "marker_used": "FALLBACK_FIRST_MATCH",
         "marker_found": True,
-        "snippet": text[max(0, mcity.start()-250):mcity.end()+250],
+        "snippet": text[max(0, mcity.start() - 250):mcity.end() + 250],
     }
 
 
@@ -686,14 +767,13 @@ def build_payload_from_detail(
         "county": "Orange",
         "state": "FL",
         "node": node,
-        "auction_source_url": viewer_url,
+        "pdf_url": pdf_url,
         "tax_sale_id": list_fields.get("tax_sale_id") or None,
         "parcel_number": list_fields.get("parcel_number") or None,
         "sale_date": normalize_sale_date_value(list_fields.get("sale_date")),
         "opening_bid": normalize_bid_for_payload(list_fields.get("opening_bid")),
         "deed_status": list_fields.get("deed_status") or None,
         "applicant_name": list_fields.get("applicant_name") or None,
-        "pdf_url": pdf_url,
         "address": addr.get("address"),
         "city": addr.get("city"),
         "state_address": addr.get("state"),
@@ -701,6 +781,13 @@ def build_payload_from_detail(
         "address_source_marker": addr.get("marker_used"),
         "status": "new",
         "notes": notes,
+        "auction_location": "Orange County Comptroller",
+        "auction_start_time": None,
+        "auction_platform": "Orange County Tax Deed",
+        "auction_source_url": viewer_url,
+        "removed_at": None,
+        "is_active": True,
+        "updated_at": now_iso(),
     }
 
 
@@ -739,6 +826,15 @@ def decide_list_action(list_fields: dict, existing: dict | None) -> dict:
         return {
             "action": "open_detail_and_upsert",
             "reason": "record exists but needs enrichment",
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
+
+    if clean_text(existing.get("is_active")).lower() in ("false", "0"):
+        return {
+            "action": "open_detail_and_upsert",
+            "reason": "record exists but is inactive and must be reactivated",
             "tax_sale_id": tax_sale_id,
             "parcel_number": parcel_number,
             "site_sale_date": site_sale_date,
@@ -964,6 +1060,8 @@ def run():
 
                         if sb_result.get("sent"):
                             existing["sale_date"] = normalize_sale_date_value(list_fields.get("sale_date"))
+                            existing["is_active"] = True
+                            existing["removed_at"] = None
                             supabase_index[key] = existing
                         continue
 
@@ -1026,21 +1124,26 @@ def run():
                     addr=addr,
                 )
 
+                # preserve created record semantics while reactivating existing record
+                if existing and existing.get("id"):
+                    payload["is_active"] = True
+                    payload["removed_at"] = None
+
                 print("\n" + "=" * 100)
                 print(f"RESULT LOT {idx}")
                 print("=" * 100)
                 print(json.dumps(payload, indent=2))
 
-                sb_result = supabase_upsert_property(payload)
+                sb_result = supabase_save_property(payload, existing)
                 supabase_results.append({
                     "node": node,
-                    "mode": "full_upsert",
+                    "mode": "full_save",
                     **sb_result,
                 })
 
                 if sb_result.get("sent"):
-                    supabase_index[key] = {
-                        "id": existing.get("id") if existing else None,
+                    new_existing = {
+                        "id": sb_result.get("record_id") or (existing.get("id") if existing else None),
                         "node": payload.get("node"),
                         "tax_sale_id": payload.get("tax_sale_id"),
                         "parcel_number": payload.get("parcel_number"),
@@ -1054,7 +1157,10 @@ def run():
                         "deed_status": payload.get("deed_status"),
                         "applicant_name": payload.get("applicant_name"),
                         "auction_source_url": payload.get("auction_source_url"),
+                        "is_active": True,
+                        "removed_at": None,
                     }
+                    supabase_index[key] = new_existing
 
                 ingest_ok = True
                 ingest_result = None
@@ -1120,7 +1226,7 @@ def run():
 
         final_payload = {
             "source": "Orange",
-            "mode": "orange_fast_precheck_in_memory_index_safe_delete",
+            "mode": "orange_fast_precheck_in_memory_index_safe_delete_v2",
             "total_site_items": total_site_items,
             "selected_count": len(selected),
             "seen_nodes_count": len(seen_nodes_this_run),
