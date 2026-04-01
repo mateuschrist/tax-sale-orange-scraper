@@ -5,7 +5,7 @@ import time
 import random
 import logging
 from io import BytesIO
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from urllib.parse import urljoin, quote
 
 import requests
@@ -45,6 +45,10 @@ SAFE_DELETE_ENABLED = os.getenv("PALM_BEACH_SAFE_DELETE_ENABLED", "true").lower(
 # =========================
 # GENERIC HELPERS
 # =========================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def norm(s):
     return re.sub(r"\s+", " ", (s or "")).strip()
 
@@ -53,7 +57,12 @@ def clean_bid(v):
     if v is None:
         return None
     cleaned = re.sub(r"[^\d.]", "", str(v))
-    return cleaned or None
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
 
 
 def normalize_sale_date_value(value: str | None) -> str | None:
@@ -191,6 +200,9 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
         "zip",
         "pdf_url",
         "auction_source_url",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
     ]
 
     for f in important_fields:
@@ -324,7 +336,8 @@ def supabase_fetch_all_palm_beach_records() -> list[dict]:
         url = (
             f"{SUPABASE_URL}/rest/v1/properties"
             f"?county=eq.PalmBeach"
-            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,"
+            f"pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,is_active,removed_at"
             f"&offset={offset}"
             f"&limit={page_size}"
         )
@@ -388,7 +401,10 @@ def supabase_update_sale_date(record_id: str, sale_date: str | None) -> dict:
     headers["Prefer"] = "return=representation"
 
     payload = {
-        "sale_date": sale_date
+        "sale_date": sale_date,
+        "updated_at": now_iso(),
+        "is_active": True,
+        "removed_at": None,
     }
 
     try:
@@ -413,42 +429,100 @@ def supabase_update_sale_date(record_id: str, sale_date: str | None) -> dict:
         }
 
 
-def supabase_upsert_property(payload: dict) -> dict:
+def supabase_insert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
         return {
             "sent": False,
             "status_code": None,
             "node": payload.get("node"),
+            "record_id": None,
             "response_text": "SUPABASE not configured",
         }
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
-    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    headers["Prefer"] = "return=representation"
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         ok = r.status_code in (200, 201)
 
+        record_id = None
+        try:
+            body = r.json()
+            if isinstance(body, list) and body:
+                record_id = body[0].get("id")
+        except Exception:
+            pass
+
         if ok:
-            log.info("SUPABASE UPSERT OK node=%s status=%s", payload.get("node"), r.status_code)
+            log.info("SUPABASE INSERT OK node=%s status=%s id=%s", payload.get("node"), r.status_code, record_id)
         else:
-            log.warning("SUPABASE UPSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:600])
+            log.warning("SUPABASE INSERT FAILED node=%s status=%s body=%s", payload.get("node"), r.status_code, r.text[:600])
 
         return {
             "sent": ok,
             "status_code": r.status_code,
             "node": payload.get("node"),
+            "record_id": record_id,
             "response_text": r.text[:1000],
         }
     except Exception as e:
-        log.warning("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        log.warning("SUPABASE INSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
         return {
             "sent": False,
             "status_code": None,
             "node": payload.get("node"),
+            "record_id": None,
             "response_text": str(e),
         }
+
+
+def supabase_update_property(record_id: str, payload: dict) -> dict:
+    if not CAN_CHECK_SUPABASE or not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": "missing config or record id",
+        }
+
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation"
+
+    try:
+        r = requests.patch(url, headers=headers, json=payload, timeout=30)
+        ok = r.status_code in (200, 204)
+
+        if ok:
+            log.info("SUPABASE PATCH OK id=%s node=%s status=%s", record_id, payload.get("node"), r.status_code)
+        else:
+            log.warning("SUPABASE PATCH FAILED id=%s node=%s status=%s body=%s", record_id, payload.get("node"), r.status_code, r.text[:600])
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
+    except Exception as e:
+        log.warning("SUPABASE PATCH EXCEPTION id=%s node=%s error=%s", record_id, payload.get("node"), str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": str(e),
+        }
+
+
+def supabase_save_property(payload: dict, existing: dict | None) -> dict:
+    if existing and existing.get("id"):
+        return supabase_update_property(existing["id"], payload)
+    return supabase_insert_property(payload)
 
 
 def supabase_delete_nodes(nodes: list[str]) -> dict:
@@ -1132,6 +1206,21 @@ def parse_case(html: str, url: str) -> dict:
 # =========================
 # LIST PRECHECK DECISION
 # =========================
+def record_needs_enrichment(existing: dict) -> bool:
+    important_fields = [
+        "pdf_url",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+        "auction_source_url",
+    ]
+    return any(not norm(existing.get(f) or "") for f in important_fields)
+
+
 def decide_list_action(row: dict, indexes: dict) -> dict:
     node = norm(row.get("node") or "")
     summary = row.get("summary") or {}
@@ -1165,17 +1254,19 @@ def decide_list_action(row: dict, indexes: dict) -> dict:
         and norm(existing.get("parcel_number") or "") == parcel_number
     ) if tax_sale_id and parcel_number else True
 
-    if same_identity and db_sale_date == site_sale_date:
+    is_inactive = existing.get("is_active") is False or norm(existing.get("removed_at") or "") != ""
+
+    if same_identity and not record_needs_enrichment(existing) and not is_inactive and db_sale_date == site_sale_date:
         return {
             "action": "skip",
-            "reason": "sale_date unchanged",
+            "reason": "sale_date unchanged and record already enriched",
             "existing": existing,
             "tax_sale_id": tax_sale_id,
             "parcel_number": parcel_number,
             "site_sale_date": site_sale_date,
         }
 
-    if same_identity and payload_quality_score(existing) >= 8:
+    if same_identity and not record_needs_enrichment(existing) and db_sale_date != site_sale_date:
         return {
             "action": "update_sale_date_only",
             "reason": f"sale_date changed from {db_sale_date} to {site_sale_date}",
@@ -1187,7 +1278,7 @@ def decide_list_action(row: dict, indexes: dict) -> dict:
 
     return {
         "action": "open_detail",
-        "reason": "existing record incomplete or needs enrich",
+        "reason": "existing record incomplete, inactive, or needs enrich",
         "existing": existing,
         "tax_sale_id": tax_sale_id,
         "parcel_number": parcel_number,
@@ -1203,19 +1294,48 @@ def build_payload_from_case(case: dict, addr: dict) -> dict:
         "county": "PalmBeach",
         "state": "FL",
         "node": case.get("case"),
-        "auction_source_url": case.get("property_appraiser") or case.get("tax"),
+        "pdf_url": case.get("pdf"),
         "tax_sale_id": case.get("case"),
         "parcel_number": case.get("parcel"),
         "sale_date": normalize_sale_date_value(case.get("date")),
         "opening_bid": clean_bid(case.get("bid")),
         "deed_status": case.get("status"),
         "applicant_name": case.get("applicant"),
-        "pdf_url": case.get("pdf"),
         "address": addr.get("address"),
         "city": addr.get("city"),
         "state_address": addr.get("state"),
         "zip": addr.get("zip"),
-        "address_source": addr.get("source"),
+        "address_source_marker": addr.get("source"),
+        "status": "new",
+        "notes": None,
+        "auction_location": "Palm Beach Clerk Tax Deed",
+        "auction_start_time": None,
+        "auction_platform": "Palm Beach Tax Deed",
+        "auction_source_url": case.get("property_appraiser") or case.get("tax"),
+        "removed_at": None,
+        "is_active": True,
+        "updated_at": now_iso(),
+    }
+
+
+def build_index_record(existing_id: str | None, payload: dict) -> dict:
+    return {
+        "id": existing_id,
+        "node": payload.get("node"),
+        "tax_sale_id": payload.get("tax_sale_id"),
+        "parcel_number": payload.get("parcel_number"),
+        "sale_date": payload.get("sale_date"),
+        "address": payload.get("address"),
+        "city": payload.get("city"),
+        "state_address": payload.get("state_address"),
+        "zip": payload.get("zip"),
+        "pdf_url": payload.get("pdf_url"),
+        "auction_source_url": payload.get("auction_source_url"),
+        "opening_bid": payload.get("opening_bid"),
+        "deed_status": payload.get("deed_status"),
+        "applicant_name": payload.get("applicant_name"),
+        "is_active": True,
+        "removed_at": None,
     }
 
 
@@ -1223,7 +1343,7 @@ def build_payload_from_case(case: dict, addr: dict) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach FINAL V1 aligned with Miami/Orange logic ===")
+    log.info("=== Palm Beach FINAL V2 aligned with Miami/Orange logic ===")
 
     supabase_rows = supabase_fetch_all_palm_beach_records() if CAN_CHECK_SUPABASE else []
     indexes = build_supabase_indexes(supabase_rows)
@@ -1291,9 +1411,10 @@ def run_palm_beach():
 
                     if upd.get("sent"):
                         existing["sale_date"] = decision["site_sale_date"]
+                        existing["is_active"] = True
+                        existing["removed_at"] = None
                     continue
 
-                # only now open detail
                 detail_opens += 1
 
                 r = s.get(case_url, timeout=30)
@@ -1303,7 +1424,6 @@ def run_palm_beach():
                 case = parse_case(r.text, r.url)
                 status_value = (case.get("status") or "").strip().upper()
 
-                # we only want SALE
                 if status_value != "SALE":
                     log.info("SKIPPED non-SALE case after detail read → %s (%s)", case.get("status"), case.get("case"))
                     continue
@@ -1336,26 +1456,35 @@ def run_palm_beach():
                 existing = None
                 tax_sale_id = norm(payload.get("tax_sale_id") or "")
                 parcel_number = norm(payload.get("parcel_number") or "")
+                payload_node = norm(payload.get("node") or "")
+
                 if tax_sale_id and parcel_number:
                     existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
-                if not existing and node:
-                    existing = indexes["by_node"].get(node)
+                if not existing and payload_node:
+                    existing = indexes["by_node"].get(payload_node)
 
                 if existing and not payload_is_better_than_existing(payload, existing):
-                    log.info("DETAIL READ but payload not better → skip upsert node=%s", node)
-                    continue
+                    # mesmo que não esteja "melhor", precisamos reativar/normalizar se estava inativo
+                    is_inactive = existing.get("is_active") is False or norm(existing.get("removed_at") or "") != ""
+                    if not is_inactive:
+                        log.info("DETAIL READ but payload not better → skip save node=%s", payload_node)
+                        continue
 
-                sb_result = supabase_upsert_property(payload)
+                sb_result = supabase_save_property(payload, existing)
                 supabase_results.append({
-                    "node": node,
-                    "mode": "full_upsert",
+                    "node": payload_node,
+                    "mode": "full_save",
                     **sb_result,
                 })
 
                 if sb_result.get("sent"):
-                    indexes["by_node"][norm(payload.get("node") or "")] = payload
+                    record_id = sb_result.get("record_id") or (existing.get("id") if existing else None)
+                    idx_record = build_index_record(record_id, payload)
+
+                    if payload_node:
+                        indexes["by_node"][payload_node] = idx_record
                     if tax_sale_id and parcel_number:
-                        indexes["by_tax_sale_parcel"][(tax_sale_id, parcel_number)] = payload
+                        indexes["by_tax_sale_parcel"][(tax_sale_id, parcel_number)] = idx_record
 
                     send(payload)
 
@@ -1396,7 +1525,7 @@ def run_palm_beach():
 
         final_payload = {
             "source": "PalmBeach",
-            "mode": "final_v1_aligned_with_miami_orange",
+            "mode": "final_v2_aligned_with_miami_orange",
             "expected_total_items": expected_total_items,
             "seen_nodes_count": len(seen_nodes_this_run),
             "fast_skips": fast_skips,
