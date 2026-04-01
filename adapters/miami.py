@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -31,6 +32,10 @@ PAGINATION_DIAGNOSTIC_MODE = os.getenv("MIAMI_PAGINATION_DIAGNOSTIC_MODE", "fals
 # =========================
 # BASIC HELPERS
 # =========================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -68,10 +73,8 @@ def normalize_sale_date_value(value: str) -> Optional[str]:
     v = clean_text(value or "")
     if not v:
         return None
-
     if v.lower() in ("not assigned", "null", "none", "n/a", "na"):
         return None
-
     return v
 
 
@@ -88,8 +91,52 @@ def payload_quality_score(payload: dict) -> int:
         "auction_source_url",
         "opening_bid",
         "deed_status",
+        "applicant_name",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
+
+
+def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
+    new_score = payload_quality_score(payload)
+    old_score = payload_quality_score(existing)
+
+    if new_score > old_score:
+        return True
+
+    important_fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+    ]
+
+    for f in important_fields:
+        old_val = clean_text(existing.get(f) or "")
+        new_val = clean_text(payload.get(f) or "")
+        if not old_val and new_val:
+            return True
+
+    return False
+
+
+def record_needs_enrichment(existing: dict) -> bool:
+    important_fields = [
+        "pdf_url",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+        "auction_source_url",
+    ]
+    return any(not clean_text(existing.get(f) or "") for f in important_fields)
 
 
 # =========================
@@ -127,123 +174,89 @@ def sb_headers():
     }
 
 
-def supabase_find_existing_case(node: str):
-    if not CAN_CHECK_SUPABASE or not node:
-        return None
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.Miami-Dade"
-        f"&node=eq.{quote(str(node), safe='')}"
-        f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
-
-    try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
-        log.warning("supabase_find_existing_case non-200 status=%s body=%s", r.status_code, r.text[:300])
-    except Exception as e:
-        log.warning("supabase_find_existing_case failed: %s", str(e))
-
-    return None
-
-
-def supabase_find_existing_property(parcel_number: str, sale_date: str):
-    if not CAN_CHECK_SUPABASE or not parcel_number or not sale_date:
-        return None
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.Miami-Dade"
-        f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
-        f"&sale_date=eq.{quote(str(sale_date), safe='')}"
-        f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
-
-    try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
-        log.warning("supabase_find_existing_property non-200 status=%s body=%s", r.status_code, r.text[:300])
-    except Exception as e:
-        log.warning("supabase_find_existing_property failed: %s", str(e))
-
-    return None
-
-
-def supabase_fetch_existing_cases_by_nodes(nodes: List[str]) -> Dict[str, dict]:
-    """
-    Busca em lote os registros existentes pelo node.
-    Isso reduz MUITO o número de chamadas ao Supabase.
-    """
+def supabase_fetch_all_miami_records() -> List[dict]:
     if not CAN_CHECK_SUPABASE:
-        return {}
+        return []
 
-    clean_nodes = [str(x).strip() for x in nodes if str(x).strip()]
-    if not clean_nodes:
-        return {}
+    all_rows = []
+    offset = 0
+    page_size = 1000
 
-    results = {}
-    batch_size = 100
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.Miami-Dade"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,"
+            f"pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,is_active,removed_at"
+            f"&offset={offset}"
+            f"&limit={page_size}"
+        )
 
-    for i in range(0, len(clean_nodes), batch_size):
-        batch = clean_nodes[i:i + batch_size]
         try:
-            quoted_nodes = ",".join(f'"{quote(node, safe="")}"' for node in batch)
-            url = (
-                f"{SUPABASE_URL}/rest/v1/properties"
-                f"?county=eq.Miami-Dade"
-                f"&node=in.({quoted_nodes})"
-                f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-                f"&limit={len(batch)}"
-            )
-
-            r = requests.get(url, headers=sb_headers(), timeout=30)
+            r = requests.get(url, headers=sb_headers(), timeout=60)
             if r.status_code != 200:
-                log.warning(
-                    "supabase_fetch_existing_cases_by_nodes non-200 status=%s body=%s",
-                    r.status_code,
-                    r.text[:500],
-                )
-                continue
+                log.warning("supabase_fetch_all_miami_records failed status=%s body=%s", r.status_code, r.text[:500])
+                break
 
             arr = r.json() or []
-            for item in arr:
-                node = str(item.get("node") or "").strip()
-                if node:
-                    results[node] = item
+            if not arr:
+                break
+
+            all_rows.extend(arr)
+
+            if len(arr) < page_size:
+                break
+
+            offset += page_size
 
         except Exception as e:
-            log.warning("supabase_fetch_existing_cases_by_nodes batch failed: %s", str(e))
+            log.warning("supabase_fetch_all_miami_records exception: %s", str(e))
+            break
 
-    return results
+    log.info("Loaded %s Miami records from Supabase", len(all_rows))
+    return all_rows
+
+
+def build_supabase_indexes(rows: List[dict]) -> Dict[str, Dict]:
+    by_node = {}
+    by_tax_sale_parcel = {}
+
+    for row in rows:
+        node = clean_text(row.get("node") or "")
+        tax_sale_id = clean_text(row.get("tax_sale_id") or "")
+        parcel_number = clean_text(row.get("parcel_number") or "")
+
+        if node:
+            by_node[node] = row
+
+        if tax_sale_id and parcel_number:
+            by_tax_sale_parcel[(tax_sale_id, parcel_number)] = row
+
+    return {
+        "by_node": by_node,
+        "by_tax_sale_parcel": by_tax_sale_parcel,
+    }
 
 
 def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
-    if not CAN_CHECK_SUPABASE:
+    if not CAN_CHECK_SUPABASE or not record_id:
         return {
             "sent": False,
             "status_code": None,
-            "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
-        }
-
-    if not record_id:
-        return {
-            "sent": False,
-            "status_code": None,
-            "response_text": "Missing record id",
+            "record_id": record_id,
+            "response_text": "missing config or record id",
         }
 
     url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
     headers = sb_headers()
     headers["Prefer"] = "return=representation"
 
-    payload = {"sale_date": sale_date}
+    payload = {
+        "sale_date": sale_date,
+        "updated_at": now_iso(),
+        "is_active": True,
+        "removed_at": None,
+    }
 
     try:
         r = requests.patch(url, headers=headers, json=payload, timeout=20)
@@ -267,6 +280,7 @@ def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
         return {
             "sent": ok,
             "status_code": r.status_code,
+            "record_id": record_id,
             "response_text": r.text[:1000],
         }
 
@@ -275,88 +289,42 @@ def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
         return {
             "sent": False,
             "status_code": None,
+            "record_id": record_id,
             "response_text": str(e),
         }
 
 
-def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
-    new_score = payload_quality_score(payload)
-    old_score = payload_quality_score(existing)
-
-    if new_score > old_score:
-        return True
-
-    important_fields = [
-        "address",
-        "city",
-        "state_address",
-        "zip",
-        "pdf_url",
-        "auction_source_url",
-    ]
-
-    for f in important_fields:
-        old_val = (existing.get(f) or "").strip() if existing.get(f) else ""
-        new_val = (payload.get(f) or "").strip() if payload.get(f) else ""
-        if not old_val and new_val:
-            return True
-
-    return False
-
-
-def should_send_payload(payload: dict):
-    node = payload.get("node")
-    parcel = payload.get("parcel_number")
-    sale_date = payload.get("sale_date")
-
-    existing_case = supabase_find_existing_case(node)
-    if existing_case:
-        if payload_is_better_than_existing(payload, existing_case):
-            return True, "existing node found, but new payload is better"
-        return False, "duplicate node already exists"
-
-    existing_prop = supabase_find_existing_property(parcel, sale_date)
-    if existing_prop:
-        if payload_is_better_than_existing(payload, existing_prop):
-            return True, "existing parcel_number + sale_date found, but new payload is better"
-        return False, "duplicate parcel_number + sale_date already exists"
-
-    return True, "new record"
-
-
-def supabase_upsert_property(payload: dict) -> dict:
+def supabase_insert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
         return {
             "sent": False,
             "status_code": None,
             "node": payload.get("node"),
-            "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
-        }
-
-    should_send, reason = should_send_payload(payload)
-    log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
-
-    if not should_send:
-        return {
-            "sent": False,
-            "status_code": 200,
-            "node": payload.get("node"),
-            "response_text": reason,
+            "record_id": None,
+            "response_text": "SUPABASE not configured",
         }
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
-    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    headers["Prefer"] = "return=representation"
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         ok = r.status_code in (200, 201)
 
+        record_id = None
+        try:
+            body = r.json()
+            if isinstance(body, list) and body:
+                record_id = body[0].get("id")
+        except Exception:
+            pass
+
         if ok:
-            log.info("SUPABASE UPSERT OK status=%s node=%s", r.status_code, payload.get("node"))
+            log.info("SUPABASE INSERT OK node=%s status=%s id=%s", payload.get("node"), r.status_code, record_id)
         else:
             log.error(
-                "SUPABASE UPSERT FAILED status=%s node=%s body=%s",
+                "SUPABASE INSERT FAILED status=%s node=%s body=%s",
                 r.status_code,
                 payload.get("node"),
                 r.text[:600],
@@ -366,16 +334,70 @@ def supabase_upsert_property(payload: dict) -> dict:
             "sent": ok,
             "status_code": r.status_code,
             "node": payload.get("node"),
+            "record_id": record_id,
             "response_text": r.text[:1000],
         }
     except Exception as e:
-        log.exception("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        log.exception("SUPABASE INSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
         return {
             "sent": False,
             "status_code": None,
             "node": payload.get("node"),
+            "record_id": None,
             "response_text": str(e),
         }
+
+
+def supabase_update_property(record_id: str, payload: dict) -> dict:
+    if not CAN_CHECK_SUPABASE or not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": "missing config or record id",
+        }
+
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation"
+
+    try:
+        r = requests.patch(url, headers=headers, json=payload, timeout=30)
+        ok = r.status_code in (200, 204)
+
+        if ok:
+            log.info("SUPABASE PATCH OK id=%s node=%s status=%s", record_id, payload.get("node"), r.status_code)
+        else:
+            log.error(
+                "SUPABASE PATCH FAILED status=%s node=%s body=%s",
+                r.status_code,
+                payload.get("node"),
+                r.text[:600],
+            )
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
+    except Exception as e:
+        log.exception("SUPABASE PATCH EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": str(e),
+        }
+
+
+def supabase_save_property(payload: dict, existing: dict | None) -> dict:
+    if existing and existing.get("id"):
+        return supabase_update_property(existing["id"], payload)
+    return supabase_insert_property(payload)
 
 
 def supabase_list_all_nodes() -> List[str]:
@@ -1568,7 +1590,6 @@ def build_properties_payload(record: dict) -> dict:
         "state": "FL",
         "node": str(record.get("caseid") or ""),
         "pdf_url": record.get("parcel_appraiser_url") or None,
-        "auction_source_url": AUCTION_URL,
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
         "sale_date": normalize_sale_date_value(record.get("sale_date")),
@@ -1579,6 +1600,37 @@ def build_properties_payload(record: dict) -> dict:
         "city": city,
         "state_address": state_address,
         "zip": zip_code,
+        "address_source_marker": "CASE_SUMMARY_PROPERTY_ADDRESS" if address_only else None,
+        "status": "new",
+        "notes": None,
+        "auction_location": "Miami-Dade RealForeclose",
+        "auction_start_time": None,
+        "auction_platform": "Miami-Dade RealForeclose",
+        "auction_source_url": AUCTION_URL,
+        "removed_at": None,
+        "is_active": True,
+        "updated_at": now_iso(),
+    }
+
+
+def build_index_record(existing_id: Optional[str], payload: dict) -> dict:
+    return {
+        "id": existing_id,
+        "node": payload.get("node"),
+        "tax_sale_id": payload.get("tax_sale_id"),
+        "parcel_number": payload.get("parcel_number"),
+        "sale_date": payload.get("sale_date"),
+        "address": payload.get("address"),
+        "city": payload.get("city"),
+        "state_address": payload.get("state_address"),
+        "zip": payload.get("zip"),
+        "pdf_url": payload.get("pdf_url"),
+        "auction_source_url": payload.get("auction_source_url"),
+        "opening_bid": payload.get("opening_bid"),
+        "deed_status": payload.get("deed_status"),
+        "applicant_name": payload.get("applicant_name"),
+        "is_active": True,
+        "removed_at": None,
     }
 
 
@@ -1586,7 +1638,10 @@ def build_properties_payload(record: dict) -> dict:
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V7 + BATCH PRECHECK + SAFE DELETE ===")
+    log.info("=== MIAMI FINAL OPERATIONAL V8 + STANDARDIZED SAVE FLOW + SAFE DELETE ===")
+
+    supabase_rows = supabase_fetch_all_miami_records() if CAN_CHECK_SUPABASE else []
+    indexes = build_supabase_indexes(supabase_rows)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1654,14 +1709,10 @@ def run_miami():
             processed_pages += 1
             log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
 
-            page_nodes = []
             for row in rows:
                 caseid = str(row.get("caseid") or "").strip()
                 if caseid:
                     seen_nodes_this_run.add(caseid)
-                    page_nodes.append(caseid)
-
-            existing_by_node = supabase_fetch_existing_cases_by_nodes(page_nodes)
 
             for row in rows:
                 if total_processed_rows >= MAX_LOTS:
@@ -1687,56 +1738,51 @@ def run_miami():
                     pre_parcel_number = clean_text(row_parsed.get("parcel_number", ""))
                     pre_sale_date = normalize_sale_date_value(row_parsed.get("sale_date", ""))
 
-                    existing = existing_by_node.get(caseid)
+                    existing = indexes["by_node"].get(caseid)
+                    if not existing and pre_tax_sale_id and pre_parcel_number:
+                        existing = indexes["by_tax_sale_parcel"].get((pre_tax_sale_id, pre_parcel_number))
 
                     if existing:
-                        existing_tax_sale_id = clean_text(existing.get("tax_sale_id", ""))
-                        existing_parcel_number = clean_text(existing.get("parcel_number", ""))
-                        existing_sale_date = normalize_sale_date_value(existing.get("sale_date"))
-
+                        db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
                         same_identity = (
-                            existing_parcel_number == pre_parcel_number and
-                            (not existing_tax_sale_id or existing_tax_sale_id == pre_tax_sale_id)
+                            clean_text(existing.get("parcel_number") or "") == pre_parcel_number
+                            and (
+                                not clean_text(existing.get("tax_sale_id") or "")
+                                or clean_text(existing.get("tax_sale_id") or "") == pre_tax_sale_id
+                            )
                         )
+                        is_inactive = existing.get("is_active") is False or clean_text(existing.get("removed_at") or "") != ""
 
-                        if same_identity:
-                            if existing_sale_date == pre_sale_date:
-                                skipped_fast_same_sale_date += 1
-                                log.info(
-                                    "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
-                                    caseid,
-                                    pre_sale_date,
-                                    existing_sale_date,
-                                )
-                                continue
+                        if same_identity and not record_needs_enrichment(existing) and not is_inactive and db_sale_date == pre_sale_date:
+                            skipped_fast_same_sale_date += 1
+                            log.info(
+                                "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
+                                caseid,
+                                pre_sale_date,
+                                db_sale_date,
+                            )
+                            continue
 
+                        if same_identity and not record_needs_enrichment(existing) and db_sale_date != pre_sale_date:
                             update_result = supabase_update_sale_date(existing.get("id"), pre_sale_date)
                             supabase_results.append({
-                                "sent": update_result.get("sent", False),
-                                "status_code": update_result.get("status_code"),
                                 "node": caseid,
-                                "response_text": f"sale_date_only_update: {update_result.get('response_text', '')}",
+                                "mode": "update_sale_date_only",
+                                **update_result,
                             })
                             updated_sale_date_only += 1
+
+                            if update_result.get("sent"):
+                                existing["sale_date"] = pre_sale_date
+                                existing["is_active"] = True
+                                existing["removed_at"] = None
 
                             log.info(
                                 "SALE_DATE ONLY UPDATE node=%s old=%s new=%s",
                                 caseid,
-                                existing_sale_date,
+                                db_sale_date,
                                 pre_sale_date,
                             )
-
-                            # mantém app em sincronia só com mínimo necessário
-                            mini_payload = {
-                                "county": "Miami-Dade",
-                                "state": "FL",
-                                "node": caseid,
-                                "tax_sale_id": pre_tax_sale_id,
-                                "parcel_number": pre_parcel_number,
-                                "sale_date": pre_sale_date,
-                                "auction_source_url": AUCTION_URL,
-                            }
-                            send_to_app(mini_payload)
                             continue
 
                     opened_detail_count += 1
@@ -1754,10 +1800,47 @@ def run_miami():
 
                     prop_payload = build_properties_payload(record)
 
-                    sb_result = supabase_upsert_property(prop_payload)
-                    supabase_results.append(sb_result)
+                    existing = indexes["by_node"].get(prop_payload.get("node"))
+                    if not existing:
+                        key = (
+                            clean_text(prop_payload.get("tax_sale_id") or ""),
+                            clean_text(prop_payload.get("parcel_number") or ""),
+                        )
+                        if key[0] and key[1]:
+                            existing = indexes["by_tax_sale_parcel"].get(key)
 
-                    send_to_app(prop_payload)
+                    if existing and not payload_is_better_than_existing(prop_payload, existing):
+                        is_inactive = existing.get("is_active") is False or clean_text(existing.get("removed_at") or "") != ""
+                        if not is_inactive:
+                            log.info("DETAIL READ but payload not better → skip save node=%s", prop_payload.get("node"))
+                            open_list_and_apply_filter(page)
+                            if page_num > 1:
+                                ok = go_to_page_number(page, page_num)
+                                if not ok:
+                                    raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
+                            continue
+
+                    sb_result = supabase_save_property(prop_payload, existing)
+                    supabase_results.append({
+                        "node": prop_payload.get("node"),
+                        "mode": "full_save",
+                        **sb_result,
+                    })
+
+                    if sb_result.get("sent"):
+                        record_id = sb_result.get("record_id") or (existing.get("id") if existing else None)
+                        idx_record = build_index_record(record_id, prop_payload)
+
+                        node_key = clean_text(prop_payload.get("node") or "")
+                        tax_sale_key = clean_text(prop_payload.get("tax_sale_id") or "")
+                        parcel_key = clean_text(prop_payload.get("parcel_number") or "")
+
+                        if node_key:
+                            indexes["by_node"][node_key] = idx_record
+                        if tax_sale_key and parcel_key:
+                            indexes["by_tax_sale_parcel"][(tax_sale_key, parcel_key)] = idx_record
+
+                        send_to_app(prop_payload)
 
                     log.info("SUCCESS DETAIL OPEN node=%s", prop_payload.get("node"))
 
@@ -1815,7 +1898,7 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v7_batch_precheck_safe_delete",
+            "mode": "final_operational_v8_standardized_save_flow_safe_delete",
             "expected_total_pages": expected_total_pages,
             "expected_total_items": expected_total_items,
             "processed_pages": processed_pages,
