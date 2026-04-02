@@ -45,8 +45,14 @@ SAFE_DELETE_ENABLED = os.getenv("PALM_BEACH_SAFE_DELETE_ENABLED", "true").lower(
 # =========================
 # GENERIC HELPERS
 # =========================
-def norm(s):
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def textify(value) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def norm(value) -> str:
+    return re.sub(r"\s+", " ", textify(value)).strip()
 
 
 def clean_text(value):
@@ -62,7 +68,7 @@ def clean_bid(v):
     return cleaned or None
 
 
-def normalize_sale_date_value(value: str | None) -> str | None:
+def normalize_sale_date_value(value: Optional[str]) -> Optional[str]:
     v = norm(value or "")
     if not v:
         return None
@@ -89,7 +95,7 @@ def normalize_property_address(addr: str) -> str:
 def is_po_box(addr: str) -> bool:
     if not addr:
         return False
-    a = addr.upper().replace(".", "").replace("  ", " ")
+    a = norm(addr).upper().replace(".", "")
     return "PO BOX" in a or "P O BOX" in a or "POST OFFICE BOX" in a
 
 
@@ -158,9 +164,9 @@ def sanitize_address_payload(addr: dict) -> dict:
     return {
         "address": normalize_property_address(addr.get("address")),
         "city": norm(addr.get("city")) if addr.get("city") else None,
-        "state": addr.get("state"),
-        "zip": addr.get("zip"),
-        "source": addr.get("source"),
+        "state": norm(addr.get("state")).upper() if addr.get("state") else None,
+        "zip": norm(addr.get("zip")) if addr.get("zip") else None,
+        "source": norm(addr.get("source")) if addr.get("source") else None,
     }
 
 
@@ -200,15 +206,31 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
         "opening_bid",
         "deed_status",
         "applicant_name",
+        "address_source_marker",
     ]
 
     for f in important_fields:
-        old_val = norm(existing.get(f) or "")
-        new_val = norm(payload.get(f) or "")
+        old_val = norm(existing.get(f))
+        new_val = norm(payload.get(f))
         if not old_val and new_val:
             return True
 
     return False
+
+
+def existing_record_needs_enrichment(existing: dict) -> bool:
+    important_fields = [
+        "pdf_url",
+        "auction_source_url",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+    ]
+    return any(not norm(existing.get(f)) for f in important_fields)
 
 
 def human_pause(a=0.20, b=0.60):
@@ -315,7 +337,7 @@ def supabase_fetch_all_palm_beach_records() -> List[dict]:
         url = (
             f"{SUPABASE_URL}/rest/v1/properties"
             f"?county=eq.PalmBeach"
-            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,address_source_marker"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,address_source_marker,status,notes"
             f"&offset={offset}"
             f"&limit={page_size}"
         )
@@ -352,11 +374,14 @@ def supabase_fetch_all_palm_beach_records() -> List[dict]:
 def build_supabase_indexes(rows: List[dict]) -> dict:
     by_node = {}
     by_tax_sale_parcel = {}
+    by_tax_sale_id = {}
+    by_parcel_sale_date = {}
 
     for row in rows:
-        node = norm(row.get("node") or "")
-        tax_sale_id = norm(row.get("tax_sale_id") or "")
-        parcel_number = norm(row.get("parcel_number") or "")
+        node = norm(row.get("node"))
+        tax_sale_id = norm(row.get("tax_sale_id"))
+        parcel_number = norm(row.get("parcel_number"))
+        sale_date = normalize_sale_date_value(row.get("sale_date"))
 
         if node:
             by_node[node] = row
@@ -364,13 +389,21 @@ def build_supabase_indexes(rows: List[dict]) -> dict:
         if tax_sale_id and parcel_number:
             by_tax_sale_parcel[(tax_sale_id, parcel_number)] = row
 
+        if tax_sale_id:
+            by_tax_sale_id[tax_sale_id] = row
+
+        if parcel_number and sale_date:
+            by_parcel_sale_date[(parcel_number, sale_date)] = row
+
     return {
         "by_node": by_node,
         "by_tax_sale_parcel": by_tax_sale_parcel,
+        "by_tax_sale_id": by_tax_sale_id,
+        "by_parcel_sale_date": by_parcel_sale_date,
     }
 
 
-def supabase_update_sale_date(record_id: str, sale_date: str | None) -> dict:
+def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
     if not CAN_CHECK_SUPABASE or not record_id:
         return {
             "sent": False,
@@ -429,21 +462,10 @@ def supabase_insert_or_update_property(payload: dict) -> dict:
         ok = r.status_code in (200, 201)
 
         if ok:
-            returned = None
-            try:
-                returned = r.json()
-            except Exception:
-                returned = None
-
-            rec_id = None
-            if isinstance(returned, list) and returned:
-                rec_id = returned[0].get("id")
-
             log.info(
-                "SUPABASE INSERT OK node=%s status=%s id=%s",
+                "SUPABASE UPSERT OK node=%s status=%s",
                 payload.get("node"),
                 r.status_code,
-                rec_id,
             )
         else:
             log.warning(
@@ -951,11 +973,7 @@ def extract_case_rows_from_current_results(page) -> List[dict]:
         try:
             row = rows.nth(i)
             row_id = norm(row.get_attribute("id") or "")
-            if not row_id:
-                continue
-            if row_id.lower() == "jqgfirstrow":
-                continue
-            if not row_id.isdigit():
+            if not row_id or row_id.lower() == "jqgfirstrow" or not row_id.isdigit():
                 continue
 
             case_url = f"{BASE_URL}/Home/Details?id={row_id}"
@@ -1139,35 +1157,31 @@ def parse_case(html: str, url: str) -> dict:
 # =========================
 # LIST PRECHECK DECISION
 # =========================
-def existing_record_needs_enrichment(existing: dict) -> bool:
-    important_fields = [
-        "pdf_url",
-        "auction_source_url",
-        "address",
-        "city",
-        "state_address",
-        "zip",
-        "opening_bid",
-        "deed_status",
-        "applicant_name",
-    ]
-    return any(not norm(existing.get(f) or "") for f in important_fields)
-
-
 def decide_list_action(row: dict, indexes: dict) -> dict:
     summary = row.get("summary") or {}
 
-    tax_sale_id = norm(summary.get("tax_sale_id") or "")
-    parcel_number = norm(summary.get("parcel_number") or "")
+    tax_sale_id = norm(summary.get("tax_sale_id"))
+    parcel_number = norm(summary.get("parcel_number"))
     site_sale_date = normalize_sale_date_value(summary.get("sale_date"))
 
-    existing = None
+    # Se a lista não trouxe identidade suficiente, não arrisca.
+    if not tax_sale_id or not parcel_number:
+        return {
+            "action": "open_detail",
+            "reason": "insufficient list identity",
+            "existing": None,
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
 
-    if tax_sale_id and parcel_number:
-        existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
+    existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
 
-    if not existing and tax_sale_id:
-        existing = indexes["by_node"].get(tax_sale_id)
+    if not existing:
+        existing = indexes["by_tax_sale_id"].get(tax_sale_id)
+
+    if not existing and parcel_number and site_sale_date:
+        existing = indexes["by_parcel_sale_date"].get((parcel_number, site_sale_date))
 
     if not existing:
         return {
@@ -1179,12 +1193,29 @@ def decide_list_action(row: dict, indexes: dict) -> dict:
             "site_sale_date": site_sale_date,
         }
 
+    existing_tax_sale_id = norm(existing.get("tax_sale_id"))
+    existing_parcel_number = norm(existing.get("parcel_number"))
     db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
+
+    same_identity = (
+        existing_tax_sale_id == tax_sale_id and
+        existing_parcel_number == parcel_number
+    )
+
+    if not same_identity:
+        return {
+            "action": "open_detail",
+            "reason": "matched loosely but identity not exact",
+            "existing": existing,
+            "tax_sale_id": tax_sale_id,
+            "parcel_number": parcel_number,
+            "site_sale_date": site_sale_date,
+        }
 
     if existing_record_needs_enrichment(existing):
         return {
             "action": "open_detail",
-            "reason": "record exists but needs enrichment",
+            "reason": "existing record incomplete",
             "existing": existing,
             "tax_sale_id": tax_sale_id,
             "parcel_number": parcel_number,
@@ -1241,7 +1272,7 @@ def build_payload_from_case(case: dict, addr: dict) -> dict:
 # MAIN
 # =========================
 def run_palm_beach():
-    log.info("=== Palm Beach FINAL V2 aligned with Miami/Orange logic ===")
+    log.info("=== Palm Beach FINAL V2.1 ===")
 
     supabase_rows = supabase_fetch_all_palm_beach_records() if CAN_CHECK_SUPABASE else []
     indexes = build_supabase_indexes(supabase_rows)
@@ -1285,10 +1316,10 @@ def run_palm_beach():
         s.headers.update(HEADERS)
 
         processed_rows = 0
-        resolved_nodes = set()
+        resolved_final_nodes = set()
 
         for idx, row in enumerate(discovered_rows, start=1):
-            row_id = norm(row.get("row_id") or "")
+            row_id = norm(row.get("row_id"))
             case_url = row.get("case_url")
             summary = row.get("summary") or {}
 
@@ -1311,14 +1342,14 @@ def run_palm_beach():
                     decision["reason"],
                 )
 
-                tax_sale_id = norm(decision.get("tax_sale_id") or "")
-                if tax_sale_id:
-                    seen_nodes_this_run.add(tax_sale_id)
+                provisional_tax_sale_id = norm(decision.get("tax_sale_id"))
+                if provisional_tax_sale_id:
+                    seen_nodes_this_run.add(provisional_tax_sale_id)
 
                 if decision["action"] == "skip":
                     fast_skips += 1
-                    if tax_sale_id:
-                        resolved_nodes.add(tax_sale_id)
+                    if provisional_tax_sale_id:
+                        resolved_final_nodes.add(provisional_tax_sale_id)
                     continue
 
                 if decision["action"] == "update_sale_date_only":
@@ -1333,9 +1364,20 @@ def run_palm_beach():
 
                     if upd.get("sent"):
                         existing["sale_date"] = decision["site_sale_date"]
+                        mini_payload = {
+                            "county": "PalmBeach",
+                            "state": "FL",
+                            "node": existing.get("node"),
+                            "tax_sale_id": existing.get("tax_sale_id"),
+                            "parcel_number": existing.get("parcel_number"),
+                            "sale_date": decision["site_sale_date"],
+                            "auction_source_url": existing.get("auction_source_url"),
+                        }
+                        send(mini_payload)
 
                     if existing.get("node"):
-                        resolved_nodes.add(norm(existing.get("node")))
+                        resolved_final_nodes.add(norm(existing.get("node")))
+                        seen_nodes_this_run.add(norm(existing.get("node")))
                     continue
 
                 detail_opens += 1
@@ -1345,7 +1387,7 @@ def run_palm_beach():
                     raise RuntimeError(f"Invalid case detail page status={r.status_code}")
 
                 case = parse_case(r.text, r.url)
-                status_value = (case.get("status") or "").strip().upper()
+                status_value = norm(case.get("status")).upper()
 
                 if status_value != "SALE":
                     log.info(
@@ -1355,7 +1397,7 @@ def run_palm_beach():
                     )
                     continue
 
-                final_node = norm(case.get("case") or "")
+                final_node = norm(case.get("case"))
                 if not final_node:
                     raise RuntimeError("Missing final case number/node in detail page")
 
@@ -1366,7 +1408,7 @@ def run_palm_beach():
                 if case.get("pdf"):
                     try:
                         pdf = s.get(case["pdf"], timeout=60)
-                        if "pdf" in (pdf.headers.get("content-type") or "").lower():
+                        if "pdf" in norm(pdf.headers.get("content-type")).lower():
                             addr = extract_pdf_addr(pdf.content)
                         else:
                             log.warning(
@@ -1391,17 +1433,22 @@ def run_palm_beach():
                 results.append(payload)
 
                 existing = None
-                tax_sale_id = norm(payload.get("tax_sale_id") or "")
-                parcel_number = norm(payload.get("parcel_number") or "")
+                tax_sale_id = norm(payload.get("tax_sale_id"))
+                parcel_number = norm(payload.get("parcel_number"))
+                sale_date = normalize_sale_date_value(payload.get("sale_date"))
 
                 if tax_sale_id and parcel_number:
                     existing = indexes["by_tax_sale_parcel"].get((tax_sale_id, parcel_number))
+                if not existing and tax_sale_id:
+                    existing = indexes["by_tax_sale_id"].get(tax_sale_id)
+                if not existing and parcel_number and sale_date:
+                    existing = indexes["by_parcel_sale_date"].get((parcel_number, sale_date))
                 if not existing and final_node:
                     existing = indexes["by_node"].get(final_node)
 
                 if existing and not payload_is_better_than_existing(payload, existing):
                     log.info("DETAIL READ but payload not better → skip upsert node=%s", final_node)
-                    resolved_nodes.add(final_node)
+                    resolved_final_nodes.add(final_node)
                     continue
 
                 sb_result = supabase_insert_or_update_property(payload)
@@ -1418,14 +1465,18 @@ def run_palm_beach():
                     indexes["by_node"][final_node] = payload
                     if tax_sale_id and parcel_number:
                         indexes["by_tax_sale_parcel"][(tax_sale_id, parcel_number)] = payload
+                    if tax_sale_id:
+                        indexes["by_tax_sale_id"][tax_sale_id] = payload
+                    if parcel_number and sale_date:
+                        indexes["by_parcel_sale_date"][(parcel_number, sale_date)] = payload
 
                     send(payload)
 
-                resolved_nodes.add(final_node)
+                resolved_final_nodes.add(final_node)
                 time.sleep(0.8)
 
             except Exception as e:
-                log.error("ERROR row_id=%s url=%s: %s", row_id, case_url, str(e))
+                log.exception("ERROR row_id=%s url=%s", row_id, case_url)
                 failures.append({
                     "row_id": row_id,
                     "case_url": case_url,
@@ -1440,11 +1491,11 @@ def run_palm_beach():
             and completed_all_pages
             and expected_total_items > 0
             and len(failures) == 0
-            and len(seen_nodes_this_run) > 0
+            and len(resolved_final_nodes) > 0
         )
 
         if can_delete_missing:
-            reconcile_result = reconcile_supabase_to_site(seen_nodes_this_run, indexes)
+            reconcile_result = reconcile_supabase_to_site(resolved_final_nodes, indexes)
         else:
             reconcile_result = {
                 "executed": False,
@@ -1453,18 +1504,18 @@ def run_palm_beach():
                     f"SAFE_DELETE_ENABLED={SAFE_DELETE_ENABLED}, "
                     f"completed_all_pages={completed_all_pages}, "
                     f"expected_total_items={expected_total_items}, "
-                    f"seen_nodes={len(seen_nodes_this_run)}, "
+                    f"resolved_final_nodes={len(resolved_final_nodes)}, "
                     f"failures_count={len(failures)}"
                 ),
             }
 
         final_payload = {
             "source": "PalmBeach",
-            "mode": "final_v2_aligned_with_miami_orange",
+            "mode": "final_v2_1",
             "expected_total_items": expected_total_items,
             "processed_rows": processed_rows,
             "seen_nodes_count": len(seen_nodes_this_run),
-            "resolved_nodes_count": len(resolved_nodes),
+            "resolved_final_nodes_count": len(resolved_final_nodes),
             "fast_skips": fast_skips,
             "sale_date_only_updates": sale_date_only_updates,
             "detail_opens": detail_opens,
