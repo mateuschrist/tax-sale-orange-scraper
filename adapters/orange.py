@@ -49,6 +49,11 @@ TESSERACT_CMD = (os.getenv("TESSERACT_CMD", "") or "").strip()
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
+ORANGE_STATUS_LABELS = [
+    "Active Sale",
+    "Lands Available",
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("taxdeed-orange-scraper")
 
@@ -61,7 +66,7 @@ def now_iso() -> str:
 
 
 def norm_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    return re.sub(r"\s+", " ", str(s or "")).strip()
 
 
 def clean_text(value):
@@ -421,10 +426,6 @@ def update_property_by_id(record_id: str, payload: dict) -> dict:
 
 
 def supabase_save_property(payload: dict, existing: dict | None) -> dict:
-    """
-    Se existe -> PATCH por id
-    Se não existe -> INSERT
-    """
     if existing and existing.get("id"):
         return update_property_by_id(existing["id"], payload)
     return insert_property(payload)
@@ -758,10 +759,14 @@ def build_payload_from_detail(
     pdf_url: str,
     list_fields: dict,
     addr: dict,
+    source_search_status: str,
 ) -> dict:
     notes = None
     if not addr.get("marker_found"):
         notes = f"Address marker not found via OCR first {OCR_MAX_PAGES} pages."
+
+    if source_search_status:
+        notes = f"{notes} | source_search_status={source_search_status}" if notes else f"source_search_status={source_search_status}"
 
     return {
         "county": "Orange",
@@ -861,7 +866,45 @@ def decide_list_action(list_fields: dict, existing: dict | None) -> dict:
 # =========================
 # BOOTSTRAP
 # =========================
-def bootstrap_to_printable(p, headless: bool):
+def set_status_by_visible_text(page, visible_text: str) -> bool:
+    try:
+        sel = page.locator("select[name='DeedStatusID']")
+        if sel.count() == 0:
+            log.warning("Dropdown DeedStatusID not found")
+            return False
+
+        options = sel.locator("option")
+        count = options.count()
+
+        matched_value = None
+        for i in range(count):
+            opt = options.nth(i)
+            txt = clean_text(opt.inner_text())
+            val = opt.get_attribute("value")
+            if txt.lower() == visible_text.lower():
+                matched_value = val
+                break
+
+        if matched_value is None:
+            available = []
+            for i in range(count):
+                try:
+                    available.append(clean_text(options.nth(i).inner_text()))
+                except Exception:
+                    continue
+            log.warning("Status option not found: %s | available=%s", visible_text, available)
+            return False
+
+        page.select_option("select[name='DeedStatusID']", value=matched_value)
+        log.info("Selected Orange status by text=%s value=%s", visible_text, matched_value)
+        return True
+
+    except Exception as e:
+        log.warning("set_status_by_visible_text failed for %s: %s", visible_text, str(e))
+        return False
+
+
+def bootstrap_to_printable(p, headless: bool, deed_status_label: str):
     browser = p.chromium.launch(headless=headless)
     context = browser.new_context()
     page = context.new_page()
@@ -881,11 +924,15 @@ def bootstrap_to_printable(p, headless: bool):
     page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=MAX_WAIT)
     wait_network(page)
 
-    if page.locator("select[name='DeedStatusID']").count() > 0:
-        page.select_option("select[name='DeedStatusID']", value="AS")
-        log.info("Set DeedStatusID=AS")
-    else:
-        log.warning("Dropdown DeedStatusID not found; selector may need update.")
+    if not set_status_by_visible_text(page, deed_status_label):
+        if deed_status_label == "Active Sale":
+            try:
+                page.select_option("select[name='DeedStatusID']", value="AS")
+                log.info("Fallback selected DeedStatusID=AS")
+            except Exception:
+                raise RuntimeError(f"Could not select Orange status '{deed_status_label}'")
+        else:
+            raise RuntimeError(f"Could not select Orange status '{deed_status_label}'")
 
     ok = click_any(page, [
         "input[type='submit'][value='Search']",
@@ -910,7 +957,7 @@ def bootstrap_to_printable(p, headless: bool):
     wait_network(page, 30_000)
 
     printable_url = page.url
-    log.info("After Printable URL: %s", printable_url)
+    log.info("After Printable URL (%s): %s", deed_status_label, printable_url)
 
     if DEBUG_HTML:
         log.info("Printable HTML length: %d", len(page.content()))
@@ -967,6 +1014,7 @@ def run():
     log.info("USE_STATE=%s STATE_KEY=%s START_AFTER_LAST_NODE=%s", USE_STATE, STATE_KEY, START_AFTER_LAST_NODE)
     log.info("MAX_LOTS=%s RESTART_BROWSER_EVERY=%s HEADLESS=%s", MAX_LOTS, RESTART_BROWSER_EVERY, HEADLESS)
     log.info("OCR_MAX_PAGES=%s OCR_SCALE=%s", OCR_MAX_PAGES, OCR_SCALE)
+    log.info("ORANGE statuses=%s", ORANGE_STATUS_LABELS)
 
     last_node = None
     if USE_STATE:
@@ -985,28 +1033,54 @@ def run():
             raise
 
     with sync_playwright() as p:
-        browser = context = page = None
-        printable_url = ""
+        all_lots = []
+        seen_lot_nodes = set()
+        status_counts = {}
 
-        browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
+        for deed_status_label in ORANGE_STATUS_LABELS:
+            browser = context = page = None
+            printable_url = ""
 
-        lots = extract_lots_from_printable(page)
-        if not lots:
-            safe_close(browser, context, page)
-            raise RuntimeError("No lots found on printable page.")
+            try:
+                browser, context, page, printable_url = bootstrap_to_printable(
+                    p,
+                    HEADLESS,
+                    deed_status_label,
+                )
 
-        total_site_items = len(lots)
-        log.info("Total lots found in Orange printable: %s", total_site_items)
+                lots = extract_lots_from_printable(page)
+                status_counts[deed_status_label] = len(lots)
+                log.info("Orange status=%s lots found=%s", deed_status_label, len(lots))
+
+                for lot in lots:
+                    node = clean_text(lot.get("node"))
+                    if not node or node in seen_lot_nodes:
+                        continue
+
+                    seen_lot_nodes.add(node)
+                    lot["source_search_status"] = deed_status_label
+                    lot["printable_url"] = printable_url
+                    all_lots.append(lot)
+
+            finally:
+                safe_close(browser, context, page)
+
+        if not all_lots:
+            raise RuntimeError("No lots found across Orange statuses")
+
+        total_site_items = len(all_lots)
+        log.info("Total unique lots found in Orange across all statuses: %s", total_site_items)
+        log.info("Status counts: %s", status_counts)
 
         if START_AFTER_LAST_NODE and last_node:
-            pos = next((i for i, l in enumerate(lots) if l["node"] == last_node), None)
+            pos = next((i for i, l in enumerate(all_lots) if l["node"] == last_node), None)
             if pos is not None:
-                lots = lots[pos + 1:]
-                log.info("Continuing AFTER last_node. Remaining lots=%d", len(lots))
+                all_lots = all_lots[pos + 1:]
+                log.info("Continuing AFTER last_node. Remaining lots=%d", len(all_lots))
             else:
-                log.info("last_node not found in current list → processing from top.")
+                log.info("last_node not found in current combined list → processing from top.")
 
-        selected = lots[:MAX_LOTS]
+        selected = all_lots[:MAX_LOTS]
         log.info("Selected lots count=%d", len(selected))
         log.info("First nodes: %s", [l["node"] for l in selected[:10]])
 
@@ -1018,23 +1092,46 @@ def run():
         completed_all_selected = False
         can_delete_missing = False
 
-        for idx, lot in enumerate(selected, start=1):
-            if RESTART_BROWSER_EVERY > 0 and idx > 1 and (idx - 1) % RESTART_BROWSER_EVERY == 0:
-                log.warning("Restarting browser after %d lots...", idx - 1)
-                safe_close(browser, context, page)
-                browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
+        browser = context = page = None
+        printable_url = ""
+        current_status_label = None
 
+        for idx, lot in enumerate(selected, start=1):
             node = clean_text(lot["node"])
             row_text = lot["row_text"]
             tax_sale_url = lot["tax_sale_url"]
             list_fields = lot["list_fields"]
+            deed_status_label = clean_text(lot.get("source_search_status"))
+            stored_printable_url = lot.get("printable_url", "")
 
             seen_nodes_this_run.add(node)
 
-            log.info("----- LOT %d/%d node=%s -----", idx, len(selected), node)
+            log.info("----- LOT %d/%d node=%s status_group=%s -----", idx, len(selected), node, deed_status_label)
             log.info("Row text: %s", row_text[:220])
 
             try:
+                need_new_session = False
+
+                if browser is None or context is None or page is None:
+                    need_new_session = True
+
+                if RESTART_BROWSER_EVERY > 0 and idx > 1 and (idx - 1) % RESTART_BROWSER_EVERY == 0:
+                    need_new_session = True
+
+                if current_status_label != deed_status_label:
+                    need_new_session = True
+
+                if need_new_session:
+                    safe_close(browser, context, page)
+                    browser, context, page, printable_url = bootstrap_to_printable(
+                        p,
+                        HEADLESS,
+                        deed_status_label,
+                    )
+                    current_status_label = deed_status_label
+                else:
+                    printable_url = stored_printable_url or printable_url
+
                 key = (
                     clean_text(list_fields.get("tax_sale_id")),
                     clean_text(list_fields.get("parcel_number")),
@@ -1122,9 +1219,9 @@ def run():
                     pdf_url=pdf_url,
                     list_fields=list_fields,
                     addr=addr,
+                    source_search_status=deed_status_label,
                 )
 
-                # preserve created record semantics while reactivating existing record
                 if existing and existing.get("id"):
                     payload["is_active"] = True
                     payload["removed_at"] = None
@@ -1184,16 +1281,20 @@ def run():
                 log.exception("LOT FAILED node=%s error=%s", node, str(e))
                 failures.append({
                     "node": node,
+                    "status_group": deed_status_label,
                     "error": str(e),
                 })
 
             try:
-                page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
-                wait_network(page, 30_000)
+                if page and printable_url:
+                    page.goto(printable_url, wait_until="domcontentloaded", timeout=MAX_WAIT)
+                    wait_network(page, 30_000)
             except Exception:
                 log.warning("Failed to return printable. Hard reset session.")
                 safe_close(browser, context, page)
-                browser, context, page, printable_url = bootstrap_to_printable(p, HEADLESS)
+                browser = context = page = None
+                printable_url = ""
+                current_status_label = None
 
             time.sleep(1.0)
 
@@ -1226,7 +1327,8 @@ def run():
 
         final_payload = {
             "source": "Orange",
-            "mode": "orange_fast_precheck_in_memory_index_safe_delete_v2",
+            "mode": "orange_active_sale_plus_lands_available",
+            "status_counts": status_counts,
             "total_site_items": total_site_items,
             "selected_count": len(selected),
             "seen_nodes_count": len(seen_nodes_this_run),
