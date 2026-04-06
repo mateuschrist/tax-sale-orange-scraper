@@ -784,10 +784,32 @@ def click_search_button(page) -> bool:
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
-    if not click_safe(page, "a.filters-reset", "RESET FILTERS"):
-        raise RuntimeError("Could not reset filters")
+    # ✅ AQUI - Substitua as linhas 787-789 por este código
+    reset_selectors = [
+        "a.filters-reset",
+        "button.filters-reset",
+        "[class*='filters-reset']",
+        "a[href*='reset']",
+        "text=Reset",
+    ]
+    
+    reset_clicked = False
+    for selector in reset_selectors:
+        if click_safe(page, selector, f"RESET FILTERS ({selector})"):
+            reset_clicked = True
+            break
+    
+    if not reset_clicked:
+        log.warning("Could not reset filters with standard selectors, taking screenshot for debug...")
+        try:
+            page.screenshot(path="miami_filters_debug.png")
+        except Exception as e:
+            log.warning("Could not save screenshot: %s", str(e))
+        # Continua mesmo sem conseguir resetar
+    
     page.wait_for_timeout(1500)
 
+    # ✅ Resto da função permanece igual (linhas 791+)
     if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
         raise RuntimeError("Could not open filter button")
     page.wait_for_timeout(1000)
