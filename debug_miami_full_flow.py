@@ -1,9 +1,11 @@
 """
-Debug script para testar TODOS os passos de navegação do Miami-Dade
-Testa múltiplas estratégias para cada ação e retorna um relatório completo
+Debug script COMPLETO do Miami-Dade
+Extrai TODAS as etapas do scraper original + múltiplas estratégias
+Objetivo: Descobrir EXATAMENTE qual método funciona para cada ação
 """
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -12,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("miami_debug")
+log = logging.getLogger("miami_debug_full")
 
 BASE_URL = "https://miamidade.realtdm.com"
 LIST_URL = f"{BASE_URL}/public/cases/list"
@@ -21,10 +23,52 @@ REPORT = {
     "timestamp": datetime.now().isoformat(),
     "steps": [],
     "success_methods": {},
+    "collected_data": {
+        "first_page_cases": [],
+        "case_details": [],
+        "pagination_info": {},
+    },
     "failed_steps": [],
 }
 
-def report_step(step_name, success, method="", details="", screenshot_name=""):
+# =====================
+# HELPERS DO SCRAPER
+# =====================
+def clean_text(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+def clean_multiline(value):
+    if value is None:
+        return ""
+    lines = [re.sub(r"\s+", " ", x).strip(" ,") for x in str(value).splitlines()]
+    lines = [x for x in lines if x]
+    return ", ".join(lines)
+
+def money_from_text(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"\$[\d,]+(?:\.\d{2})?", text)
+    return m.group(0) if m else ""
+
+def parse_row_text(row_text: str):
+    """Parse da linha de caso conforme scraper original"""
+    parts = re.split(r"\s{2,}|\t", row_text)
+    parts = [clean_text(x) for x in parts if clean_text(x)]
+    return {
+        "status": parts[0] if len(parts) > 0 else "",
+        "case_number": parts[1] if len(parts) > 1 else "",
+        "date_created": parts[2] if len(parts) > 2 else "",
+        "application_number": parts[3] if len(parts) > 3 else "",
+        "parcel_number": parts[4] if len(parts) > 4 else "",
+        "sale_date": parts[5] if len(parts) > 5 else "",
+    }
+
+# =====================
+# REPORT SYSTEM
+# =====================
+def report_step(step_name, success, method="", details="", screenshot_name="", data=None):
     """Registra um passo no relatório"""
     entry = {
         "step": step_name,
@@ -33,6 +77,7 @@ def report_step(step_name, success, method="", details="", screenshot_name=""):
         "details": details,
         "screenshot": screenshot_name,
         "timestamp": datetime.now().isoformat(),
+        "data": data or {}
     }
     REPORT["steps"].append(entry)
     
@@ -44,8 +89,11 @@ def report_step(step_name, success, method="", details="", screenshot_name=""):
     status = "✅" if success else "❌"
     log.info(f"{status} {step_name}: {method or 'N/A'} | {details}")
 
+# =====================
+# STEP 1: PAGE LOAD
+# =====================
 def test_page_load(page):
-    """Testa carregamento da página"""
+    """Carrega a página"""
     log.info("\n" + "="*80)
     log.info("STEP 1: Carregando página do Miami-Dade")
     log.info("="*80)
@@ -55,7 +103,6 @@ def test_page_load(page):
         page.wait_for_timeout(6000)
         page.screenshot(path="debug_01_page_loaded.png")
         
-        # Verificar se página carregou
         body_text = page.content()
         if "miamidade" in body_text.lower():
             report_step("Page Load", True, "goto + domcontentloaded", 
@@ -63,264 +110,346 @@ def test_page_load(page):
             return True
     except Exception as e:
         report_step("Page Load", False, "goto", f"Erro: {str(e)}")
-        return False
     
     return False
 
+# =====================
+# STEP 2: RESET FILTERS
+# =====================
 def test_reset_filters(page):
-    """Testa todas as maneiras de clicar no botão RESET FILTERS"""
+    """Testa RESET FILTERS com todas as estratégias do scraper"""
     log.info("\n" + "="*80)
-    log.info("STEP 2: Testando click em RESET FILTERS")
+    log.info("STEP 2: Reset Filters (a.filters-reset)")
     log.info("="*80)
     
-    # Método 1: Locator direto
+    # Método 1: Click normal
     try:
-        loc = page.locator("a.filters-reset").first
-        if loc.count() > 0:
-            loc.click(timeout=5000)
-            page.wait_for_timeout(1500)
-            page.screenshot(path="debug_02_reset_method1.png")
-            report_step("Reset Filters", True, "Locator: a.filters-reset", 
-                       "Click normal bem-sucedido")
-            return True
+        page.click("a.filters-reset", timeout=6000)
+        page.wait_for_timeout(1500)
+        page.screenshot(path="debug_02_reset_m1.png")
+        report_step("Reset Filters", True, "page.click(selector)", 
+                   "Click normal bem-sucedido", "debug_02_reset_m1.png")
+        return True
     except Exception as e:
-        report_step("Reset Filters", False, "Locator: a.filters-reset", str(e))
+        report_step("Reset Filters", False, "page.click(selector)", str(e))
 
-    # Método 2: Force click
+    # Método 2: Locator force
     try:
-        loc = page.locator("a.filters-reset").first
-        if loc.count() > 0:
-            loc.click(force=True, timeout=5000)
-            page.wait_for_timeout(1500)
-            page.screenshot(path="debug_02_reset_method2.png")
-            report_step("Reset Filters", True, "Locator: a.filters-reset (force)", 
-                       "Force click bem-sucedido")
-            return True
+        page.locator("a.filters-reset").first.click(force=True, timeout=6000)
+        page.wait_for_timeout(1500)
+        page.screenshot(path="debug_02_reset_m2.png")
+        report_step("Reset Filters", True, "locator.first.click(force=True)", 
+                   "Force click bem-sucedido", "debug_02_reset_m2.png")
+        return True
     except Exception as e:
-        report_step("Reset Filters", False, "Locator: a.filters-reset (force)", str(e))
+        report_step("Reset Filters", False, "locator.first.click(force=True)", str(e))
 
-    # Método 3: JavaScript direto
-    try:
-        result = page.evaluate(
-            """() => {
-                const el = document.querySelector('a.filters-reset');
-                if (!el) return false;
-                el.click();
-                return true;
-            }"""
-        )
-        if result:
-            page.wait_for_timeout(1500)
-            page.screenshot(path="debug_02_reset_method3.png")
-            report_step("Reset Filters", True, "JavaScript: document.querySelector + click", 
-                       "JS direto bem-sucedido")
-            return True
-    except Exception as e:
-        report_step("Reset Filters", False, "JavaScript: querySelector + click", str(e))
-
-    # Método 4: Mouse events via JS
+    # Método 3: JS fallback
     try:
         page.evaluate(
-            """() => {
-                const el = document.querySelector('a.filters-reset');
-                if (!el) return false;
-                el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                return true;
-            }"""
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error(`not found: ${sel}`);
+                el.click();
+            }""",
+            "a.filters-reset",
         )
         page.wait_for_timeout(1500)
-        page.screenshot(path="debug_02_reset_method4.png")
-        report_step("Reset Filters", True, "JavaScript: Synthetic mouse events", 
-                   "Mouse events bem-sucedidos")
+        page.screenshot(path="debug_02_reset_m3.png")
+        report_step("Reset Filters", True, "page.evaluate(js)", 
+                   "JS fallback bem-sucedido", "debug_02_reset_m3.png")
         return True
     except Exception as e:
-        report_step("Reset Filters", False, "JavaScript: Synthetic mouse events", str(e))
-
-    # Método 5: Procurar por variações do seletor
-    selectors = [
-        "button.filters-reset",
-        ".filters-reset",
-        "[class*='filters-reset']",
-        "a[class*='reset']",
-    ]
+        report_step("Reset Filters", False, "page.evaluate(js)", str(e))
     
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click(timeout=5000)
-                page.wait_for_timeout(1500)
-                page.screenshot(path=f"debug_02_reset_method5_{sel.replace('[', '').replace(']', '')}.png")
-                report_step("Reset Filters", True, f"Locator: {sel}", 
-                           f"Seletor alternativo encontrado")
-                return True
-        except Exception:
-            continue
-    
-    report_step("Reset Filters", False, "Todos os métodos", "Nenhum método funcionou")
     return False
 
+# =====================
+# STEP 3: OPEN FILTER BUTTON
+# =====================
 def test_filter_button(page):
-    """Testa todas as maneiras de abrir o filtro de STATUS"""
+    """Abre o botão de filtro STATUS"""
     log.info("\n" + "="*80)
-    log.info("STEP 3: Testando click em FILTER BUTTON (Status)")
+    log.info("STEP 3: Open Filter Button (#filterButtonStatus)")
     log.info("="*80)
     
-    # Método 1: Locator direto
+    # Método 1: Click normal
     try:
-        loc = page.locator("#filterButtonStatus").first
-        if loc.count() > 0:
-            loc.click(timeout=5000)
-            page.wait_for_timeout(1000)
-            page.screenshot(path="debug_03_filter_method1.png")
-            report_step("Filter Button", True, "Locator: #filterButtonStatus", 
-                       "Click normal bem-sucedido")
-            return True
+        page.click("#filterButtonStatus", timeout=6000)
+        page.wait_for_timeout(1000)
+        page.screenshot(path="debug_03_filter_m1.png")
+        report_step("Filter Button", True, "page.click(selector)", 
+                   "Click normal bem-sucedido", "debug_03_filter_m1.png")
+        return True
     except Exception as e:
-        report_step("Filter Button", False, "Locator: #filterButtonStatus", str(e))
+        report_step("Filter Button", False, "page.click(selector)", str(e))
 
-    # Método 2: Force click
+    # Método 2: Locator force
     try:
-        loc = page.locator("#filterButtonStatus").first
-        if loc.count() > 0:
-            loc.click(force=True, timeout=5000)
-            page.wait_for_timeout(1000)
-            page.screenshot(path="debug_03_filter_method2.png")
-            report_step("Filter Button", True, "Locator: #filterButtonStatus (force)", 
-                       "Force click bem-sucedido")
-            return True
+        page.locator("#filterButtonStatus").first.click(force=True, timeout=6000)
+        page.wait_for_timeout(1000)
+        page.screenshot(path="debug_03_filter_m2.png")
+        report_step("Filter Button", True, "locator.first.click(force=True)", 
+                   "Force click bem-sucedido", "debug_03_filter_m2.png")
+        return True
     except Exception as e:
-        report_step("Filter Button", False, "Locator: #filterButtonStatus (force)", str(e))
+        report_step("Filter Button", False, "locator.first.click(force=True)", str(e))
 
-    # Método 3: JavaScript
-    try:
-        result = page.evaluate(
-            """() => {
-                const el = document.querySelector('#filterButtonStatus');
-                if (!el) return false;
-                el.click();
-                return true;
-            }"""
-        )
-        if result:
-            page.wait_for_timeout(1000)
-            page.screenshot(path="debug_03_filter_method3.png")
-            report_step("Filter Button", True, "JavaScript: querySelector + click", 
-                       "JS direto bem-sucedido")
-            return True
-    except Exception as e:
-        report_step("Filter Button", False, "JavaScript: querySelector + click", str(e))
-
-    # Método 4: Mouse events
+    # Método 3: JS
     try:
         page.evaluate(
-            """() => {
-                const el = document.querySelector('#filterButtonStatus');
-                if (!el) return false;
-                el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                return true;
-            }"""
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error(`not found: ${sel}`);
+                el.click();
+            }""",
+            "#filterButtonStatus",
         )
         page.wait_for_timeout(1000)
-        page.screenshot(path="debug_03_filter_method4.png")
-        report_step("Filter Button", True, "JavaScript: Synthetic mouse events", 
-                   "Mouse events bem-sucedidos")
+        page.screenshot(path="debug_03_filter_m3.png")
+        report_step("Filter Button", True, "page.evaluate(js)", 
+                   "JS bem-sucedido", "debug_03_filter_m3.png")
         return True
     except Exception as e:
-        report_step("Filter Button", False, "JavaScript: Synthetic mouse events", str(e))
-
-    report_step("Filter Button", False, "Todos os métodos", "Nenhum método funcionou")
+        report_step("Filter Button", False, "page.evaluate(js)", str(e))
+    
     return False
 
-def test_search_button(page):
-    """Testa todas as maneiras de clicar no botão SEARCH"""
+# =====================
+# STEP 4: CLEAR ALL STATUSES
+# =====================
+def test_clear_statuses(page):
+    """Limpa todos os status selecionados (conforme scraper)"""
     log.info("\n" + "="*80)
-    log.info("STEP 4: Testando click em SEARCH BUTTON")
+    log.info("STEP 4: Clear All Active Statuses")
+    log.info("="*80)
+    
+    try:
+        page.evaluate(
+            """
+            () => {
+                const children = document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]');
+                children.forEach(el => {
+                    el.classList.remove('selected');
+                    const icon = el.querySelector('i');
+                    if (icon) {
+                        icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                        icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                        icon.className = (icon.className + ' icon-circle-blank').trim();
+                    }
+                });
+
+                const parent = document.querySelector('#caseStatus2');
+                if (parent) {
+                    parent.classList.remove('selected');
+                    const picon = parent.querySelector('i');
+                    if (picon) {
+                        picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                        picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                        picon.className = (picon.className + ' icon-circle-blank').trim();
+                    }
+                }
+
+                const hidden = document.querySelector('#filterCaseStatus');
+                if (hidden) hidden.value = '';
+
+                const label = document.querySelector('#filterCaseStatusLabel');
+                if (label) label.innerText = 'None Selected';
+            }
+            """
+        )
+        page.wait_for_timeout(400)
+        page.screenshot(path="debug_04_clear_statuses.png")
+        report_step("Clear All Statuses", True, "page.evaluate(js)", 
+                   "Statuses limpados", "debug_04_clear_statuses.png")
+        return True
+    except Exception as e:
+        report_step("Clear All Statuses", False, "page.evaluate(js)", str(e))
+    
+    return False
+
+# =====================
+# STEP 5: SELECT STATUS 192
+# =====================
+def test_select_status_192(page):
+    """Seleciona apenas status 192 (ACTIVE)"""
+    log.info("\n" + "="*80)
+    log.info("STEP 5: Select Only Status 192 (ACTIVE)")
+    log.info("="*80)
+    
+    try:
+        page.evaluate(
+            """
+            () => {
+                const el = document.querySelector('a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]');
+                if (!el) throw new Error("Status 192 not found");
+
+                el.classList.add('selected');
+
+                const icon = el.querySelector('i');
+                if (icon) {
+                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    icon.className = (icon.className + ' icon-ok-sign').trim();
+                }
+
+                const parent = document.querySelector('#caseStatus2');
+                if (parent) {
+                    parent.classList.add('selected');
+                    const picon = parent.querySelector('i');
+                    if (picon) {
+                        picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                        picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                        picon.className = (picon.className + ' icon-ok-sign').trim();
+                    }
+                }
+
+                const hidden = document.querySelector('#filterCaseStatus');
+                if (hidden) hidden.value = '192';
+
+                const label = document.querySelector('#filterCaseStatusLabel');
+                if (label) label.innerText = '1 Selected';
+            }
+            """
+        )
+        page.wait_for_timeout(800)
+        page.screenshot(path="debug_05_select_192.png")
+        report_step("Select Status 192", True, "page.evaluate(js)", 
+                   "Status 192 selecionado", "debug_05_select_192.png")
+        return True
+    except Exception as e:
+        report_step("Select Status 192", False, "page.evaluate(js)", str(e))
+    
+    return False
+
+# =====================
+# STEP 6: CLICK SEARCH
+# =====================
+def test_click_search(page):
+    """Clica no botão SEARCH com múltiplas estratégias"""
+    log.info("\n" + "="*80)
+    log.info("STEP 6: Click Search Button")
     log.info("="*80)
     
     selectors = [
-        ("button.filters-submit", "button.filters-submit"),
-        ("text=Search", "text=Search"),
-        ("button:has-text('Search')", "button:has-text"),
+        "button.filters-submit",
+        "text=Search",
+        "button:has-text('Search')",
     ]
-    
-    for sel_name, sel in selectors:
-        # Método 1: Click normal
+
+    for sel in selectors:
+        # Método 1: Click normal com navigation
         try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click(timeout=6000)
-                page.wait_for_timeout(3000)
-                page.screenshot(path=f"debug_04_search_method1_{sel_name}.png")
-                report_step("Search Button", True, f"Locator: {sel_name}", 
-                           "Click normal bem-sucedido")
-                return True
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                locator.click(timeout=6000)
+            page.wait_for_timeout(3000)
+            page.screenshot(path=f"debug_06_search_m1_{sel[:20]}.png")
+            report_step("Click Search", True, f"locator.click() with navigation | {sel}", 
+                       "Search com navigation bem-sucedido")
+            return True
         except Exception:
             pass
 
-        # Método 2: Force click
+        # Método 2: Click normal sem navigation
         try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click(force=True, timeout=6000)
-                page.wait_for_timeout(3000)
-                page.screenshot(path=f"debug_04_search_method2_{sel_name}.png")
-                report_step("Search Button", True, f"Locator: {sel_name} (force)", 
-                           "Force click bem-sucedido")
-                return True
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+            
+            locator.click(timeout=6000)
+            page.wait_for_timeout(3000)
+            page.screenshot(path=f"debug_06_search_m2_{sel[:20]}.png")
+            report_step("Click Search", True, f"locator.click() | {sel}", 
+                       "Search normal bem-sucedido")
+            return True
         except Exception:
             pass
 
-        # Método 3: JavaScript
+        # Método 3: Force click
         try:
-            result = page.evaluate(
-                f"""() => {{
-                    const el = document.querySelector('{sel if sel.startswith('.') or sel.startswith('#') else 'button'}');
-                    if (!el) return false;
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+            
+            locator.click(force=True, timeout=6000)
+            page.wait_for_timeout(3000)
+            page.screenshot(path=f"debug_06_search_m3_{sel[:20]}.png")
+            report_step("Click Search", True, f"locator.click(force=True) | {sel}", 
+                       "Search force bem-sucedido")
+            return True
+        except Exception:
+            pass
+
+        # Método 4: JavaScript direto
+        try:
+            page.evaluate(
+                f"""(selector) => {{
+                    const el = document.querySelector(selector);
+                    if (!el) throw new Error('search button not found');
+                    el.dispatchEvent(new MouseEvent('mouseover', {{ bubbles: true }}));
+                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true }}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true }}));
                     el.click();
-                    return true;
-                }}"""
+                }}""",
+                sel,
             )
-            if result:
-                page.wait_for_timeout(3000)
-                page.screenshot(path=f"debug_04_search_method3_{sel_name}.png")
-                report_step("Search Button", True, f"JavaScript: {sel_name}", 
-                           "JS direto bem-sucedido")
-                return True
+            page.wait_for_timeout(3000)
+            page.screenshot(path=f"debug_06_search_m4_{sel[:20]}.png")
+            report_step("Click Search", True, f"page.evaluate(js) | {sel}", 
+                       "Search JS bem-sucedido")
+            return True
         except Exception:
             pass
 
-    report_step("Search Button", False, "Todos os métodos", "Nenhum método funcionou")
+    report_step("Click Search", False, "Todos os métodos", "Nenhum método funcionou")
     return False
 
+# =====================
+# STEP 7: WAIT FOR RESULTS
+# =====================
 def test_wait_for_results(page):
-    """Testa se consegue detectar resultados"""
+    """Aguarda e coleta resultados"""
     log.info("\n" + "="*80)
-    log.info("STEP 5: Aguardando resultados de busca")
+    log.info("STEP 7: Wait for Case Rows (Results)")
     log.info("="*80)
     
     try:
         waited = 0
-        max_wait = 30000
-        step = 1000
-        
-        while waited < max_wait:
+        while waited < 25000:
             rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
             if rows > 0:
                 log.info(f"✅ Encontrados {rows} casos!")
-                page.screenshot(path="debug_05_results_found.png")
+                page.screenshot(path="debug_07_results.png")
+                
+                # Coletar dados da primeira página
+                collected = []
+                for i in range(min(rows, 5)):  # Pega os primeiros 5 casos
+                    try:
+                        row = page.locator('tr.load-case.table-row.link[data-caseid]').nth(i)
+                        caseid = row.get_attribute("data-caseid")
+                        row_text = clean_text(row.inner_text())
+                        parsed = parse_row_text(row_text)
+                        collected.append({
+                            "caseid": caseid,
+                            "row_text": row_text,
+                            "parsed": parsed
+                        })
+                    except Exception as e:
+                        log.warning(f"Erro ao coletar caso {i}: {e}")
+                
+                REPORT["collected_data"]["first_page_cases"] = collected
+                
                 report_step("Wait for Results", True, "Locator: tr.load-case", 
-                           f"{rows} casos encontrados")
+                           f"{rows} casos encontrados", "debug_07_results.png",
+                           {"total_rows": rows, "collected_samples": len(collected)})
                 return True
             
-            page.wait_for_timeout(step)
-            waited += step
+            page.wait_for_timeout(1000)
+            waited += 1000
         
         report_step("Wait for Results", False, "Polling", "Timeout esperando resultados")
     except Exception as e:
@@ -328,127 +457,97 @@ def test_wait_for_results(page):
     
     return False
 
-def test_pagination(page):
-    """Testa navegação entre páginas"""
+# =====================
+# STEP 8: PAGINATION INFO
+# =====================
+def test_pagination_info(page):
+    """Coleta informações de paginação"""
     log.info("\n" + "="*80)
-    log.info("STEP 6: Testando navegação de páginas")
+    log.info("STEP 8: Detect Pagination Info")
     log.info("="*80)
     
-    # Detectar página atual
     try:
-        current_page = page.evaluate(
-            """() => {
+        total_pages = page.evaluate(
+            """
+            () => {
                 const body = document.body.innerText || '';
                 const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
-                if (m) return { current: parseInt(m[1], 10), total: parseInt(m[2], 10) };
-                return null;
-            }"""
+                if (m) return parseInt(m[2], 10);
+
+                let maxPage = 1;
+                document.querySelectorAll('a[data-page]').forEach(a => {
+                    const p = parseInt(a.getAttribute('data-page') || '', 10);
+                    if (!isNaN(p) && p > maxPage) maxPage = p;
+                });
+                return maxPage;
+            }
+            """
         )
         
-        if current_page:
-            log.info(f"Página atual: {current_page['current']} de {current_page['total']}")
-            report_step("Detect Pagination", True, "JavaScript: regex body text", 
-                       f"Página {current_page['current']}/{current_page['total']}")
-            
-            # Se não estamos na última página, testa ir para próxima
-            if current_page['current'] < current_page['total']:
-                next_page = current_page['current'] + 1
-                
-                # Método 1: Clicar no link direto a[data-page="X"]
-                try:
-                    loc = page.locator(f'a[data-page="{next_page}"]').first
-                    if loc.count() > 0:
-                        loc.click(timeout=5000)
-                        page.wait_for_timeout(3000)
-                        page.screenshot(path=f"debug_06_pagination_method1.png")
-                        report_step("Navigate to Next Page", True, 
-                                   f"Locator: a[data-page='{next_page}']", 
-                                   "Click direto no link bem-sucedido")
-                        return True
-                except Exception:
-                    pass
-
-                # Método 2: Force click
-                try:
-                    loc = page.locator(f'a[data-page="{next_page}"]').first
-                    if loc.count() > 0:
-                        loc.click(force=True, timeout=5000)
-                        page.wait_for_timeout(3000)
-                        page.screenshot(path=f"debug_06_pagination_method2.png")
-                        report_step("Navigate to Next Page", True, 
-                                   f"Locator: a[data-page='{next_page}'] (force)", 
-                                   "Force click bem-sucedido")
-                        return True
-                except Exception:
-                    pass
-
-                # Método 3: JavaScript
-                try:
-                    page.evaluate(
-                        f"""() => {{
-                            const el = document.querySelector('a[data-page="{next_page}"]');
-                            if (!el) throw new Error('Page link not found');
-                            el.click();
-                        }}"""
-                    )
-                    page.wait_for_timeout(3000)
-                    page.screenshot(path=f"debug_06_pagination_method3.png")
-                    report_step("Navigate to Next Page", True, 
-                               "JavaScript: querySelector + click", 
-                               "JS direto bem-sucedido")
-                    return True
-                except Exception:
-                    pass
-
-                report_step("Navigate to Next Page", False, "Todos os métodos", 
-                           "Não conseguiu navegar para próxima página")
-            else:
-                report_step("Navigate to Next Page", True, "N/A", 
-                           "Já está na última página")
-                return True
-        else:
-            report_step("Detect Pagination", False, "JavaScript", 
-                       "Não conseguiu detectar paginação")
+        current_page = page.evaluate(
+            """
+            () => {
+                const body = document.body.innerText || '';
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                if (m) return parseInt(m[1], 10);
+                return 1;
+            }
+            """
+        )
+        
+        REPORT["collected_data"]["pagination_info"] = {
+            "current_page": current_page,
+            "total_pages": total_pages
+        }
+        
+        report_step("Pagination Info", True, "page.evaluate(js)", 
+                   f"Página {current_page}/{total_pages}", data={
+                       "current_page": current_page,
+                       "total_pages": total_pages
+                   })
+        return True
     except Exception as e:
-        report_step("Detect Pagination", False, "JavaScript", str(e))
+        report_step("Pagination Info", False, "page.evaluate(js)", str(e))
     
     return False
 
-def test_case_detail(page):
-    """Testa abertura de detalhe de caso"""
+# =====================
+# STEP 9: OPEN CASE DETAIL
+# =====================
+def test_open_case_detail(page):
+    """Abre detalhe do primeiro caso"""
     log.info("\n" + "="*80)
-    log.info("STEP 7: Testando abertura de detalhe de caso")
+    log.info("STEP 9: Open Case Detail")
     log.info("="*80)
     
     try:
-        # Pegar primeiro caso
         rows = page.locator('tr.load-case.table-row.link[data-caseid]')
         if rows.count() == 0:
             report_step("Open Case Detail", False, "Locator", "Nenhum caso encontrado")
             return False
         
-        first_row = rows.first
-        caseid = first_row.get_attribute("data-caseid")
-        log.info(f"Clicando no caso: {caseid}")
+        row = rows.first
+        caseid = row.get_attribute("data-caseid")
+        row_text = clean_text(row.inner_text())
         
         # Método 1: Click normal
         try:
-            first_row.click(timeout=6000)
+            row.click(timeout=6000)
             page.wait_for_timeout(7000)
-            page.screenshot(path="debug_07_case_detail_method1.png")
-            report_step("Open Case Detail", True, "Click normal no row", 
-                       f"Caso {caseid} aberto")
+            page.screenshot(path="debug_09_case_detail_m1.png")
+            report_step("Open Case Detail", True, "row.click()", 
+                       f"Caso {caseid} aberto", "debug_09_case_detail_m1.png")
             return True
         except Exception:
             pass
 
         # Método 2: Force click
         try:
-            first_row.click(force=True, timeout=6000)
+            row.click(force=True, timeout=6000)
             page.wait_for_timeout(7000)
-            page.screenshot(path="debug_07_case_detail_method2.png")
-            report_step("Open Case Detail", True, "Force click no row", 
-                       f"Caso {caseid} aberto")
+            page.screenshot(path="debug_09_case_detail_m2.png")
+            report_step("Open Case Detail", True, "row.click(force=True)", 
+                       f"Caso {caseid} aberto", "debug_09_case_detail_m2.png")
             return True
         except Exception:
             pass
@@ -463,22 +562,122 @@ def test_case_detail(page):
                 }}"""
             )
             page.wait_for_timeout(7000)
-            page.screenshot(path="debug_07_case_detail_method3.png")
-            report_step("Open Case Detail", True, "JavaScript: querySelector + click", 
+            page.screenshot(path="debug_09_case_detail_m3.png")
+            report_step("Open Case Detail", True, "element_handle.evaluate() + click", 
                        f"Caso {caseid} aberto via JS")
             return True
         except Exception:
             pass
 
-        report_step("Open Case Detail", False, "Todos os métodos", 
-                   f"Não conseguiu abrir caso {caseid}")
+        report_step("Open Case Detail", False, "Todos os métodos", f"Não conseguiu abrir {caseid}")
     except Exception as e:
         report_step("Open Case Detail", False, "Geral", str(e))
     
     return False
 
+# =====================
+# STEP 10: PARSE CASE DETAIL
+# =====================
+def test_parse_case_detail(page):
+    """Parse os dados do detalhe do caso"""
+    log.info("\n" + "="*80)
+    log.info("STEP 10: Parse Case Header & Summary")
+    log.info("="*80)
+    
+    try:
+        # Parse header
+        header_data = page.evaluate(
+            """
+            () => {
+                const bodyText = document.body.innerText || '';
+
+                function byLabel(label) {
+                    const nodes = Array.from(document.querySelectorAll('body *'));
+                    for (const node of nodes) {
+                        const txt = (node.innerText || '').trim();
+                        if (txt === label) {
+                            const parent = node.parentElement;
+                            if (parent) {
+                                const parentText = (parent.innerText || '').trim();
+                                if (parentText && parentText !== label) {
+                                    return parentText.replace(label, '').trim();
+                                }
+                            }
+                            const next = node.nextElementSibling;
+                            if (next) return (next.innerText || '').trim();
+                        }
+                    }
+                    return '';
+                }
+
+                const parcelLink = document.querySelector('#propertyAppraiserLink');
+
+                return {
+                    case_number: byLabel('Case Number'),
+                    parcel_number: byLabel('Parcel Number'),
+                    case_status: byLabel('Case Status'),
+                    raw_body: bodyText.slice(0, 5000),
+                };
+            }
+            """
+        )
+        
+        # Parse summary
+        summary_data = page.evaluate(
+            """
+            () => {
+                function byLabel(label) {
+                    const nodes = Array.from(document.querySelectorAll('body *'));
+                    for (const node of nodes) {
+                        const txt = (node.innerText || '').trim();
+                        if (txt === label) {
+                            const parent = node.parentElement;
+                            if (parent) {
+                                const parentText = (parent.innerText || '').trim();
+                                if (parentText && parentText !== label) {
+                                    return parentText.replace(label, '').trim();
+                                }
+                            }
+                            const next = node.nextElementSibling;
+                            if (next) return (next.innerText || '').trim();
+                        }
+                    }
+                    return '';
+                }
+
+                return {
+                    app_receive_date: byLabel('App Receive Date'),
+                    sale_date: byLabel('Sale Date'),
+                    publish_dates: byLabel('Publish Date(s)'),
+                    property_address: byLabel('Property Address'),
+                    homestead: byLabel('Homestead'),
+                    legal_description: byLabel('Legal Description')
+                };
+            }
+            """
+        )
+        
+        case_data = {
+            "header": header_data,
+            "summary": summary_data,
+        }
+        
+        REPORT["collected_data"]["case_details"] = case_data
+        
+        report_step("Parse Case Detail", True, "page.evaluate(js)", 
+                   f"Caso parseado: {header_data.get('case_number', 'N/A')}", data=case_data)
+        page.screenshot(path="debug_10_case_parsed.png")
+        return True
+    except Exception as e:
+        report_step("Parse Case Detail", False, "page.evaluate(js)", str(e))
+    
+    return False
+
+# =====================
+# MAIN
+# =====================
 def main():
-    log.info("🚀 INICIANDO DEBUG COMPLETO DO MIAMI-DADE")
+    log.info("🚀 INICIANDO DEBUG COMPLETO DO MIAMI-DADE (COM TODOS OS DADOS)")
     log.info("="*80)
     
     with sync_playwright() as p:
@@ -506,42 +705,58 @@ def main():
         page = context.new_page()
 
         try:
-            # Executar todos os testes
+            # Executar todos os testes em sequência
             if not test_page_load(page):
-                log.error("Falha no carregamento da página!")
+                log.error("❌ Falha no carregamento da página!")
                 return
             
             test_reset_filters(page)
             test_filter_button(page)
-            test_search_button(page)
+            test_clear_statuses(page)
+            test_select_status_192(page)
+            test_click_search(page)
             test_wait_for_results(page)
-            test_pagination(page)
-            test_case_detail(page)
+            test_pagination_info(page)
+            test_open_case_detail(page)
+            test_parse_case_detail(page)
             
         except Exception as e:
-            log.exception(f"Erro geral: {e}")
+            log.exception(f"❌ Erro geral: {e}")
         finally:
             browser.close()
     
-    # Salvar relatório
+    # =====================
+    # SALVAR RELATÓRIO
+    # =====================
     log.info("\n" + "="*80)
-    log.info("📋 SALVANDO RELATÓRIO")
+    log.info("📋 SALVANDO RELATÓRIO COMPLETO")
     log.info("="*80)
     
     with open("debug_miami_report.json", "w", encoding="utf-8") as f:
         json.dump(REPORT, f, indent=2, ensure_ascii=False)
     
     log.info("✅ Relatório salvo em: debug_miami_report.json")
-    log.info("\n📊 RESUMO:")
-    log.info(f"Total de passos testados: {len(REPORT['steps'])}")
-    log.info(f"Métodos bem-sucedidos encontrados: {len(REPORT['success_methods'])}")
-    for step, methods in REPORT['success_methods'].items():
-        log.info(f"  ✅ {step}: {', '.join(methods)}")
     
-    if REPORT['failed_steps']:
-        log.warning(f"\n⚠️ Passos que falharam:")
-        for step in REPORT['failed_steps']:
-            log.warning(f"  ❌ {step}")
+    # =====================
+    # RESUMO FINAL
+    # =====================
+    log.info("\n" + "="*80)
+    log.info("📊 RESUMO FINAL")
+    log.info("="*80)
+    
+    log.info(f"Total de passos testados: {len(REPORT['steps'])}")
+    log.info(f"\n✅ Métodos bem-sucedidos encontrados:")
+    for step, methods in REPORT['success_methods'].items():
+        log.info(f"   {step}:")
+        for method in methods:
+            log.info(f"      • {method}")
+    
+    log.info(f"\n📊 Dados coletados:")
+    log.info(f"   • Primeiros 5 casos: {len(REPORT['collected_data']['first_page_cases'])}")
+    log.info(f"   • Paginação: {REPORT['collected_data']['pagination_info']}")
+    log.info(f"   • Detalhe do caso: {'Sim' if REPORT['collected_data']['case_details'] else 'Não'}")
+    
+    log.info("\n🎯 PRÓXIMO PASSO: Abra o arquivo 'debug_miami_report.json' para análise detalhada")
 
 if __name__ == "__main__":
     main()
