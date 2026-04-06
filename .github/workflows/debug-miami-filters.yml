@@ -1,0 +1,35 @@
+name: Debug Miami Filters
+
+on:
+  workflow_dispatch:  # Permite rodar manualmente
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          playwright install chromium
+      
+      - name: Run debug script
+        run: python debug_miami_filters.py
+        continue-on-error: true
+      
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-results
+          path: |
+            debug_page_initial.png
+            debug_page_html.html
+          retention-days: 7
