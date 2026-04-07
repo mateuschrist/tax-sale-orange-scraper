@@ -68,10 +68,8 @@ def normalize_sale_date_value(value: str) -> Optional[str]:
     v = clean_text(value or "")
     if not v:
         return None
-
     if v.lower() in ("not assigned", "null", "none", "n/a", "na"):
         return None
-
     return v
 
 
@@ -90,6 +88,42 @@ def payload_quality_score(payload: dict) -> int:
         "deed_status",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
+
+
+def dump_debug_artifacts(page, prefix: str):
+    try:
+        page.screenshot(path=f"{prefix}.png", full_page=True)
+        log.info("Saved screenshot: %s.png", prefix)
+    except Exception as e:
+        log.warning("Could not save screenshot %s.png: %s", prefix, str(e))
+
+    try:
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log.info("Saved html: %s.html", prefix)
+    except Exception as e:
+        log.warning("Could not save html %s.html: %s", prefix, str(e))
+
+
+def human_pause(page, ms=600):
+    try:
+        page.wait_for_timeout(ms)
+    except Exception:
+        pass
+
+
+def humanize(page):
+    try:
+        page.mouse.move(250, 220)
+        page.wait_for_timeout(300)
+        page.mouse.move(520, 360)
+        page.wait_for_timeout(500)
+        page.mouse.wheel(0, 350)
+        page.wait_for_timeout(700)
+        page.mouse.wheel(0, -180)
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
 
 
 # =========================
@@ -222,18 +256,9 @@ def supabase_fetch_existing_cases_by_nodes(nodes: List[str]) -> Dict[str, dict]:
 
 def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
     if not CAN_CHECK_SUPABASE:
-        return {
-            "sent": False,
-            "status_code": None,
-            "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
-        }
-
+        return {"sent": False, "status_code": None, "response_text": "SUPABASE not configured"}
     if not record_id:
-        return {
-            "sent": False,
-            "status_code": None,
-            "response_text": "Missing record id",
-        }
+        return {"sent": False, "status_code": None, "response_text": "Missing record id"}
 
     url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
     headers = sb_headers()
@@ -246,33 +271,14 @@ def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
         ok = r.status_code in (200, 204)
 
         if ok:
-            log.info(
-                "SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s",
-                record_id,
-                sale_date,
-                r.status_code,
-            )
+            log.info("SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s", record_id, sale_date, r.status_code)
         else:
-            log.warning(
-                "SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s",
-                record_id,
-                r.status_code,
-                r.text[:500],
-            )
+            log.warning("SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s", record_id, r.status_code, r.text[:500])
 
-        return {
-            "sent": ok,
-            "status_code": r.status_code,
-            "response_text": r.text[:1000],
-        }
-
+        return {"sent": ok, "status_code": r.status_code, "response_text": r.text[:1000]}
     except Exception as e:
         log.warning("SUPABASE SALE_DATE UPDATE EXCEPTION id=%s error=%s", record_id, str(e))
-        return {
-            "sent": False,
-            "status_code": None,
-            "response_text": str(e),
-        }
+        return {"sent": False, "status_code": None, "response_text": str(e)}
 
 
 def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
@@ -282,16 +288,7 @@ def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
     if new_score > old_score:
         return True
 
-    important_fields = [
-        "address",
-        "city",
-        "state_address",
-        "zip",
-        "pdf_url",
-        "auction_source_url",
-    ]
-
-    for f in important_fields:
+    for f in ["address", "city", "state_address", "zip", "pdf_url", "auction_source_url"]:
         old_val = (existing.get(f) or "").strip() if existing.get(f) else ""
         new_val = (payload.get(f) or "").strip() if payload.get(f) else ""
         if not old_val and new_val:
@@ -322,23 +319,13 @@ def should_send_payload(payload: dict):
 
 def supabase_upsert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
-        return {
-            "sent": False,
-            "status_code": None,
-            "node": payload.get("node"),
-            "response_text": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
-        }
+        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": "SUPABASE not configured"}
 
     should_send, reason = should_send_payload(payload)
     log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
 
     if not should_send:
-        return {
-            "sent": False,
-            "status_code": 200,
-            "node": payload.get("node"),
-            "response_text": reason,
-        }
+        return {"sent": False, "status_code": 200, "node": payload.get("node"), "response_text": reason}
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
@@ -351,27 +338,12 @@ def supabase_upsert_property(payload: dict) -> dict:
         if ok:
             log.info("SUPABASE UPSERT OK status=%s node=%s", r.status_code, payload.get("node"))
         else:
-            log.error(
-                "SUPABASE UPSERT FAILED status=%s node=%s body=%s",
-                r.status_code,
-                payload.get("node"),
-                r.text[:600],
-            )
+            log.error("SUPABASE UPSERT FAILED status=%s node=%s body=%s", r.status_code, payload.get("node"), r.text[:600])
 
-        return {
-            "sent": ok,
-            "status_code": r.status_code,
-            "node": payload.get("node"),
-            "response_text": r.text[:1000],
-        }
+        return {"sent": ok, "status_code": r.status_code, "node": payload.get("node"), "response_text": r.text[:1000]}
     except Exception as e:
         log.exception("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
-        return {
-            "sent": False,
-            "status_code": None,
-            "node": payload.get("node"),
-            "response_text": str(e),
-        }
+        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": str(e)}
 
 
 def supabase_list_all_nodes() -> List[str]:
@@ -393,13 +365,8 @@ def supabase_list_all_nodes() -> List[str]:
             )
 
             r = requests.get(url, headers=sb_headers(), timeout=60)
-
             if r.status_code != 200:
-                log.warning(
-                    "supabase_list_all_nodes non-200 status=%s body=%s",
-                    r.status_code,
-                    r.text[:500],
-                )
+                log.warning("supabase_list_all_nodes non-200 status=%s body=%s", r.status_code, r.text[:500])
                 break
 
             arr = r.json() or []
@@ -415,7 +382,6 @@ def supabase_list_all_nodes() -> List[str]:
                 break
 
             offset += page_size
-
     except Exception as e:
         log.warning("supabase_list_all_nodes failed: %s", str(e))
 
@@ -424,19 +390,11 @@ def supabase_list_all_nodes() -> List[str]:
 
 def supabase_delete_nodes(nodes: List[str]) -> Dict:
     if not CAN_CHECK_SUPABASE:
-        return {
-            "executed": False,
-            "deleted_count": 0,
-            "reason": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
-        }
+        return {"executed": False, "deleted_count": 0, "reason": "SUPABASE not configured"}
 
     nodes = [str(x).strip() for x in nodes if str(x).strip()]
     if not nodes:
-        return {
-            "executed": True,
-            "deleted_count": 0,
-            "reason": "no nodes to delete",
-        }
+        return {"executed": True, "deleted_count": 0, "reason": "no nodes to delete"}
 
     deleted_count = 0
     errors = []
@@ -447,15 +405,9 @@ def supabase_delete_nodes(nodes: List[str]) -> Dict:
 
         try:
             in_clause = ",".join(f'"{quote(node, safe="")}"' for node in batch)
-
-            url = (
-                f"{SUPABASE_URL}/rest/v1/properties"
-                f"?county=eq.Miami-Dade"
-                f"&node=in.({in_clause})"
-            )
+            url = f"{SUPABASE_URL}/rest/v1/properties?county=eq.Miami-Dade&node=in.({in_clause})"
 
             r = requests.delete(url, headers=sb_headers(), timeout=60)
-
             if r.status_code in (200, 204):
                 deleted_count += len(batch)
                 log.info("SUPABASE DELETE batch ok count=%s", len(batch))
@@ -463,34 +415,21 @@ def supabase_delete_nodes(nodes: List[str]) -> Dict:
                 msg = f"status={r.status_code} body={r.text[:500]}"
                 errors.append(msg)
                 log.warning("SUPABASE DELETE batch failed: %s", msg)
-
         except Exception as e:
             msg = str(e)
             errors.append(msg)
             log.warning("SUPABASE DELETE batch exception: %s", msg)
 
-    return {
-        "executed": True,
-        "deleted_count": deleted_count,
-        "requested_delete_count": len(nodes),
-        "errors": errors,
-    }
+    return {"executed": True, "deleted_count": deleted_count, "requested_delete_count": len(nodes), "errors": errors}
 
 
 def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
     try:
         existing_nodes = set(supabase_list_all_nodes())
         site_nodes = {str(x).strip() for x in seen_nodes_this_run if str(x).strip()}
-
         to_delete = sorted(existing_nodes - site_nodes)
 
-        log.info(
-            "RECONCILE MIAMI: supabase=%s site=%s delete=%s",
-            len(existing_nodes),
-            len(site_nodes),
-            len(to_delete),
-        )
-
+        log.info("RECONCILE MIAMI: supabase=%s site=%s delete=%s", len(existing_nodes), len(site_nodes), len(to_delete))
         delete_result = supabase_delete_nodes(to_delete)
 
         return {
@@ -501,29 +440,69 @@ def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
             "delete_candidates_sample": to_delete[:50],
             "delete_result": delete_result,
         }
-
     except Exception as e:
         log.exception("reconcile_supabase_to_site failed: %s", str(e))
-        return {
-            "executed": False,
-            "reason": str(e),
+        return {"executed": False, "reason": str(e)}
+
+
+# =========================
+# SCAN / CLICK / FILTER
+# =========================
+def scan_clickables(page, prefix="miami_scan") -> Dict:
+    data = page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
+            return {
+                url: location.href,
+                title: document.title,
+                body_sample: (document.body.innerText || '').slice(0, 3000),
+                clickables: Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],div,span,li'))
+                    .map((el, idx) => ({
+                        idx,
+                        tag: el.tagName.toLowerCase(),
+                        text: txt(el),
+                        id: el.id || '',
+                        class_name: (el.className || '').toString(),
+                        href: el.getAttribute('href') || '',
+                        onclick: el.getAttribute('onclick') || '',
+                        data_target: el.getAttribute('data-target') || '',
+                        data_toggle: el.getAttribute('data-toggle') || '',
+                        data_statusid: el.getAttribute('data-statusid') || '',
+                        data_parentid: el.getAttribute('data-parentid') || ''
+                    }))
+                    .filter(x => x.text || x.id || x.class_name || x.data_target || x.data_statusid)
+                    .slice(0, 2000)
+            };
         }
+        """
+    )
+
+    try:
+        with open(f"{prefix}.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        log.info("Saved scan json: %s.json", prefix)
+    except Exception as e:
+        log.warning("Could not save scan json: %s", str(e))
+
+    dump_debug_artifacts(page, prefix)
+    log.info("SCAN title=%s url=%s", data.get("title"), data.get("url"))
+    return data
 
 
-# =========================
-# UI HELPERS
-# =========================
 def click_safe(page, selector, name, timeout=6000):
     try:
         page.locator(selector).first.click(timeout=timeout)
-        log.info("%s clicked (locator)", name)
+        log.info("%s clicked (locator): %s", name, selector)
         return True
     except Exception:
         pass
 
     try:
         page.locator(selector).first.click(force=True, timeout=timeout)
-        log.info("%s clicked (force)", name)
+        log.info("%s clicked (force): %s", name, selector)
         return True
     except Exception:
         pass
@@ -539,7 +518,7 @@ def click_safe(page, selector, name, timeout=6000):
             selector,
         )
         if clicked:
-            log.info("%s clicked (JS fallback)", name)
+            log.info("%s clicked (JS): %s", name, selector)
             return True
     except Exception:
         pass
@@ -548,55 +527,124 @@ def click_safe(page, selector, name, timeout=6000):
     return False
 
 
-def click_element_handle_safe(el, page, name):
+def click_by_text_scan(page, texts: List[str], name: str) -> bool:
+    for text in texts:
+        selectors = [
+            f'text="{text}"',
+            f'text={text}',
+            f'button:has-text("{text}")',
+            f'a:has-text("{text}")',
+            f'span:has-text("{text}")',
+            f'div:has-text("{text}")',
+            f'li:has-text("{text}")',
+        ]
+        for sel in selectors:
+            if click_safe(page, sel, f"{name} [{text}]"):
+                return True
+
     try:
-        el.click(timeout=6000)
-        log.info("%s clicked (normal)", name)
-        return True
+        for text in texts:
+            result = page.evaluate(
+                """
+                (needle) => {
+                    function txt(el) {
+                        return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+                    }
+
+                    const all = Array.from(document.querySelectorAll('a,button,div,span,li,input[type="button"],input[type="submit"]'));
+                    const target = all.find(el => txt(el).toLowerCase() === needle.toLowerCase())
+                        || all.find(el => txt(el).toLowerCase().includes(needle.toLowerCase()));
+
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }
+                """,
+                text,
+            )
+            if result:
+                log.info("%s clicked (text scan JS): %s", name, text)
+                return True
     except Exception:
         pass
 
-    try:
-        el.click(force=True, timeout=6000)
-        log.info("%s clicked (force)", name)
-        return True
-    except Exception:
-        pass
+    log.warning("%s not found by text scan: %s", name, texts)
+    return False
 
-    try:
-        page.evaluate("(el) => el.click()", el)
-        log.info("%s clicked (JS fallback)", name)
+
+def discover_and_open_status_filter(page) -> bool:
+    # tentativa direta
+    direct_selectors = [
+        "#filterButtonStatus",
+        '[data-target="#filterStatus"]',
+        '[data-target*="Status"]',
+        "#caseStatus2",
+    ]
+    for sel in direct_selectors:
+        if click_safe(page, sel, "FILTER BUTTON"):
+            human_pause(page, 1000)
+            return True
+
+    # tentativa por texto
+    if click_by_text_scan(page, ["Case Status", "Status"], "FILTER BUTTON TEXT"):
+        human_pause(page, 1000)
         return True
-    except Exception as e:
-        log.error("%s FAILED: %s", name, e)
-        return False
+
+    dump_debug_artifacts(page, "miami_filter_open_failed")
+    return False
+
+
+def discover_active_status(page) -> dict:
+    return page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
+
+            const candidates = Array.from(document.querySelectorAll('[data-statusid], a, li, div, span'))
+                .map(el => ({
+                    text: txt(el),
+                    data_statusid: el.getAttribute('data-statusid') || '',
+                    data_parentid: el.getAttribute('data-parentid') || '',
+                    class_name: (el.className || '').toString(),
+                    id: el.id || ''
+                }))
+                .filter(x =>
+                    x.data_statusid ||
+                    x.text.toLowerCase().includes('active') ||
+                    x.class_name.toLowerCase().includes('status')
+                );
+
+            const exactActive = candidates.find(x => x.text.toLowerCase() === 'active');
+            const containsActive = candidates.find(x => x.text.toLowerCase().includes('active'));
+
+            return {
+                exactActive,
+                containsActive,
+                candidates: candidates.slice(0, 200)
+            };
+        }
+        """
+    )
 
 
 def force_clear_all_active_statuses(page):
     page.evaluate(
         """
         () => {
-            const children = document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]');
+            const children = document.querySelectorAll('[data-statusid]');
             children.forEach(el => {
                 el.classList.remove('selected');
                 const icon = el.querySelector('i');
                 if (icon) {
                     icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
                     icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    icon.className = (icon.className + ' icon-circle-blank').trim();
+                    if (!icon.className.includes('icon-circle-blank')) {
+                        icon.className = (icon.className + ' icon-circle-blank').trim();
+                    }
                 }
             });
-
-            const parent = document.querySelector('#caseStatus2');
-            if (parent) {
-                parent.classList.remove('selected');
-                const picon = parent.querySelector('i');
-                if (picon) {
-                    picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    picon.className = (picon.className + ' icon-circle-blank').trim();
-                }
-            }
 
             const hidden = document.querySelector('#filterCaseStatus');
             if (hidden) hidden.value = '';
@@ -609,62 +657,104 @@ def force_clear_all_active_statuses(page):
     log.info("Cleared UI + hidden filterCaseStatus")
 
 
-def force_select_only_192(page):
-    page.evaluate(
-        """
-        () => {
-            const el = document.querySelector('a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]');
-            if (!el) throw new Error("Status 192 not found");
+def force_select_active(page) -> str:
+    discovery = discover_active_status(page)
+    chosen = discovery.get("exactActive") or discovery.get("containsActive")
 
-            el.classList.add('selected');
+    try:
+        with open("miami_active_candidates.json", "w", encoding="utf-8") as f:
+            json.dump(discovery, f, indent=2, ensure_ascii=False)
+        log.info("Saved miami_active_candidates.json")
+    except Exception:
+        pass
 
-            const icon = el.querySelector('i');
-            if (icon) {
-                icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                icon.className = (icon.className + ' icon-ok-sign').trim();
-            }
+    if not chosen:
+        dump_debug_artifacts(page, "miami_active_not_found")
+        raise RuntimeError("Active status not found in DOM")
 
-            const parent = document.querySelector('#caseStatus2');
-            if (parent) {
-                parent.classList.add('selected');
-                const picon = parent.querySelector('i');
-                if (picon) {
-                    picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    picon.className = (picon.className + ' icon-ok-sign').trim();
-                }
-            }
+    statusid = clean_text(chosen.get("data_statusid"))
+    parentid = clean_text(chosen.get("data_parentid"))
+    text = clean_text(chosen.get("text"))
 
-            const hidden = document.querySelector('#filterCaseStatus');
-            if (hidden) hidden.value = '192';
+    log.info("ACTIVE discovered text=%s statusid=%s parentid=%s", text, statusid, parentid)
 
-            const label = document.querySelector('#filterCaseStatusLabel');
-            if (label) label.innerText = '1 Selected';
-        }
-        """
-    )
-    log.info("Forced UI + hidden filterCaseStatus=192")
+    # 1) tenta por data-statusid
+    if statusid:
+        selectors = []
+        if parentid:
+            selectors.append(f'[data-statusid="{statusid}"][data-parentid="{parentid}"]')
+        selectors.append(f'[data-statusid="{statusid}"]')
+
+        for sel in selectors:
+            if click_safe(page, sel, "ACTIVE STATUS"):
+                human_pause(page, 800)
+                try:
+                    page.evaluate(
+                        """([statusid, textValue]) => {
+                            const hidden = document.querySelector('#filterCaseStatus');
+                            if (hidden && statusid) hidden.value = statusid;
+
+                            const label = document.querySelector('#filterCaseStatusLabel');
+                            if (label) label.innerText = '1 Selected';
+
+                            const all = Array.from(document.querySelectorAll('[data-statusid]'));
+                            all.forEach(el => {
+                                if (el.getAttribute('data-statusid') === statusid) {
+                                    el.classList.add('selected');
+                                }
+                            });
+                        }""",
+                        [statusid, text],
+                    )
+                except Exception:
+                    pass
+                return statusid
+
+    # 2) fallback por texto
+    clicked = click_by_text_scan(page, [text, "Active"], "ACTIVE STATUS TEXT")
+    if clicked:
+        human_pause(page, 800)
+        if statusid:
+            try:
+                page.evaluate(
+                    """(statusid) => {
+                        const hidden = document.querySelector('#filterCaseStatus');
+                        if (hidden) hidden.value = statusid;
+                        const label = document.querySelector('#filterCaseStatusLabel');
+                        if (label) label.innerText = '1 Selected';
+                    }""",
+                    statusid,
+                )
+            except Exception:
+                pass
+        return statusid or text
+
+    dump_debug_artifacts(page, "miami_active_click_failed")
+    raise RuntimeError(f"Could not click Active status. Candidate={chosen}")
 
 
 def get_filter_state(page):
     return page.evaluate(
         """
         () => {
-            const selected192 = document.querySelector('a[data-statusid="192"][data-parentid="2"]');
             const hidden = document.querySelector('#filterCaseStatus');
             const label = document.querySelector('#filterCaseStatusLabel');
+            const selected = Array.from(document.querySelectorAll('.selected,[aria-selected="true"]'))
+                .map(el => ((el.innerText || '').replace(/\\s+/g, ' ').trim()))
+                .filter(Boolean)
+                .slice(0, 30);
+
             return {
                 label: (label?.innerText || '').trim(),
                 hidden_filterCaseStatus: hidden ? hidden.value : '',
-                selected192_class: selected192 ? selected192.className : ''
+                selected_items: selected
             };
         }
         """
     )
 
 
-def wait_for_case_rows(page, timeout_ms=25000):
+def wait_for_case_rows(page, timeout_ms=30000):
     log.info("Waiting for Miami search results...")
     waited = 0
     step = 1000
@@ -676,16 +766,19 @@ def wait_for_case_rows(page, timeout_ms=25000):
         page.wait_for_timeout(step)
         waited += step
 
+    dump_debug_artifacts(page, "miami_no_rows_after_search")
     raise RuntimeError("No case rows found after Miami search")
 
 
 def click_search_button(page) -> bool:
     selectors = [
         "button.filters-submit",
-        "text=Search",
-        "button:has-text('Search')",
-        "text=Process Search",
         "button:has-text('Process Search')",
+        "text=Process Search",
+        "button:has-text('Search')",
+        "text=Search",
+        'input[type="submit"][value*="Search"]',
+        'input[type="button"][value*="Search"]',
     ]
 
     for sel in selectors:
@@ -718,81 +811,44 @@ def click_search_button(page) -> bool:
             except Exception:
                 pass
 
-            try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                    page.evaluate(
-                        """(selector) => {
-                            const el = document.querySelector(selector);
-                            if (!el) throw new Error('search button not found');
-                            el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                            el.click();
-                        }""",
-                        sel,
-                    )
-                log.info("SEARCH BUTTON clicked (JS + navigation): %s", sel)
-                return True
-            except Exception:
-                pass
-
-            try:
-                page.evaluate(
-                    """(selector) => {
-                        const el = document.querySelector(selector);
-                        if (!el) throw new Error('search button not found');
-                        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                        el.click();
-                    }""",
-                    sel,
-                )
-                page.wait_for_timeout(3000)
-                log.info("SEARCH BUTTON clicked (JS fallback): %s", sel)
-                return True
-            except Exception:
-                pass
-
         except Exception as e:
             log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
 
-    log.error("SEARCH BUTTON FAILED")
+    # texto solto no DOM
+    if click_by_text_scan(page, ["Process Search", "Search"], "SEARCH BUTTON TEXT"):
+        page.wait_for_timeout(3000)
+        return True
+
+    dump_debug_artifacts(page, "miami_search_click_failed")
     return False
 
 
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
+    scan_clickables(page, "miami_before_filter")
+
     reset_ok = click_safe(page, "a.filters-reset", "RESET FILTERS")
     if reset_ok:
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1200)
     else:
         log.warning("RESET FILTERS not found; continuing without reset")
 
-    opened = click_safe(page, "#filterButtonStatus", "FILTER BUTTON")
-    if not opened:
-        opened = click_safe(page, '[data-target="#filterStatus"]', "FILTER BUTTON FALLBACK")
-    if not opened:
-        opened = click_safe(page, 'text=Case Status', "FILTER BUTTON TEXT")
-    if not opened:
-        opened = click_safe(page, 'text=Status', "FILTER BUTTON TEXT 2")
-
-    if not opened:
+    if not discover_and_open_status_filter(page):
         raise RuntimeError("Could not open filter button")
 
-    page.wait_for_timeout(1000)
+    scan_clickables(page, "miami_status_open")
 
     force_clear_all_active_statuses(page)
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(500)
 
-    force_select_only_192(page)
+    active_key = force_select_active(page)
     page.wait_for_timeout(800)
 
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
-    if state.get("hidden_filterCaseStatus") != "192":
+    if not state.get("hidden_filterCaseStatus") and not active_key:
         raise RuntimeError(f"Status filter did not stick. Current state={state}")
 
     if not click_search_button(page):
@@ -807,7 +863,8 @@ def open_list_and_apply_filter(page):
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(4000)
+    humanize(page)
     run_search_flow(page)
 
 
@@ -820,7 +877,6 @@ def get_results_summary(page) -> Dict:
         () => {
             const bodyText = document.body.innerText || '';
             const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
-
             const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
@@ -853,7 +909,6 @@ def get_active_page_number(page) -> int:
                     const mm = txt.match(/^Page\\s+(\\d+)$/i);
                     if (mm) return parseInt(mm[1], 10);
                 }
-
                 return 1;
             }
             """
@@ -902,17 +957,11 @@ def parse_total_items(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-
-                const patterns = [
-                    /Cases List\\s*»\\s*(\\d+)\\s*Cases/i,
-                    /(\\d+)\\s*Cases/i
-                ];
-
+                const patterns = [/Cases List\\s*»\\s*(\\d+)\\s*Cases/i, /(\\d+)\\s*Cases/i];
                 for (const rx of patterns) {
                     const m = body.match(rx);
                     if (m) return parseInt(m[1], 10);
                 }
-
                 return 0;
             }
             """
@@ -943,13 +992,7 @@ def get_first_row_text(page) -> str:
         return ""
 
 
-def wait_for_page_change(
-    page,
-    old_page: int,
-    old_first_caseid: str = "",
-    old_first_row_text: str = "",
-    timeout_ms: int = 22000,
-) -> bool:
+def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_first_row_text: str = "", timeout_ms: int = 22000) -> bool:
     waited = 0
     step = 1000
 
@@ -965,13 +1008,8 @@ def wait_for_page_change(
             first_text_changed = bool(old_first_row_text and new_first_row_text and new_first_row_text != old_first_row_text)
 
             if page_changed or first_case_changed or first_text_changed:
-                log.info(
-                    "Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
-                    old_page,
-                    current,
-                    old_first_caseid,
-                    new_first_caseid,
-                )
+                log.info("Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
+                         old_page, current, old_first_caseid, new_first_caseid)
                 return True
         except Exception:
             pass
@@ -997,14 +1035,12 @@ def open_pager_dropdown(page) -> bool:
             loc = page.locator(sel)
             if loc.count() == 0:
                 continue
-
             loc.first.click(timeout=4000)
             page.wait_for_timeout(1200)
             log.info("Opened pager dropdown using selector: %s", sel)
             return True
         except Exception:
             continue
-
     return False
 
 
@@ -1044,12 +1080,9 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
                     }) || null;
                 }
 
-                if (!target) {
-                    return { ok: false, reason: 'target page element not found' };
-                }
+                if (!target) return { ok: false, reason: 'target page element not found' };
 
                 const r = target.getBoundingClientRect();
-
                 try { target.click(); } catch (e) {}
                 try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
                 try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
@@ -1070,29 +1103,16 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
         log.info("Direct hidden/visible page option result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
+            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                 return True
 
             try:
                 if result.get("visible"):
                     page.mouse.click(result["x"], result["y"])
-                    if wait_for_page_change(
-                        page,
-                        old_page=current_before,
-                        old_first_caseid=old_first_caseid,
-                        old_first_row_text=old_first_row_text,
-                        timeout_ms=16000,
-                    ):
+                    if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                         return True
             except Exception:
                 pass
-
     except Exception as e:
         log.warning("click_page_option_direct_without_dropdown failed for page %s: %s", target_page, str(e))
 
@@ -1118,12 +1138,9 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                     return t === `Page ${targetPage}` || t.startsWith(`Page ${targetPage} (results`);
                 });
 
-                if (!option) {
-                    return { ok: false, reason: 'dropdown option not found' };
-                }
+                if (!option) return { ok: false, reason: 'dropdown option not found' };
 
                 const r = option.getBoundingClientRect();
-
                 try { option.click(); } catch (e) {}
                 try { option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
                 try { option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
@@ -1143,28 +1160,15 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
         log.info("Dropdown page option click result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
+            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                 return True
 
             try:
                 page.mouse.click(result["x"], result["y"])
-                if wait_for_page_change(
-                    page,
-                    old_page=current_before,
-                    old_first_caseid=old_first_caseid,
-                    old_first_row_text=old_first_row_text,
-                    timeout_ms=16000,
-                ):
+                if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                     return True
             except Exception:
                 pass
-
     except Exception as e:
         log.warning("click_page_option_from_dropdown failed for page %s: %s", target_page, str(e))
 
@@ -1176,8 +1180,6 @@ def click_next_page(page) -> bool:
     old_first_caseid = get_first_caseid(page)
     old_first_row_text = get_first_row_text(page)
 
-    log.info("Current Miami page before NEXT click: %s", current_before)
-
     try:
         result = page.evaluate(
             """
@@ -1186,11 +1188,7 @@ def click_next_page(page) -> bool:
                     if (!el) return false;
                     const s = window.getComputedStyle(el);
                     const r = el.getBoundingClientRect();
-                    return !!s &&
-                        s.display !== 'none' &&
-                        s.visibility !== 'hidden' &&
-                        r.width > 0 &&
-                        r.height > 0;
+                    return !!s && s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
                 }
 
                 function txt(el) {
@@ -1211,14 +1209,13 @@ def click_next_page(page) -> bool:
                     const c = cls(el);
                     let score = 0;
 
-                    if (t == '>' || t == '›' || t == '»') score += 200;
+                    if (t === '>' || t === '›' || t === '»') score += 200;
                     if (c.includes('next')) score += 120;
                     if (c.includes('right')) score += 80;
                     if (c.includes('arrow')) score += 80;
                     if (c.includes('chevron')) score += 80;
                     if (el.tagName.toLowerCase() === 'img') score += 40;
                     if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
-
                     if (score <= 0) continue;
 
                     const r = el.getBoundingClientRect();
@@ -1230,15 +1227,10 @@ def click_next_page(page) -> bool:
                         className: c
                     };
 
-                    if (!best || candidate.score > best.score) {
-                        best = candidate;
-                    }
+                    if (!best || candidate.score > best.score) best = candidate;
                 }
 
-                if (!best) {
-                    return { ok: false, reason: 'no next candidate found' };
-                }
-
+                if (!best) return { ok: false, reason: 'no next candidate found' };
                 return { ok: true, ...best };
             }
             """
@@ -1248,14 +1240,7 @@ def click_next_page(page) -> bool:
 
         if result and result.get("ok"):
             page.mouse.click(result["x"], result["y"])
-
-            if wait_for_page_change(
-                page,
-                old_page=current_before,
-                old_first_caseid=old_first_caseid,
-                old_first_row_text=old_first_row_text,
-                timeout_ms=16000,
-            ):
+            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                 return True
     except Exception as e:
         log.warning("NEXT click failed: %s", str(e))
@@ -1275,11 +1260,7 @@ def log_pagination_diagnostics(page):
                         const style = window.getComputedStyle(el);
                         const text = ((el.innerText || '')).replace(/\\s+/g, ' ').trim();
 
-                        if (
-                            !text.includes('Page') &&
-                            !el.getAttribute('data-page') &&
-                            !((el.getAttribute('href') || '').includes('javascript:void(0)'))
-                        ) {
+                        if (!text.includes('Page') && !el.getAttribute('data-page') && !((el.getAttribute('href') || '').includes('javascript:void(0)'))) {
                             return null;
                         }
 
@@ -1316,11 +1297,7 @@ def go_to_page_number(page, page_num: int) -> bool:
         return True
 
     if page_num < current:
-        log.warning(
-            "Requested page %s but current page is %s. Reload is required to go backwards.",
-            page_num,
-            current,
-        )
+        log.warning("Requested page %s but current page is %s. Reload is required to go backwards.", page_num, current)
         return False
 
     for attempt in range(1, 4):
@@ -1362,7 +1339,7 @@ def go_to_page_number(page, page_num: int) -> bool:
 def parse_row_text(row_text: str) -> Dict:
     parts = re.split(r"\s{2,}|\t", row_text)
     parts = [clean_text(x) for x in parts if clean_text(x)]
-    payload = {
+    return {
         "status": parts[0] if len(parts) > 0 else "",
         "case_number": parts[1] if len(parts) > 1 else "",
         "date_created": parts[2] if len(parts) > 2 else "",
@@ -1370,7 +1347,6 @@ def parse_row_text(row_text: str) -> Dict:
         "parcel_number": parts[4] if len(parts) > 4 else "",
         "sale_date": parts[5] if len(parts) > 5 else "",
     }
-    return payload
 
 
 def open_case_by_caseid(page, caseid: str) -> Dict:
@@ -1539,7 +1515,7 @@ def build_final_record(case_detail: Dict) -> Dict:
     parcel_number = header.get("parcel_number") or row_parsed.get("parcel_number") or parcel.get("text", "")
     case_number = header.get("case_number") or row_parsed.get("case_number", "")
 
-    record = {
+    return {
         "source": "MiamiDade",
         "county": "Miami-Dade",
         "visible_in_app": True,
@@ -1564,7 +1540,6 @@ def build_final_record(case_detail: Dict) -> Dict:
         "homestead": summary.get("homestead", ""),
         "parcel_appraiser_url": parcel.get("href", ""),
     }
-    return record
 
 
 def build_properties_payload(record: dict) -> dict:
@@ -1620,7 +1595,7 @@ def launch_browser(p):
         return browser
     except Exception as e:
         log.warning("Chrome channel unavailable, falling back to chromium: %s", str(e))
-        browser = p.chromium.launch(
+        return p.chromium.launch(
             headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -1628,14 +1603,13 @@ def launch_browser(p):
                 "--disable-dev-shm-usage",
             ],
         )
-        return browser
 
 
 # =========================
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V7 + BATCH PRECHECK + SAFE DELETE ===")
+    log.info("=== MIAMI RECOVERY MODE + SCAN + SAFE DELETE ===")
 
     with sync_playwright() as p:
         browser = launch_browser(p)
@@ -1712,14 +1686,8 @@ def run_miami():
                 row_index = row.get("index")
                 total_processed_rows += 1
 
-                log.info(
-                    "[row %s/%s] Evaluating caseid=%s page=%s row=%s ...",
-                    total_processed_rows,
-                    MAX_LOTS,
-                    caseid,
-                    page_num,
-                    row_index,
-                )
+                log.info("[row %s/%s] Evaluating caseid=%s page=%s row=%s ...",
+                         total_processed_rows, MAX_LOTS, caseid, page_num, row_index)
 
                 try:
                     row_parsed = parse_row_text(row.get("row_text", ""))
@@ -1743,12 +1711,8 @@ def run_miami():
                         if same_identity:
                             if existing_sale_date == pre_sale_date:
                                 skipped_fast_same_sale_date += 1
-                                log.info(
-                                    "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
-                                    caseid,
-                                    pre_sale_date,
-                                    existing_sale_date,
-                                )
+                                log.info("FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
+                                         caseid, pre_sale_date, existing_sale_date)
                                 continue
 
                             update_result = supabase_update_sale_date(existing.get("id"), pre_sale_date)
@@ -1760,12 +1724,7 @@ def run_miami():
                             })
                             updated_sale_date_only += 1
 
-                            log.info(
-                                "SALE_DATE ONLY UPDATE node=%s old=%s new=%s",
-                                caseid,
-                                existing_sale_date,
-                                pre_sale_date,
-                            )
+                            log.info("SALE_DATE ONLY UPDATE node=%s old=%s new=%s", caseid, existing_sale_date, pre_sale_date)
 
                             mini_payload = {
                                 "county": "Miami-Dade",
@@ -1816,6 +1775,8 @@ def run_miami():
                         "error": str(e),
                     })
 
+                    dump_debug_artifacts(page, f"miami_failed_case_{caseid}")
+
                     try:
                         open_list_and_apply_filter(page)
                         if page_num > 1:
@@ -1823,9 +1784,7 @@ def run_miami():
                     except Exception:
                         pass
 
-        completed_all_pages = (
-            expected_total_pages > 0 and processed_pages == expected_total_pages
-        )
+        completed_all_pages = (expected_total_pages > 0 and processed_pages == expected_total_pages)
 
         can_delete_missing = (
             completed_all_pages
@@ -1841,8 +1800,7 @@ def run_miami():
             reconcile_result = {
                 "executed": False,
                 "reason": (
-                    f"safe delete blocked: "
-                    f"completed_all_pages={completed_all_pages}, "
+                    f"safe delete blocked: completed_all_pages={completed_all_pages}, "
                     f"processed_pages={processed_pages}, "
                     f"expected_total_pages={expected_total_pages}, "
                     f"seen_nodes={len(seen_nodes_this_run)}, "
@@ -1855,7 +1813,7 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_operational_v7_batch_precheck_safe_delete",
+            "mode": "recovery_scan_safe_delete",
             "expected_total_pages": expected_total_pages,
             "expected_total_items": expected_total_items,
             "processed_pages": processed_pages,
@@ -1883,8 +1841,5 @@ def run_miami():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     run_miami()
