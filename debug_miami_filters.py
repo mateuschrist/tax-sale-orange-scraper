@@ -2,17 +2,17 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://miamidade.realtdm.com"
 LIST_URL = f"{BASE_URL}/public/cases/list"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 OUTPUT_DIR = os.getenv("MIAMI_DEBUG_DIR", "miami_debug_max_output")
+
 WAIT_SHORT = 800
 WAIT_MED = 1800
 WAIT_LONG = 5000
@@ -42,9 +42,6 @@ REPORT: Dict[str, Any] = {
 }
 
 
-# =========================================================
-# FILE HELPERS
-# =========================================================
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -62,12 +59,12 @@ def save_json(name: str, data: Any):
     log.info("Saved json: %s", path)
 
 
-def save_text(name: str, content: str):
+def save_html(page, name: str):
     path = out_path(name)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(page.content())
     REPORT["artifacts"].append(path)
-    log.info("Saved text: %s", path)
+    log.info("Saved html: %s", path)
 
 
 def save_screenshot(page, name: str):
@@ -75,14 +72,6 @@ def save_screenshot(page, name: str):
     page.screenshot(path=path, full_page=True)
     REPORT["artifacts"].append(path)
     log.info("Saved screenshot: %s", path)
-
-
-def save_html(page, name: str):
-    path = out_path(name)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(page.content())
-    REPORT["artifacts"].append(path)
-    log.info("Saved html: %s", path)
 
 
 def record_step(step: str, ok: bool, detail: Optional[Dict[str, Any]] = None):
@@ -96,9 +85,6 @@ def record_step(step: str, ok: bool, detail: Optional[Dict[str, Any]] = None):
     log.info("%s %s %s", "OK" if ok else "FAIL", step, json.dumps(detail or {}, ensure_ascii=False)[:900])
 
 
-# =========================================================
-# BASIC HELPERS
-# =========================================================
 def clean_text(value) -> str:
     if value is None:
         return ""
@@ -128,9 +114,6 @@ def humanize(page):
         pass
 
 
-# =========================================================
-# NETWORK
-# =========================================================
 def attach_network_logging(page):
     def on_request(request):
         try:
@@ -170,9 +153,6 @@ def attach_network_logging(page):
     page.on("requestfailed", on_request_failed)
 
 
-# =========================================================
-# PAGE STATE
-# =========================================================
 def current_filter_state(page) -> Dict[str, Any]:
     return page.evaluate(
         """
@@ -350,9 +330,6 @@ def dom_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# =========================================================
-# CLICK ENGINE
-# =========================================================
 def try_click_selector(page, selector: str, label: str = "") -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "label": label,
@@ -468,9 +445,6 @@ def clear_status_filter(page):
         pass
 
 
-# =========================================================
-# TEST PHASES
-# =========================================================
 def test_page_load(page) -> bool:
     try:
         page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
@@ -872,35 +846,6 @@ def test_next_page(page) -> Dict[str, Any]:
     return {"ok": False, "strategies": strategies}
 
 
-# =========================================================
-# MAIN
-# =========================================================
-def launch_browser(p):
-    try:
-        browser = p.chromium.launch(
-            channel="chrome",
-            headless=HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        record_step("launch_browser", True, {"mode": "chrome", "headless": HEADLESS})
-        return browser
-    except Exception as e:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        record_step("launch_browser", True, {"mode": "chromium_fallback", "headless": HEADLESS, "reason": str(e)})
-        return browser
-
-
 def rerun_minimal_flow_to_rows(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
     try:
@@ -913,6 +858,19 @@ def rerun_minimal_flow_to_rows(page):
     test_open_status(page)
     test_select_active(page)
     test_submit_search(page)
+
+
+def launch_browser(p):
+    browser = p.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    record_step("launch_browser", True, {"mode": "playwright_chromium", "headless": HEADLESS})
+    return browser
 
 
 def main():
