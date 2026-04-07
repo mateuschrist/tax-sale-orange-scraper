@@ -105,13 +105,6 @@ def dump_debug_artifacts(page, prefix: str):
         log.warning("Could not save html %s.html: %s", prefix, str(e))
 
 
-def human_pause(page, ms=600):
-    try:
-        page.wait_for_timeout(ms)
-    except Exception:
-        pass
-
-
 def humanize(page):
     try:
         page.mouse.move(250, 220)
@@ -446,7 +439,7 @@ def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
 
 
 # =========================
-# SCAN / CLICK / FILTER
+# UI / FILTER / SEARCH
 # =========================
 def scan_clickables(page, prefix="miami_scan") -> Dict:
     data = page.evaluate(
@@ -573,60 +566,17 @@ def click_by_text_scan(page, texts: List[str], name: str) -> bool:
 
 
 def discover_and_open_status_filter(page) -> bool:
-    # tentativa direta
-    direct_selectors = [
-        "#filterButtonStatus",
-        '[data-target="#filterStatus"]',
-        '[data-target*="Status"]',
-        "#caseStatus2",
-    ]
-    for sel in direct_selectors:
+    for sel in ["#filterButtonStatus", '[data-target="#filterStatus"]', '[data-target*="Status"]', "#caseStatus2"]:
         if click_safe(page, sel, "FILTER BUTTON"):
-            human_pause(page, 1000)
+            page.wait_for_timeout(1000)
             return True
 
-    # tentativa por texto
     if click_by_text_scan(page, ["Case Status", "Status"], "FILTER BUTTON TEXT"):
-        human_pause(page, 1000)
+        page.wait_for_timeout(1000)
         return True
 
     dump_debug_artifacts(page, "miami_filter_open_failed")
     return False
-
-
-def discover_active_status(page) -> dict:
-    return page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-            }
-
-            const candidates = Array.from(document.querySelectorAll('[data-statusid], a, li, div, span'))
-                .map(el => ({
-                    text: txt(el),
-                    data_statusid: el.getAttribute('data-statusid') || '',
-                    data_parentid: el.getAttribute('data-parentid') || '',
-                    class_name: (el.className || '').toString(),
-                    id: el.id || ''
-                }))
-                .filter(x =>
-                    x.data_statusid ||
-                    x.text.toLowerCase().includes('active') ||
-                    x.class_name.toLowerCase().includes('status')
-                );
-
-            const exactActive = candidates.find(x => x.text.toLowerCase() === 'active');
-            const containsActive = candidates.find(x => x.text.toLowerCase().includes('active'));
-
-            return {
-                exactActive,
-                containsActive,
-                candidates: candidates.slice(0, 200)
-            };
-        }
-        """
-    )
 
 
 def force_clear_all_active_statuses(page):
@@ -658,79 +608,105 @@ def force_clear_all_active_statuses(page):
 
 
 def force_select_active(page) -> str:
-    discovery = discover_active_status(page)
-    chosen = discovery.get("exactActive") or discovery.get("containsActive")
+    discovery = page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
+
+            const all = Array.from(document.querySelectorAll('a, li, div, span, button'));
+
+            const visible = all.filter(el => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            });
+
+            const exact = visible.map(el => ({
+                text: txt(el),
+                tag: el.tagName.toLowerCase(),
+                id: el.id || '',
+                class_name: (el.className || '').toString(),
+                data_statusid: el.getAttribute('data-statusid') || '',
+                data_parentid: el.getAttribute('data-parentid') || '',
+                onclick: el.getAttribute('onclick') || ''
+            }))
+            .filter(x => x.text === 'Active');
+
+            return {
+                exact_active_candidates: exact.slice(0, 50)
+            };
+        }
+        """
+    )
 
     try:
-        with open("miami_active_candidates.json", "w", encoding="utf-8") as f:
+        with open("miami_active_exact_candidates.json", "w", encoding="utf-8") as f:
             json.dump(discovery, f, indent=2, ensure_ascii=False)
-        log.info("Saved miami_active_candidates.json")
+        log.info("Saved miami_active_exact_candidates.json")
     except Exception:
         pass
 
-    if not chosen:
-        dump_debug_artifacts(page, "miami_active_not_found")
-        raise RuntimeError("Active status not found in DOM")
+    clicked = page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
 
-    statusid = clean_text(chosen.get("data_statusid"))
-    parentid = clean_text(chosen.get("data_parentid"))
-    text = clean_text(chosen.get("text"))
+            const all = Array.from(document.querySelectorAll('a, li, div, span, button'));
 
-    log.info("ACTIVE discovered text=%s statusid=%s parentid=%s", text, statusid, parentid)
+            const visible = all.filter(el => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            });
 
-    # 1) tenta por data-statusid
-    if statusid:
-        selectors = []
-        if parentid:
-            selectors.append(f'[data-statusid="{statusid}"][data-parentid="{parentid}"]')
-        selectors.append(f'[data-statusid="{statusid}"]')
+            const exact = visible.filter(el => txt(el) === 'Active');
 
-        for sel in selectors:
-            if click_safe(page, sel, "ACTIVE STATUS"):
-                human_pause(page, 800)
-                try:
-                    page.evaluate(
-                        """([statusid, textValue]) => {
-                            const hidden = document.querySelector('#filterCaseStatus');
-                            if (hidden && statusid) hidden.value = statusid;
+            exact.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return (ra.width * ra.height) - (rb.width * rb.height);
+            });
 
-                            const label = document.querySelector('#filterCaseStatusLabel');
-                            if (label) label.innerText = '1 Selected';
+            const target = exact[0];
+            if (!target) return { ok: false, reason: "exact Active not found" };
 
-                            const all = Array.from(document.querySelectorAll('[data-statusid]'));
-                            all.forEach(el => {
-                                if (el.getAttribute('data-statusid') === statusid) {
-                                    el.classList.add('selected');
-                                }
-                            });
-                        }""",
-                        [statusid, text],
-                    )
-                except Exception:
-                    pass
-                return statusid
+            try { target.click(); } catch (e) {}
+            try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+            try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+            try { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
 
-    # 2) fallback por texto
-    clicked = click_by_text_scan(page, [text, "Active"], "ACTIVE STATUS TEXT")
-    if clicked:
-        human_pause(page, 800)
-        if statusid:
-            try:
-                page.evaluate(
-                    """(statusid) => {
-                        const hidden = document.querySelector('#filterCaseStatus');
-                        if (hidden) hidden.value = statusid;
-                        const label = document.querySelector('#filterCaseStatusLabel');
-                        if (label) label.innerText = '1 Selected';
-                    }""",
-                    statusid,
-                )
-            except Exception:
-                pass
-        return statusid or text
+            const hidden = document.querySelector('#filterCaseStatus');
+            const label = document.querySelector('#filterCaseStatusLabel');
 
-    dump_debug_artifacts(page, "miami_active_click_failed")
-    raise RuntimeError(f"Could not click Active status. Candidate={chosen}")
+            return {
+                ok: true,
+                hidden_value: hidden ? hidden.value : '',
+                label: label ? label.innerText.trim() : ''
+            };
+        }
+        """
+    )
+
+    log.info("ACTIVE click result: %s", clicked)
+
+    hidden_value = clean_text((clicked or {}).get("hidden_value", ""))
+    if not clicked or not clicked.get("ok"):
+        dump_debug_artifacts(page, "miami_active_click_failed")
+        raise RuntimeError(f"Could not click exact Active. Result={clicked}")
+
+    if "," in hidden_value:
+        dump_debug_artifacts(page, "miami_active_group_clicked")
+        raise RuntimeError(f"Clicked Active group instead of leaf. hidden_filterCaseStatus={hidden_value}")
+
+    if not hidden_value:
+        raise RuntimeError("Active clicked but hidden filter value is empty")
+
+    log.info("ACTIVE leaf selected successfully: %s", hidden_value)
+    return hidden_value
 
 
 def get_filter_state(page):
@@ -754,31 +730,15 @@ def get_filter_state(page):
     )
 
 
-def wait_for_case_rows(page, timeout_ms=30000):
-    log.info("Waiting for Miami search results...")
-    waited = 0
-    step = 1000
-    while waited < timeout_ms:
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-        if rows > 0:
-            log.info("Rows after search: %s", rows)
-            return rows
-        page.wait_for_timeout(step)
-        waited += step
-
-    dump_debug_artifacts(page, "miami_no_rows_after_search")
-    raise RuntimeError("No case rows found after Miami search")
-
-
 def click_search_button(page) -> bool:
     selectors = [
-        "button.filters-submit",
         "button:has-text('Process Search')",
         "text=Process Search",
+        'input[type="submit"][value*="Process Search"]',
+        'input[type="button"][value*="Process Search"]',
+        "button.filters-submit",
         "button:has-text('Search')",
         "text=Search",
-        'input[type="submit"][value*="Search"]',
-        'input[type="button"][value*="Search"]',
     ]
 
     for sel in selectors:
@@ -797,7 +757,7 @@ def click_search_button(page) -> bool:
 
             try:
                 locator.click(timeout=6000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)
                 log.info("SEARCH BUTTON clicked (normal): %s", sel)
                 return True
             except Exception:
@@ -805,7 +765,7 @@ def click_search_button(page) -> bool:
 
             try:
                 locator.click(force=True, timeout=6000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)
                 log.info("SEARCH BUTTON clicked (force): %s", sel)
                 return True
             except Exception:
@@ -814,13 +774,24 @@ def click_search_button(page) -> bool:
         except Exception as e:
             log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
 
-    # texto solto no DOM
-    if click_by_text_scan(page, ["Process Search", "Search"], "SEARCH BUTTON TEXT"):
-        page.wait_for_timeout(3000)
-        return True
-
     dump_debug_artifacts(page, "miami_search_click_failed")
     return False
+
+
+def wait_for_case_rows(page, timeout_ms=30000):
+    log.info("Waiting for Miami search results...")
+    waited = 0
+    step = 1000
+    while waited < timeout_ms:
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+        if rows > 0:
+            log.info("Rows after search: %s", rows)
+            return rows
+        page.wait_for_timeout(step)
+        waited += step
+
+    dump_debug_artifacts(page, "miami_no_rows_after_search")
+    raise RuntimeError("No case rows found after Miami search")
 
 
 def run_search_flow(page):
@@ -848,8 +819,14 @@ def run_search_flow(page):
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
-    if not state.get("hidden_filterCaseStatus") and not active_key:
+    if not state.get("hidden_filterCaseStatus"):
         raise RuntimeError(f"Status filter did not stick. Current state={state}")
+
+    if "," in state.get("hidden_filterCaseStatus", ""):
+        raise RuntimeError(f"Active group was selected instead of a single status. Current state={state}")
+
+    if not active_key:
+        raise RuntimeError(f"Active key is empty. Current state={state}")
 
     if not click_search_button(page):
         raise RuntimeError("Could not click search")
@@ -1609,7 +1586,7 @@ def launch_browser(p):
 # MAIN
 # =========================
 def run_miami():
-    log.info("=== MIAMI RECOVERY MODE + SCAN + SAFE DELETE ===")
+    log.info("=== MIAMI FINAL FIXED MODE ===")
 
     with sync_playwright() as p:
         browser = launch_browser(p)
@@ -1813,7 +1790,7 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "recovery_scan_safe_delete",
+            "mode": "final_fixed_mode",
             "expected_total_pages": expected_total_pages,
             "expected_total_items": expected_total_items,
             "processed_pages": processed_pages,
