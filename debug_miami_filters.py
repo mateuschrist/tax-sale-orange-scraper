@@ -1,384 +1,404 @@
-"""
-MIAMI DEBUG SCRIPT - CORRIGIDO
-Objetivo: descobrir exatamente o que funciona no site hoje
-"""
-
 import json
 import logging
 import os
 import re
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("miami_debug")
+log = logging.getLogger("miami_probe")
 
 BASE_URL = "https://miamidade.realtdm.com"
 LIST_URL = f"{BASE_URL}/public/cases/list"
-
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 REPORT = {
-    "timestamp": datetime.now().isoformat(),
+    "started_at": datetime.utcnow().isoformat(),
+    "page": {},
     "steps": [],
-    "success_methods": {},
-    "page_info": {},
-    "dom_inspection": {},
-    "samples": {},
+    "results": {},
 }
 
-# =====================
-# HELPERS
-# =====================
+
 def clean_text(value):
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def report_step(step, success, method="", details="", data=None):
-    REPORT["steps"].append({
-        "step": step,
-        "success": success,
-        "method": method,
-        "details": details,
-        "time": datetime.now().isoformat(),
-        "data": data or {},
-    })
-
-    if success and method:
-        REPORT["success_methods"].setdefault(step, []).append(method)
-
-    icon = "✅" if success else "❌"
-    log.info("%s %s | %s | %s", icon, step, method, details)
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def safe_screenshot(page, name):
+def dump_artifacts(page, prefix):
     try:
-        page.screenshot(path=name, full_page=True)
-        log.info("Screenshot saved: %s", name)
-    except Exception as e:
-        log.warning("Could not save screenshot %s: %s", name, str(e))
-
-
-def human_behavior(page):
+        page.screenshot(path=f"{prefix}.png", full_page=True)
+    except Exception:
+        pass
     try:
-        page.mouse.move(200, 200)
-        page.wait_for_timeout(400)
-        page.mouse.move(500, 350)
-        page.wait_for_timeout(600)
-        page.mouse.wheel(0, 500)
-        page.wait_for_timeout(800)
-        page.mouse.wheel(0, -250)
-        page.wait_for_timeout(500)
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
     except Exception:
         pass
 
 
-def click_with_methods(page, selector, step_name, screenshot_prefix, timeout=6000):
-    methods = [
-        ("page.click", lambda: page.click(selector, timeout=timeout)),
-        ("locator.click", lambda: page.locator(selector).first.click(timeout=timeout)),
-        ("locator.click(force=True)", lambda: page.locator(selector).first.click(force=True, timeout=timeout)),
-        ("js click", lambda: page.evaluate(
-            """(sel) => {
-                const el = document.querySelector(sel);
-                if (!el) throw new Error(`not found: ${sel}`);
-                el.click();
-            }""",
-            selector
-        )),
-    ]
-
-    for method_name, fn in methods:
-        try:
-            fn()
-            page.wait_for_timeout(1200)
-            safe_screenshot(page, f"{screenshot_prefix}_{method_name.replace('/', '_').replace(' ', '_')}.png")
-            report_step(step_name, True, method_name, f"selector={selector}")
-            return True
-        except Exception as e:
-            report_step(step_name, False, method_name, str(e))
-
-    return False
-
-
-# =====================
-# INSPECTION
-# =====================
-def inspect_basic_page_info(page):
-    try:
-        title = page.title()
-    except Exception:
-        title = ""
-
-    try:
-        body_text = page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        body_text = ""
-
-    REPORT["page_info"] = {
-        "url": page.url,
-        "title": title,
-        "body_sample": body_text[:3000],
+def record(step, ok, detail=None):
+    entry = {
+        "step": step,
+        "ok": ok,
+        "detail": detail or {},
+        "ts": datetime.utcnow().isoformat(),
     }
-
-    log.info("PAGE URL: %s", page.url)
-    log.info("PAGE TITLE: %s", title)
-    log.info("BODY SAMPLE: %s", body_text[:500])
+    REPORT["steps"].append(entry)
+    log.info("%s %s %s", "OK" if ok else "FAIL", step, json.dumps(detail or {}, ensure_ascii=False)[:500])
 
 
-def inspect_reset_candidates(page):
+def launch_browser(p):
     try:
-        data = page.evaluate("""
-        () => {
-            return Array.from(document.querySelectorAll('a,button,span,div'))
-            .map(el => ({
-                text: (el.innerText || '').trim(),
-                class: el.className || '',
-                id: el.id || '',
-                href: el.getAttribute('href') || '',
-                onclick: el.getAttribute('onclick') || ''
-            }))
-            .filter(x =>
-                x.text.toLowerCase().includes('reset') ||
-                x.class.toLowerCase().includes('reset') ||
-                x.id.toLowerCase().includes('reset')
-            )
-            .slice(0, 50);
-        }
-        """)
-        REPORT["dom_inspection"]["reset_candidates"] = data
-        log.info("RESET CANDIDATES: %s", json.dumps(data, indent=2))
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        record("launch_browser", True, {"mode": "chrome"})
+        return browser
     except Exception as e:
-        log.warning("inspect_reset_candidates failed: %s", str(e))
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        record("launch_browser", True, {"mode": "chromium_fallback", "reason": str(e)})
+        return browser
 
 
-def inspect_filter_candidates(page):
+def humanize(page):
     try:
-        data = page.evaluate("""
+        page.mouse.move(250, 220)
+        page.wait_for_timeout(300)
+        page.mouse.move(520, 360)
+        page.wait_for_timeout(500)
+        page.mouse.wheel(0, 350)
+        page.wait_for_timeout(700)
+        page.mouse.wheel(0, -180)
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+
+def scan_dom(page, prefix):
+    data = page.evaluate(
+        """
         () => {
-            return Array.from(document.querySelectorAll('a,button,span,div'))
-            .map(el => ({
-                text: (el.innerText || '').trim(),
-                class: el.className || '',
-                id: el.id || '',
-                data_target: el.getAttribute('data-target') || '',
-                onclick: el.getAttribute('onclick') || ''
-            }))
-            .filter(x =>
-                x.text.toLowerCase().includes('status') ||
-                x.id.toLowerCase().includes('status') ||
-                x.class.toLowerCase().includes('status') ||
-                x.data_target.toLowerCase().includes('status')
-            )
-            .slice(0, 80);
-        }
-        """)
-        REPORT["dom_inspection"]["filter_candidates"] = data
-        log.info("FILTER CANDIDATES: %s", json.dumps(data, indent=2))
-    except Exception as e:
-        log.warning("inspect_filter_candidates failed: %s", str(e))
-
-
-def inspect_search_candidates(page):
-    try:
-        data = page.evaluate("""
-        () => {
-            return Array.from(document.querySelectorAll('button,a,input[type="submit"],input[type="button"]'))
-            .map(el => ({
-                tag: el.tagName.toLowerCase(),
-                text: (el.innerText || el.value || '').trim(),
-                class: el.className || '',
-                id: el.id || '',
-                type: el.getAttribute('type') || ''
-            }))
-            .filter(x =>
-                x.text.toLowerCase().includes('search') ||
-                x.class.toLowerCase().includes('search') ||
-                x.id.toLowerCase().includes('search')
-            )
-            .slice(0, 50);
-        }
-        """)
-        REPORT["dom_inspection"]["search_candidates"] = data
-        log.info("SEARCH CANDIDATES: %s", json.dumps(data, indent=2))
-    except Exception as e:
-        log.warning("inspect_search_candidates failed: %s", str(e))
-
-
-def inspect_pagination(page):
-    try:
-        data = page.evaluate("""
-        () => {
-            return Array.from(document.querySelectorAll('[data-page],a,button,span,div,td,li'))
-            .map(el => ({
-                text: (el.innerText || '').trim(),
-                data_page: el.getAttribute('data-page') || '',
-                class: el.className || '',
-                id: el.id || ''
-            }))
-            .filter(x => x.text.includes('Page') || x.data_page)
-            .slice(0, 100);
-        }
-        """)
-        REPORT["dom_inspection"]["pagination"] = data
-        log.info("PAGINATION CANDIDATES: %s", json.dumps(data, indent=2))
-    except Exception as e:
-        log.warning("inspect_pagination failed: %s", str(e))
-
-
-# =====================
-# TESTS
-# =====================
-def test_page_load(page):
-    try:
-        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_load_state("networkidle", timeout=15000)
-        page.wait_for_timeout(5000)
-
-        inspect_basic_page_info(page)
-        safe_screenshot(page, "debug_01_page_loaded.png")
-
-        report_step("Page Load", True, "goto + networkidle", "Página carregada")
-        return True
-    except PlaywrightTimeoutError as e:
-        safe_screenshot(page, "debug_01_page_timeout.png")
-        report_step("Page Load", False, "goto + networkidle", f"Timeout: {str(e)}")
-        return False
-    except Exception as e:
-        safe_screenshot(page, "debug_01_page_error.png")
-        report_step("Page Load", False, "goto", str(e))
-        return False
-
-
-def test_reset_filters(page):
-    log.info("=" * 80)
-    log.info("TEST RESET FILTERS")
-    log.info("=" * 80)
-
-    inspect_reset_candidates(page)
-    return click_with_methods(page, "a.filters-reset", "Reset Filters", "debug_02_reset")
-
-
-def test_filter_button(page):
-    log.info("=" * 80)
-    log.info("TEST FILTER BUTTON")
-    log.info("=" * 80)
-
-    inspect_filter_candidates(page)
-
-    selectors = [
-        "#filterButtonStatus",
-        '[data-target="#filterStatus"]',
-        'text=Status',
-    ]
-
-    for sel in selectors:
-        ok = click_with_methods(page, sel, "Filter Button", "debug_03_filter")
-        if ok:
-            return True
-
-    return False
-
-
-def test_clear_statuses(page):
-    try:
-        page.evaluate("""
-        () => {
-            const children = document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]');
-            children.forEach(el => {
-                el.classList.remove('selected');
-                const icon = el.querySelector('i');
-                if (icon) {
-                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    icon.className = (icon.className + ' icon-circle-blank').trim();
-                }
-            });
-
-            const parent = document.querySelector('#caseStatus2');
-            if (parent) {
-                parent.classList.remove('selected');
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
+            function visible(el) {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
             }
 
+            const clickables = Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],div,span,li'))
+                .map((el, idx) => ({
+                    idx,
+                    tag: el.tagName.toLowerCase(),
+                    text: txt(el),
+                    visible: visible(el),
+                    id: el.id || '',
+                    class_name: (el.className || '').toString(),
+                    href: el.getAttribute('href') || '',
+                    onclick: el.getAttribute('onclick') || '',
+                    data_target: el.getAttribute('data-target') || '',
+                    data_toggle: el.getAttribute('data-toggle') || '',
+                    data_statusid: el.getAttribute('data-statusid') || '',
+                    data_parentid: el.getAttribute('data-parentid') || ''
+                }))
+                .filter(x => x.text || x.id || x.class_name || x.data_target || x.data_statusid);
+
+            return {
+                url: location.href,
+                title: document.title,
+                body_sample: (document.body.innerText || '').slice(0, 5000),
+                clickables: clickables.slice(0, 3000),
+                status_candidates: clickables.filter(x =>
+                    x.text.toLowerCase().includes('status') ||
+                    x.id.toLowerCase().includes('status') ||
+                    x.class_name.toLowerCase().includes('status') ||
+                    x.data_target.toLowerCase().includes('status')
+                ).slice(0, 300),
+                active_candidates: clickables.filter(x =>
+                    x.text === 'Active' ||
+                    x.text.toLowerCase().includes('active')
+                ).slice(0, 300),
+                search_candidates: clickables.filter(x =>
+                    x.text.toLowerCase().includes('search')
+                ).slice(0, 300),
+                page_candidates: clickables.filter(x =>
+                    x.text.includes('Page') || x.data_page
+                ).slice(0, 300)
+            };
+        }
+        """
+    )
+    save_json(f"{prefix}.json", data)
+    dump_artifacts(page, prefix)
+    return data
+
+
+def try_click_selector(page, selector, label):
+    attempts = []
+
+    try:
+        page.locator(selector).first.click(timeout=4000)
+        page.wait_for_timeout(1200)
+        attempts.append({"method": "locator.click", "ok": True})
+        return True, attempts
+    except Exception as e:
+        attempts.append({"method": "locator.click", "ok": False, "error": str(e)})
+
+    try:
+        page.locator(selector).first.click(force=True, timeout=4000)
+        page.wait_for_timeout(1200)
+        attempts.append({"method": "locator.click(force=True)", "ok": True})
+        return True, attempts
+    except Exception as e:
+        attempts.append({"method": "locator.click(force=True)", "ok": False, "error": str(e)})
+
+    try:
+        ok = page.evaluate(
+            """
+            (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                try { el.click(); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+                return true;
+            }
+            """,
+            selector,
+        )
+        if ok:
+            page.wait_for_timeout(1200)
+            attempts.append({"method": "page.evaluate(js click)", "ok": True})
+            return True, attempts
+        attempts.append({"method": "page.evaluate(js click)", "ok": False, "error": "selector not found"})
+    except Exception as e:
+        attempts.append({"method": "page.evaluate(js click)", "ok": False, "error": str(e)})
+
+    return False, attempts
+
+
+def try_click_text(page, text, label):
+    selectors = [
+        f'text="{text}"',
+        f'text={text}',
+        f'button:has-text("{text}")',
+        f'a:has-text("{text}")',
+        f'span:has-text("{text}")',
+        f'div:has-text("{text}")',
+        f'li:has-text("{text}")',
+    ]
+
+    all_attempts = []
+    for sel in selectors:
+        ok, attempts = try_click_selector(page, sel, label)
+        all_attempts.append({"selector": sel, "attempts": attempts})
+        if ok:
+            return True, all_attempts
+    return False, all_attempts
+
+
+def current_filter_state(page):
+    return page.evaluate(
+        """
+        () => {
+            const hidden = document.querySelector('#filterCaseStatus');
+            const label = document.querySelector('#filterCaseStatusLabel');
+            const selected = Array.from(document.querySelectorAll('.selected,[aria-selected="true"]'))
+                .map(el => ((el.innerText || '').replace(/\\s+/g, ' ').trim()))
+                .filter(Boolean)
+                .slice(0, 50);
+
+            return {
+                hidden_filterCaseStatus: hidden ? hidden.value : '',
+                label: label ? label.innerText.trim() : '',
+                selected_items: selected
+            };
+        }
+        """
+    )
+
+
+def clear_statuses(page):
+    page.evaluate(
+        """
+        () => {
+            const nodes = document.querySelectorAll('[data-statusid]');
+            nodes.forEach(el => el.classList.remove('selected'));
             const hidden = document.querySelector('#filterCaseStatus');
             if (hidden) hidden.value = '';
-
             const label = document.querySelector('#filterCaseStatusLabel');
             if (label) label.innerText = 'None Selected';
         }
-        """)
-        page.wait_for_timeout(700)
-        safe_screenshot(page, "debug_04_clear_statuses.png")
-        report_step("Clear Statuses", True, "page.evaluate", "Statuses limpos")
-        return True
-    except Exception as e:
-        report_step("Clear Statuses", False, "page.evaluate", str(e))
-        return False
+        """
+    )
+    page.wait_for_timeout(600)
 
 
-def test_select_status_192(page):
-    try:
-        page.evaluate("""
+def test_open_status(page):
+    candidates = [
+        "#filterButtonStatus",
+        '[data-target="#filterStatus"]',
+        '[data-target*="Status"]',
+        "#caseStatus2",
+    ]
+
+    log.info("=== TEST OPEN STATUS ===")
+    details = []
+
+    for sel in candidates:
+        ok, attempts = try_click_selector(page, sel, "open_status")
+        details.append({"selector": sel, "attempts": attempts, "state": current_filter_state(page)})
+        if ok:
+            record("open_status", True, {"winner": sel, "details": details[-1]})
+            return True, details
+
+    for txt in ["Case Status", "Status"]:
+        ok, attempts = try_click_text(page, txt, "open_status_text")
+        details.append({"text": txt, "attempts": attempts, "state": current_filter_state(page)})
+        if ok:
+            record("open_status", True, {"winner_text": txt, "details": details[-1]})
+            return True, details
+
+    record("open_status", False, {"details": details})
+    return False, details
+
+
+def test_select_active(page):
+    log.info("=== TEST SELECT ACTIVE ===")
+    clear_statuses(page)
+
+    # testar por seletor conhecido primeiro
+    strategies = []
+
+    known_selectors = [
+        '[data-statusid="192"]',
+        'a[data-statusid="192"]',
+        '[data-statusid="192"][data-parentid="2"]',
+        'a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]',
+    ]
+
+    for sel in known_selectors:
+        clear_statuses(page)
+        ok, attempts = try_click_selector(page, sel, "active_known")
+        state = current_filter_state(page)
+        strategies.append({"type": "selector", "value": sel, "attempts": attempts, "state": state})
+        if ok and state.get("hidden_filterCaseStatus") == "192":
+            record("select_active", True, {"winner": sel, "state": state})
+            return True, strategies
+
+    # depois testar texto exato
+    clear_statuses(page)
+    ok, attempts = try_click_text(page, "Active", "active_text")
+    state = current_filter_state(page)
+    strategies.append({"type": "text", "value": "Active", "attempts": attempts, "state": state})
+    if ok and state.get("hidden_filterCaseStatus") == "192":
+        record("select_active", True, {"winner_text": "Active", "state": state})
+        return True, strategies
+
+    # varredura ampla: clicar todos candidatos com texto exact Active
+    candidates = page.evaluate(
+        """
         () => {
-            const el = document.querySelector('a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]');
-            if (!el) throw new Error("Status 192 not found");
-
-            el.classList.add('selected');
-
-            const icon = el.querySelector('i');
-            if (icon) {
-                icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                icon.className = (icon.className + ' icon-ok-sign').trim();
+            function txt(el) {
+                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+            }
+            function visible(el) {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
             }
 
-            const parent = document.querySelector('#caseStatus2');
-            if (parent) {
-                parent.classList.add('selected');
+            return Array.from(document.querySelectorAll('a,li,div,span,button'))
+                .filter(visible)
+                .map((el, idx) => ({
+                    idx,
+                    tag: el.tagName.toLowerCase(),
+                    text: txt(el),
+                    id: el.id || '',
+                    class_name: (el.className || '').toString(),
+                    data_statusid: el.getAttribute('data-statusid') || '',
+                    data_parentid: el.getAttribute('data-parentid') || ''
+                }))
+                .filter(x => x.text === 'Active')
+                .slice(0, 100);
+        }
+        """
+    )
+
+    save_json("miami_active_candidates_probe.json", candidates)
+
+    for i, cand in enumerate(candidates):
+        clear_statuses(page)
+        clicked = page.evaluate(
+            """
+            (targetIndex) => {
+                function txt(el) {
+                    return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+                }
+                function visible(el) {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                }
+
+                const matches = Array.from(document.querySelectorAll('a,li,div,span,button'))
+                    .filter(visible)
+                    .filter(el => txt(el) === 'Active');
+
+                const el = matches[targetIndex];
+                if (!el) return false;
+
+                try { el.click(); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+                return true;
             }
+            """,
+            i,
+        )
+        page.wait_for_timeout(900)
+        state = current_filter_state(page)
+        strategies.append({"type": "candidate_index", "value": i, "candidate": cand, "clicked": clicked, "state": state})
 
-            const hidden = document.querySelector('#filterCaseStatus');
-            if (hidden) hidden.value = '192';
+        if clicked and state.get("hidden_filterCaseStatus") == "192":
+            record("select_active", True, {"winner_candidate_index": i, "candidate": cand, "state": state})
+            return True, strategies
 
-            const label = document.querySelector('#filterCaseStatusLabel');
-            if (label) label.innerText = '1 Selected';
-        }
-        """)
-        page.wait_for_timeout(1000)
-
-        state = page.evaluate("""
-        () => {
-            const hidden = document.querySelector('#filterCaseStatus');
-            const label = document.querySelector('#filterCaseStatusLabel');
-            return {
-                hidden_value: hidden ? hidden.value : '',
-                label: label ? label.innerText.trim() : ''
-            };
-        }
-        """)
-
-        safe_screenshot(page, "debug_05_select_192.png")
-        report_step("Select Status 192", True, "page.evaluate", "Status 192 selecionado", state)
-        return True
-    except Exception as e:
-        report_step("Select Status 192", False, "page.evaluate", str(e))
-        return False
+    record("select_active", False, {"strategies": strategies[-20:]})
+    return False, strategies
 
 
-def test_click_search(page):
-    log.info("=" * 80)
-    log.info("TEST SEARCH BUTTON")
-    log.info("=" * 80)
-
-    inspect_search_candidates(page)
+def test_search_submit(page):
+    log.info("=== TEST SEARCH SUBMIT ===")
+    strategies = []
 
     selectors = [
+        "button:has-text('Process Search')",
+        "text=Process Search",
+        'input[type="submit"][value*="Process Search"]',
+        'input[type="button"][value*="Process Search"]',
         "button.filters-submit",
         "button:has-text('Search')",
         "text=Search",
@@ -388,249 +408,183 @@ def test_click_search(page):
         try:
             locator = page.locator(sel).first
             if locator.count() == 0:
+                strategies.append({"selector": sel, "found": False})
                 continue
 
             try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                    locator.click(timeout=6000)
-                page.wait_for_timeout(3000)
-                safe_screenshot(page, "debug_06_search_navigation.png")
-                report_step("Click Search", True, f"click + navigation | {sel}", "Search executado")
-                return True
-            except Exception:
-                pass
-
-            try:
-                locator.click(timeout=6000)
-                page.wait_for_timeout(3000)
-                safe_screenshot(page, "debug_06_search_click.png")
-                report_step("Click Search", True, f"click | {sel}", "Search executado")
-                return True
-            except Exception:
-                pass
-
-            try:
-                locator.click(force=True, timeout=6000)
-                page.wait_for_timeout(3000)
-                safe_screenshot(page, "debug_06_search_force.png")
-                report_step("Click Search", True, f"force click | {sel}", "Search executado")
-                return True
-            except Exception:
-                pass
-
+                locator.click(timeout=5000)
+                page.wait_for_timeout(5000)
+                rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+                strategies.append({"selector": sel, "found": True, "rows_after": rows})
+                if rows > 0:
+                    record("search_submit", True, {"winner": sel, "rows_after": rows})
+                    return True, strategies
+            except Exception as e:
+                strategies.append({"selector": sel, "found": True, "error": str(e)})
         except Exception as e:
-            report_step("Click Search", False, sel, str(e))
+            strategies.append({"selector": sel, "error": str(e)})
 
-    report_step("Click Search", False, "all selectors", "Nenhum método funcionou")
-    return False
-
-
-def test_wait_for_results(page):
-    try:
-        waited = 0
-        while waited < 25000:
-            rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-            if rows > 0:
-                samples = []
-                for i in range(min(rows, 5)):
-                    try:
-                        row = page.locator('tr.load-case.table-row.link[data-caseid]').nth(i)
-                        samples.append({
-                            "caseid": row.get_attribute("data-caseid") or "",
-                            "row_text": clean_text(row.inner_text()),
-                        })
-                    except Exception:
-                        pass
-
-                REPORT["samples"]["rows"] = samples
-                safe_screenshot(page, "debug_07_results.png")
-                report_step("Wait Results", True, "poll rows", f"{rows} rows encontrados", {"rows": rows})
-                return True
-
-            page.wait_for_timeout(1000)
-            waited += 1000
-
-        report_step("Wait Results", False, "poll rows", "Timeout sem rows")
-        return False
-    except Exception as e:
-        report_step("Wait Results", False, "poll rows", str(e))
-        return False
+    record("search_submit", False, {"strategies": strategies})
+    return False, strategies
 
 
-def test_pagination_info(page):
-    try:
-        inspect_pagination(page)
+def test_next_page(page):
+    log.info("=== TEST NEXT PAGE ===")
+    strategies = []
 
-        data = page.evaluate("""
+    current_before = page.evaluate(
+        """
         () => {
             const body = document.body.innerText || '';
             const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
-            return {
-                current_page: m ? parseInt(m[1], 10) : 1,
-                total_pages: m ? parseInt(m[2], 10) : 1
-            };
+            return m ? parseInt(m[1], 10) : 1;
         }
-        """)
+        """
+    )
 
-        REPORT["samples"]["pagination_info"] = data
-        report_step("Pagination Info", True, "page.evaluate", f"Page {data['current_page']}/{data['total_pages']}", data)
-        return True
-    except Exception as e:
-        report_step("Pagination Info", False, "page.evaluate", str(e))
-        return False
+    selectors = [
+        '[data-page="2"]',
+        'a[data-page="2"]',
+        'text="Page 2"',
+        'text=Page 2',
+        'div:has-text("Page 2")',
+        'span:has-text("Page 2")',
+    ]
 
-
-def test_open_case_detail(page):
-    try:
-        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
-        if row.count() == 0:
-            report_step("Open Case Detail", False, "locator", "Nenhuma row encontrada")
-            return False
-
-        caseid = row.get_attribute("data-caseid") or ""
-
-        try:
-            row.click(timeout=6000)
-            method = "row.click"
-        except Exception:
-            try:
-                row.click(force=True, timeout=6000)
-                method = "row.click(force=True)"
-            except Exception:
-                page.evaluate("(el) => el.click()", row.element_handle())
-                method = "page.evaluate(el.click)"
-
-        page.wait_for_timeout(7000)
-        safe_screenshot(page, "debug_09_case_detail.png")
-        report_step("Open Case Detail", True, method, f"caseid={caseid}")
-        return True
-    except Exception as e:
-        report_step("Open Case Detail", False, "all methods", str(e))
-        return False
-
-
-def test_parse_case_detail(page):
-    try:
-        data = page.evaluate("""
-        () => {
-            const bodyText = document.body.innerText || '';
-
-            function byLabel(label) {
-                const nodes = Array.from(document.querySelectorAll('body *'));
-                for (const node of nodes) {
-                    const txt = (node.innerText || '').trim();
-                    if (txt === label) {
-                        const parent = node.parentElement;
-                        if (parent) {
-                            const parentText = (parent.innerText || '').trim();
-                            if (parentText && parentText !== label) {
-                                return parentText.replace(label, '').trim();
-                            }
-                        }
-                        const next = node.nextElementSibling;
-                        if (next) return (next.innerText || '').trim();
-                    }
-                }
-                return '';
+    for sel in selectors:
+        ok, attempts = try_click_selector(page, sel, "next_page")
+        page.wait_for_timeout(3000)
+        current_after = page.evaluate(
+            """
+            () => {
+                const body = document.body.innerText || '';
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                return m ? parseInt(m[1], 10) : 1;
             }
+            """
+        )
+        strategies.append({
+            "selector": sel,
+            "attempts": attempts,
+            "page_before": current_before,
+            "page_after": current_after
+        })
+        if ok and current_after != current_before:
+            record("next_page", True, {"winner": sel, "page_after": current_after})
+            return True, strategies
 
-            return {
-                case_number: byLabel('Case Number'),
-                parcel_number: byLabel('Parcel Number'),
-                case_status: byLabel('Case Status'),
-                sale_date: byLabel('Sale Date'),
-                property_address: byLabel('Property Address'),
-                raw_sample: bodyText.slice(0, 3000)
-            };
+    # fallback visual next
+    result = page.evaluate(
+        """
+        () => {
+            function isVisible(el) {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            }
+            function txt(el) {
+                return ((el.innerText || '').replace(/\\s+/g, ' ')).trim();
+            }
+            const els = Array.from(document.querySelectorAll('a,button,span,div,td,img')).filter(isVisible);
+
+            let best = null;
+            for (const el of els) {
+                const t = txt(el);
+                const c = ((el.className || '') + '').toLowerCase();
+                let score = 0;
+                if (t === '>' || t === '›' || t === '»') score += 200;
+                if (c.includes('next')) score += 120;
+                if (c.includes('right')) score += 80;
+                if (c.includes('arrow')) score += 80;
+                if (c.includes('chevron')) score += 80;
+                if (score <= 0) continue;
+
+                const r = el.getBoundingClientRect();
+                const cand = { x: r.left + r.width/2, y: r.top + r.height/2, text: t, class_name: c, score };
+                if (!best || cand.score > best.score) best = cand;
+            }
+            return best;
         }
-        """)
+        """
+    )
 
-        REPORT["samples"]["case_detail"] = data
-        safe_screenshot(page, "debug_10_case_parsed.png")
-        report_step("Parse Case Detail", True, "page.evaluate", "Detalhe parseado", data)
-        return True
-    except Exception as e:
-        report_step("Parse Case Detail", False, "page.evaluate", str(e))
-        return False
+    if result:
+        page.mouse.click(result["x"], result["y"])
+        page.wait_for_timeout(3000)
+        current_after = page.evaluate(
+            """
+            () => {
+                const body = document.body.innerText || '';
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                return m ? parseInt(m[1], 10) : 1;
+            }
+            """
+        )
+        strategies.append({"visual_next": result, "page_before": current_before, "page_after": current_after})
+        if current_after != current_before:
+            record("next_page", True, {"winner": "visual_next", "page_after": current_after})
+            return True, strategies
+
+    record("next_page", False, {"strategies": strategies})
+    return False, strategies
 
 
-# =====================
-# MAIN
-# =====================
 def main():
-    log.info("INICIANDO DEBUG MIAMI-DADE")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     with sync_playwright() as p:
-        browser = None
+        browser = launch_browser(p)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.new_page()
+
+        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
         try:
-            # tenta Chrome real primeiro, igual ao scraper
-            try:
-                browser = p.chromium.launch(
-                    channel="chrome",
-                    headless=HEADLESS,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-                log.info("Browser launched with channel=chrome")
-            except Exception as e:
-                log.warning("Could not launch channel=chrome: %s", str(e))
-                browser = p.chromium.launch(
-                    headless=HEADLESS,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-                log.info("Browser launched with default chromium")
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(4000)
+        humanize(page)
 
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/134.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 900},
-                locale="en-US",
-                timezone_id="America/New_York",
-            )
+        REPORT["page"] = {
+            "url": page.url,
+            "title": page.title(),
+        }
 
-            page = context.new_page()
+        scan_dom(page, "probe_01_initial")
 
-            ok = test_page_load(page)
-            if not ok:
-                return
+        ok_status, status_details = test_open_status(page)
+        REPORT["results"]["open_status"] = status_details
+        scan_dom(page, "probe_02_after_open_status")
 
-            human_behavior(page)
+        if ok_status:
+            ok_active, active_details = test_select_active(page)
+            REPORT["results"]["select_active"] = active_details
+            scan_dom(page, "probe_03_after_select_active")
 
-            reset_ok = test_reset_filters(page)
-            if not reset_ok:
-                log.warning("RESET FILTERS falhou; continuando sem reset")
+            if ok_active:
+                ok_search, search_details = test_search_submit(page)
+                REPORT["results"]["search_submit"] = search_details
+                scan_dom(page, "probe_04_after_search")
 
-            filter_ok = test_filter_button(page)
-            if not filter_ok:
-                log.warning("FILTER BUTTON falhou; os próximos passos podem não funcionar")
+                if ok_search:
+                    ok_next, next_details = test_next_page(page)
+                    REPORT["results"]["next_page"] = next_details
+                    scan_dom(page, "probe_05_after_next_page")
 
-            test_clear_statuses(page)
-            test_select_status_192(page)
-            test_click_search(page)
+        browser.close()
 
-            if test_wait_for_results(page):
-                test_pagination_info(page)
-                if test_open_case_detail(page):
-                    test_parse_case_detail(page)
-
-        finally:
-            if browser:
-                browser.close()
-
-    with open("debug_miami_report.json", "w", encoding="utf-8") as f:
-        json.dump(REPORT, f, indent=2, ensure_ascii=False)
-
-    log.info("Relatório salvo em debug_miami_report.json")
+    REPORT["finished_at"] = datetime.utcnow().isoformat()
+    save_json("miami_probe_report.json", REPORT)
+    log.info("Done. Files: miami_probe_report.json + probe_*.json/html/png")
 
 
 if __name__ == "__main__":
