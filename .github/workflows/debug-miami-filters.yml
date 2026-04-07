@@ -1,35 +1,106 @@
-name: Debug Miami Filters
+name: Debug Miami Max Probe
 
 on:
-  workflow_dispatch:  # Permite rodar manualmente
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-miami-max-probe
+  cancel-in-progress: true
 
 jobs:
-  debug:
+  debug-miami:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 45
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      HEADLESS: "true"
+      MIAMI_DEBUG_DIR: "miami_debug_max_output"
+
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Show environment info
         run: |
+          python --version
+          pip --version
+          uname -a
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
           pip install playwright requests
-          playwright install chromium
-      
-      - name: Run debug script
-        run: python debug_miami_filters.py
+
+      - name: Install Playwright browser + system deps
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Ensure output folders exist
+        run: |
+          mkdir -p miami_debug_max_output
+          mkdir -p miami_debug_output
+
+      - name: Run max debug probe
+        run: |
+          python debug_miami_max_probe.py
         continue-on-error: true
-      
-      - name: Upload debug artifacts
+
+      - name: Run secondary debug script
+        run: |
+          if [ -f debug_miami_filters.py ]; then
+            python debug_miami_filters.py
+          else
+            echo "debug_miami_filters.py not found, skipping"
+          fi
+        continue-on-error: true
+
+      - name: List generated files
+        if: always()
+        run: |
+          echo "=== ROOT FILES ==="
+          ls -la || true
+          echo "=== miami_debug_max_output ==="
+          ls -la miami_debug_max_output || true
+          echo "=== miami_debug_output ==="
+          ls -la miami_debug_output || true
+
+      - name: Upload all debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-results
-          path: |
-            debug_page_initial.png
-            debug_page_html.html
+          name: miami-debug-artifacts
+          if-no-files-found: warn
           retention-days: 7
+          path: |
+            miami_debug_max_output/**
+            miami_debug_output/**
+            **/*miami*report*.json
+            **/*probe*.json
+            **/*probe*.html
+            **/*probe*.png
+            **/*debug*.json
+            **/*debug*.html
+            **/*debug*.png
+
+      - name: Write quick summary
+        if: always()
+        run: |
+          {
+            echo "## Miami debug run"
+            echo ""
+            echo "- Workflow finished."
+            echo "- Check artifact: \`miami-debug-artifacts\`"
+            echo "- Main expected report: \`miami_debug_max_output/miami_max_probe_report.json\`"
+          } >> "$GITHUB_STEP_SUMMARY"
