@@ -177,10 +177,6 @@ def supabase_find_existing_property(parcel_number: str, sale_date: str):
 
 
 def supabase_fetch_existing_cases_by_nodes(nodes: List[str]) -> Dict[str, dict]:
-    """
-    Busca em lote os registros existentes pelo node.
-    Isso reduz MUITO o número de chamadas ao Supabase.
-    """
     if not CAN_CHECK_SUPABASE:
         return {}
 
@@ -519,8 +515,8 @@ def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
 # =========================
 def click_safe(page, selector, name, timeout=6000):
     try:
-        page.click(selector, timeout=timeout)
-        log.info("%s clicked (normal)", name)
+        page.locator(selector).first.click(timeout=timeout)
+        log.info("%s clicked (locator)", name)
         return True
     except Exception:
         pass
@@ -533,19 +529,23 @@ def click_safe(page, selector, name, timeout=6000):
         pass
 
     try:
-        page.evaluate(
+        clicked = page.evaluate(
             """(sel) => {
                 const el = document.querySelector(sel);
-                if (!el) throw new Error(`not found: ${sel}`);
+                if (!el) return false;
                 el.click();
+                return true;
             }""",
             selector,
         )
-        log.info("%s clicked (JS fallback)", name)
-        return True
-    except Exception as e:
-        log.error("%s FAILED: %s", name, e)
-        return False
+        if clicked:
+            log.info("%s clicked (JS fallback)", name)
+            return True
+    except Exception:
+        pass
+
+    log.warning("%s not found/clickable: %s", name, selector)
+    return False
 
 
 def click_element_handle_safe(el, page, name):
@@ -684,6 +684,8 @@ def click_search_button(page) -> bool:
         "button.filters-submit",
         "text=Search",
         "button:has-text('Search')",
+        "text=Process Search",
+        "button:has-text('Process Search')",
     ]
 
     for sel in selectors:
@@ -762,12 +764,23 @@ def click_search_button(page) -> bool:
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
-    if not click_safe(page, "a.filters-reset", "RESET FILTERS"):
-        raise RuntimeError("Could not reset filters")
-    page.wait_for_timeout(1500)
+    reset_ok = click_safe(page, "a.filters-reset", "RESET FILTERS")
+    if reset_ok:
+        page.wait_for_timeout(1500)
+    else:
+        log.warning("RESET FILTERS not found; continuing without reset")
 
-    if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
+    opened = click_safe(page, "#filterButtonStatus", "FILTER BUTTON")
+    if not opened:
+        opened = click_safe(page, '[data-target="#filterStatus"]', "FILTER BUTTON FALLBACK")
+    if not opened:
+        opened = click_safe(page, 'text=Case Status', "FILTER BUTTON TEXT")
+    if not opened:
+        opened = click_safe(page, 'text=Status', "FILTER BUTTON TEXT 2")
+
+    if not opened:
         raise RuntimeError("Could not open filter button")
+
     page.wait_for_timeout(1000)
 
     force_clear_all_active_statuses(page)
@@ -779,6 +792,9 @@ def run_search_flow(page):
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
+    if state.get("hidden_filterCaseStatus") != "192":
+        raise RuntimeError(f"Status filter did not stick. Current state={state}")
+
     if not click_search_button(page):
         raise RuntimeError("Could not click search")
 
@@ -787,7 +803,11 @@ def run_search_flow(page):
 
 def open_list_and_apply_filter(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(6000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(3000)
     run_search_flow(page)
 
 
@@ -1191,7 +1211,7 @@ def click_next_page(page) -> bool:
                     const c = cls(el);
                     let score = 0;
 
-                    if (t === '>' || t === '›' || t === '»') score += 200;
+                    if (t == '>' || t == '›' || t == '»') score += 200;
                     if (c.includes('next')) score += 120;
                     if (c.includes('right')) score += 80;
                     if (c.includes('arrow')) score += 80;
@@ -1583,12 +1603,10 @@ def build_properties_payload(record: dict) -> dict:
 
 
 # =========================
-# MAIN
+# BROWSER
 # =========================
-def run_miami():
-    log.info("=== MIAMI FINAL OPERATIONAL V7 + BATCH PRECHECK + SAFE DELETE ===")
-
-    with sync_playwright() as p:
+def launch_browser(p):
+    try:
         browser = p.chromium.launch(
             channel="chrome",
             headless=HEADLESS,
@@ -1598,6 +1616,29 @@ def run_miami():
                 "--disable-dev-shm-usage",
             ],
         )
+        log.info("Launched with channel=chrome")
+        return browser
+    except Exception as e:
+        log.warning("Chrome channel unavailable, falling back to chromium: %s", str(e))
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        return browser
+
+
+# =========================
+# MAIN
+# =========================
+def run_miami():
+    log.info("=== MIAMI FINAL OPERATIONAL V7 + BATCH PRECHECK + SAFE DELETE ===")
+
+    with sync_playwright() as p:
+        browser = launch_browser(p)
 
         context = browser.new_context(
             user_agent=(
@@ -1726,7 +1767,6 @@ def run_miami():
                                 pre_sale_date,
                             )
 
-                            # mantém app em sincronia só com mínimo necessário
                             mini_payload = {
                                 "county": "Miami-Dade",
                                 "state": "FL",
