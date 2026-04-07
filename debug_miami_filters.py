@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -11,31 +12,39 @@ BASE_URL = "https://miamidade.realtdm.com"
 LIST_URL = f"{BASE_URL}/public/cases/list"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-OUTPUT_DIR = os.getenv("MIAMI_DEBUG_DIR", "miami_debug_output")
+OUTPUT_DIR = os.getenv("MIAMI_DEBUG_DIR", "miami_debug_max_output")
+WAIT_SHORT = 800
+WAIT_MED = 1800
+WAIT_LONG = 5000
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("miami_full_probe")
+log = logging.getLogger("miami_max_probe")
 
 REPORT: Dict[str, Any] = {
     "started_at": datetime.utcnow().isoformat(),
     "config": {
         "headless": HEADLESS,
+        "base_url": BASE_URL,
         "list_url": LIST_URL,
         "output_dir": OUTPUT_DIR,
     },
-    "page": {},
     "steps": [],
     "artifacts": [],
+    "network": {
+        "requests": [],
+        "responses": [],
+        "failures": [],
+    },
     "results": {},
 }
 
 
-# =========================
-# HELPERS
-# =========================
+# =========================================================
+# FILE HELPERS
+# =========================================================
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -43,12 +52,6 @@ def ensure_output_dir():
 def out_path(name: str) -> str:
     ensure_output_dir()
     return os.path.join(OUTPUT_DIR, name)
-
-
-def clean_text(value) -> str:
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 def save_json(name: str, data: Any):
@@ -82,24 +85,6 @@ def save_html(page, name: str):
     log.info("Saved html: %s", path)
 
 
-def dump_state(page, prefix: str):
-    try:
-        save_screenshot(page, f"{prefix}.png")
-    except Exception as e:
-        log.warning("Could not save screenshot for %s: %s", prefix, str(e))
-
-    try:
-        save_html(page, f"{prefix}.html")
-    except Exception as e:
-        log.warning("Could not save html for %s: %s", prefix, str(e))
-
-    try:
-        scan = scan_dom(page)
-        save_json(f"{prefix}.json", scan)
-    except Exception as e:
-        log.warning("Could not save dom scan for %s: %s", prefix, str(e))
-
-
 def record_step(step: str, ok: bool, detail: Optional[Dict[str, Any]] = None):
     payload = {
         "step": step,
@@ -108,48 +93,86 @@ def record_step(step: str, ok: bool, detail: Optional[Dict[str, Any]] = None):
         "timestamp": datetime.utcnow().isoformat(),
     }
     REPORT["steps"].append(payload)
-    log.info("%s %s %s", "OK" if ok else "FAIL", step, json.dumps(detail or {}, ensure_ascii=False)[:700])
+    log.info("%s %s %s", "OK" if ok else "FAIL", step, json.dumps(detail or {}, ensure_ascii=False)[:900])
 
 
-def humanize(page):
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+def clean_text(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def safe_wait(page, ms: int):
     try:
-        page.mouse.move(180, 160)
-        page.wait_for_timeout(250)
-        page.mouse.move(420, 290)
-        page.wait_for_timeout(400)
-        page.mouse.move(760, 420)
-        page.wait_for_timeout(350)
-        page.mouse.wheel(0, 350)
-        page.wait_for_timeout(500)
-        page.mouse.wheel(0, -180)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(ms)
     except Exception:
         pass
 
 
-def current_page_info(page) -> Dict[str, Any]:
+def humanize(page):
     try:
-        title = page.title()
+        page.mouse.move(160, 140)
+        safe_wait(page, 250)
+        page.mouse.move(380, 260)
+        safe_wait(page, 350)
+        page.mouse.move(700, 360)
+        safe_wait(page, 300)
+        page.mouse.wheel(0, 300)
+        safe_wait(page, 500)
+        page.mouse.wheel(0, -150)
+        safe_wait(page, 350)
     except Exception:
-        title = ""
-
-    try:
-        url = page.url
-    except Exception:
-        url = ""
-
-    try:
-        body_text = page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        body_text = ""
-
-    return {
-        "url": url,
-        "title": title,
-        "body_sample": body_text[:5000],
-    }
+        pass
 
 
+# =========================================================
+# NETWORK
+# =========================================================
+def attach_network_logging(page):
+    def on_request(request):
+        try:
+            REPORT["network"]["requests"].append({
+                "ts": datetime.utcnow().isoformat(),
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+            })
+        except Exception:
+            pass
+
+    def on_response(response):
+        try:
+            REPORT["network"]["responses"].append({
+                "ts": datetime.utcnow().isoformat(),
+                "status": response.status,
+                "url": response.url,
+            })
+        except Exception:
+            pass
+
+    def on_request_failed(request):
+        try:
+            REPORT["network"]["failures"].append({
+                "ts": datetime.utcnow().isoformat(),
+                "url": request.url,
+                "method": request.method,
+                "resource_type": request.resource_type,
+                "failure": request.failure,
+            })
+        except Exception:
+            pass
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    page.on("requestfailed", on_request_failed)
+
+
+# =========================================================
+# PAGE STATE
+# =========================================================
 def current_filter_state(page) -> Dict[str, Any]:
     return page.evaluate(
         """
@@ -160,7 +183,7 @@ def current_filter_state(page) -> Dict[str, Any]:
             const selectedItems = Array.from(document.querySelectorAll('.selected,[aria-selected="true"]'))
                 .map(el => ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim()))
                 .filter(Boolean)
-                .slice(0, 50);
+                .slice(0, 100);
 
             return {
                 hidden_filterCaseStatus: hidden ? hidden.value : '',
@@ -170,6 +193,30 @@ def current_filter_state(page) -> Dict[str, Any]:
         }
         """
     )
+
+
+def current_page_meta(page) -> Dict[str, Any]:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        pass
+
+    return {
+        "url": url,
+        "title": title,
+        "body_sample": clean_text(body_text)[:6000],
+    }
 
 
 def scan_dom(page) -> Dict[str, Any]:
@@ -186,29 +233,38 @@ def scan_dom(page) -> Dict[str, Any]:
                 return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
             }
 
-            const clickables = Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],div,span,li,td'))
-                .map((el, idx) => ({
-                    idx,
-                    tag: el.tagName.toLowerCase(),
-                    text: txt(el),
-                    visible: visible(el),
-                    id: el.id || '',
-                    class_name: (el.className || '').toString(),
-                    href: el.getAttribute('href') || '',
-                    onclick: el.getAttribute('onclick') || '',
-                    data_target: el.getAttribute('data-target') || '',
-                    data_toggle: el.getAttribute('data-toggle') || '',
-                    data_statusid: el.getAttribute('data-statusid') || '',
-                    data_parentid: el.getAttribute('data-parentid') || '',
-                    role: el.getAttribute('role') || '',
-                    aria_label: el.getAttribute('aria-label') || ''
-                }))
-                .filter(x =>
-                    x.text || x.id || x.class_name || x.data_target || x.data_statusid || x.aria_label
-                );
+            const frames = Array.from(document.querySelectorAll('iframe,frame')).map((el, idx) => ({
+                idx,
+                id: el.id || '',
+                name: el.getAttribute('name') || '',
+                src: el.getAttribute('src') || '',
+                class_name: (el.className || '').toString()
+            }));
+
+            const clickables = Array.from(
+                document.querySelectorAll('a,button,input[type="button"],input[type="submit"],div,span,li,td,label')
+            ).map((el, idx) => ({
+                idx,
+                tag: el.tagName.toLowerCase(),
+                text: txt(el),
+                visible: visible(el),
+                id: el.id || '',
+                class_name: (el.className || '').toString(),
+                href: el.getAttribute('href') || '',
+                onclick: el.getAttribute('onclick') || '',
+                data_target: el.getAttribute('data-target') || '',
+                data_toggle: el.getAttribute('data-toggle') || '',
+                data_statusid: el.getAttribute('data-statusid') || '',
+                data_parentid: el.getAttribute('data-parentid') || '',
+                role: el.getAttribute('role') || '',
+                aria_label: el.getAttribute('aria-label') || '',
+                title: el.getAttribute('title') || '',
+            })).filter(x =>
+                x.text || x.id || x.class_name || x.data_target || x.data_statusid || x.aria_label || x.title
+            );
 
             const rows = Array.from(document.querySelectorAll('tr.load-case.table-row.link[data-caseid]'))
-                .slice(0, 20)
+                .slice(0, 30)
                 .map((el, idx) => ({
                     idx,
                     caseid: el.getAttribute('data-caseid') || '',
@@ -216,44 +272,93 @@ def scan_dom(page) -> Dict[str, Any]:
                 }));
 
             return {
-                title: document.title,
                 url: location.href,
-                body_sample: (document.body.innerText || '').slice(0, 8000),
+                title: document.title,
+                body_sample: (document.body.innerText || '').slice(0, 10000),
+                html_length: document.documentElement.outerHTML.length,
+                frames,
+                frames_count: frames.length,
                 clickables_count: clickables.length,
                 rows_count: document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length,
-                clickables: clickables.slice(0, 3000),
                 first_rows: rows,
                 status_candidates: clickables.filter(x =>
                     x.text.toLowerCase().includes('status') ||
                     x.id.toLowerCase().includes('status') ||
                     x.class_name.toLowerCase().includes('status') ||
                     x.data_target.toLowerCase().includes('status')
-                ).slice(0, 300),
+                ).slice(0, 400),
                 active_candidates: clickables.filter(x =>
                     x.text === 'Active' ||
                     x.text.toLowerCase().includes('active') ||
                     x.data_statusid === '192'
-                ).slice(0, 300),
+                ).slice(0, 400),
                 search_candidates: clickables.filter(x =>
                     x.text.toLowerCase().includes('search')
-                ).slice(0, 200),
+                ).slice(0, 300),
                 pager_candidates: clickables.filter(x =>
                     x.text.includes('Page') ||
                     x.class_name.toLowerCase().includes('next') ||
                     x.class_name.toLowerCase().includes('pager') ||
                     x.class_name.toLowerCase().includes('page')
-                ).slice(0, 300)
+                ).slice(0, 400),
+                clickables: clickables.slice(0, 4000)
             };
         }
         """
     )
 
 
-def try_click_selector(page, selector: str) -> Dict[str, Any]:
-    result = {
+def snapshot(page, prefix: str):
+    try:
+        save_screenshot(page, f"{prefix}.png")
+    except Exception as e:
+        log.warning("snapshot screenshot failed %s: %s", prefix, str(e))
+
+    try:
+        save_html(page, f"{prefix}.html")
+    except Exception as e:
+        log.warning("snapshot html failed %s: %s", prefix, str(e))
+
+    try:
+        save_json(f"{prefix}.json", scan_dom(page))
+    except Exception as e:
+        log.warning("snapshot json failed %s: %s", prefix, str(e))
+
+
+def dom_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    before_set = {
+        (x.get("tag", ""), x.get("text", ""), x.get("id", ""), x.get("class_name", ""), x.get("data_statusid", ""))
+        for x in before.get("clickables", [])
+    }
+    after_set = {
+        (x.get("tag", ""), x.get("text", ""), x.get("id", ""), x.get("class_name", ""), x.get("data_statusid", ""))
+        for x in after.get("clickables", [])
+    }
+
+    added = after_set - before_set
+    removed = before_set - after_set
+
+    return {
+        "before_clickables_count": before.get("clickables_count"),
+        "after_clickables_count": after.get("clickables_count"),
+        "before_rows_count": before.get("rows_count"),
+        "after_rows_count": after.get("rows_count"),
+        "before_frames_count": before.get("frames_count"),
+        "after_frames_count": after.get("frames_count"),
+        "added_samples": list(added)[:120],
+        "removed_samples": list(removed)[:120],
+    }
+
+
+# =========================================================
+# CLICK ENGINE
+# =========================================================
+def try_click_selector(page, selector: str, label: str = "") -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "label": label,
         "selector": selector,
-        "attempts": [],
         "ok": False,
+        "attempts": [],
     }
 
     methods = [
@@ -265,12 +370,13 @@ def try_click_selector(page, selector: str) -> Dict[str, Any]:
                 """
                 (sel) => {
                     const el = document.querySelector(sel);
-                    if (!el) return false;
+                    if (!el) return { found: false };
                     try { el.click(); } catch(e) {}
-                    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch(e) {}
-                    try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch(e) {}
-                    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch(e) {}
-                    return true;
+                    try { el.dispatchEvent(new MouseEvent('mouseover', { bubbles:true })); } catch(e) {}
+                    try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                    try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                    try { el.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+                    return { found: true };
                 }
                 """,
                 selector,
@@ -278,21 +384,32 @@ def try_click_selector(page, selector: str) -> Dict[str, Any]:
         ),
     ]
 
-    for name, fn in methods:
+    for method_name, fn in methods:
         try:
             value = fn()
-            page.wait_for_timeout(900)
-            result["attempts"].append({"method": name, "ok": True, "return_value": value})
+            safe_wait(page, WAIT_SHORT)
+            attempt = {
+                "method": method_name,
+                "ok": True,
+                "return_value": value,
+                "state": current_filter_state(page),
+            }
+            result["attempts"].append(attempt)
             result["ok"] = True
-            result["winner"] = name
+            result["winner"] = method_name
             return result
         except Exception as e:
-            result["attempts"].append({"method": name, "ok": False, "error": str(e)})
+            result["attempts"].append({
+                "method": method_name,
+                "ok": False,
+                "error": str(e),
+                "state": current_filter_state(page),
+            })
 
     return result
 
 
-def try_click_text(page, text: str) -> Dict[str, Any]:
+def try_click_text(page, text: str, label: str = "") -> Dict[str, Any]:
     selectors = [
         f'text="{text}"',
         f'text={text}',
@@ -301,23 +418,26 @@ def try_click_text(page, text: str) -> Dict[str, Any]:
         f'span:has-text("{text}")',
         f'div:has-text("{text}")',
         f'li:has-text("{text}")',
+        f'label:has-text("{text}")',
     ]
 
-    final = {
+    result: Dict[str, Any] = {
+        "label": label,
         "text": text,
         "ok": False,
         "attempts": [],
     }
 
     for sel in selectors:
-        res = try_click_selector(page, sel)
-        final["attempts"].append(res)
-        if res.get("ok"):
-            final["ok"] = True
-            final["winner_selector"] = sel
-            return final
+        clicked = try_click_selector(page, sel, label=label)
+        clicked["used_selector"] = sel
+        result["attempts"].append(clicked)
+        if clicked.get("ok"):
+            result["ok"] = True
+            result["winner_selector"] = sel
+            return result
 
-    return final
+    return result
 
 
 def clear_status_filter(page):
@@ -325,26 +445,33 @@ def clear_status_filter(page):
         page.evaluate(
             """
             () => {
-                const nodes = document.querySelectorAll('[data-statusid]');
+                const nodes = document.querySelectorAll('[data-statusid], .selected, [aria-selected="true"]');
                 nodes.forEach(el => el.classList.remove('selected'));
 
                 const hidden = document.querySelector('#filterCaseStatus');
                 if (hidden) hidden.value = '';
 
                 const label = document.querySelector('#filterCaseStatusLabel');
-                if (label) label.innerText = 'None Selected';
+                if (label) label.innerText = '';
+
+                const icons = document.querySelectorAll('i');
+                icons.forEach(icon => {
+                    if (icon.className && icon.className.includes('icon-ok-sign')) {
+                        icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, 'icon-circle-blank').trim();
+                    }
+                });
             }
             """
         )
-        page.wait_for_timeout(600)
+        safe_wait(page, 700)
     except Exception:
         pass
 
 
-# =========================
-# TESTS
-# =========================
-def test_page_load(page):
+# =========================================================
+# TEST PHASES
+# =========================================================
+def test_page_load(page) -> bool:
     try:
         page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
         try:
@@ -352,22 +479,25 @@ def test_page_load(page):
         except Exception:
             pass
 
-        page.wait_for_timeout(4000)
+        safe_wait(page, 3500)
         humanize(page)
 
-        info = current_page_info(page)
-        REPORT["page"] = info
-        dump_state(page, "01_page_loaded")
-        record_step("page_load", True, info)
+        meta = current_page_meta(page)
+        snapshot(page, "01_page_loaded")
+        record_step("page_load", True, meta)
+        REPORT["results"]["page_meta"] = meta
         return True
     except Exception as e:
-        dump_state(page, "01_page_load_failed")
+        snapshot(page, "01_page_load_failed")
         record_step("page_load", False, {"error": str(e)})
         return False
 
 
-def test_open_status(page):
-    details = {"strategies": []}
+def test_open_status(page) -> Dict[str, Any]:
+    before = scan_dom(page)
+    save_json("02_before_open_status.json", before)
+
+    strategies: List[Dict[str, Any]] = []
 
     selector_candidates = [
         "#filterButtonStatus",
@@ -377,91 +507,79 @@ def test_open_status(page):
     ]
 
     for sel in selector_candidates:
-        res = try_click_selector(page, sel)
-        details["strategies"].append({"type": "selector", "value": sel, "result": res, "state": current_filter_state(page)})
+        res = try_click_selector(page, sel, "open_status")
+        after = scan_dom(page)
+        item = {
+            "kind": "selector",
+            "value": sel,
+            "result": res,
+            "diff": dom_diff(before, after),
+            "state": current_filter_state(page),
+        }
+        strategies.append(item)
         if res.get("ok"):
-            dump_state(page, "02_status_opened")
-            record_step("open_status", True, {"winner": sel, "state": current_filter_state(page)})
-            return True, details
+            snapshot(page, "02_status_opened")
+            record_step("open_status", True, item)
+            return {"ok": True, "strategies": strategies}
 
-    for txt in ["Case Status", "Status"]:
-        res = try_click_text(page, txt)
-        details["strategies"].append({"type": "text", "value": txt, "result": res, "state": current_filter_state(page)})
+    for text in ["Case Status", "Status"]:
+        res = try_click_text(page, text, "open_status_text")
+        after = scan_dom(page)
+        item = {
+            "kind": "text",
+            "value": text,
+            "result": res,
+            "diff": dom_diff(before, after),
+            "state": current_filter_state(page),
+        }
+        strategies.append(item)
         if res.get("ok"):
-            dump_state(page, "02_status_opened")
-            record_step("open_status", True, {"winner_text": txt, "state": current_filter_state(page)})
-            return True, details
+            snapshot(page, "02_status_opened")
+            record_step("open_status", True, item)
+            return {"ok": True, "strategies": strategies}
 
-    dump_state(page, "02_status_open_failed")
-    record_step("open_status", False, details)
-    return False, details
+    snapshot(page, "02_status_open_failed")
+    record_step("open_status", False, {"last": strategies[-10:]})
+    return {"ok": False, "strategies": strategies}
 
 
-def test_select_active(page):
-    details = {"strategies": []}
+def test_select_active(page) -> Dict[str, Any]:
+    strategies: List[Dict[str, Any]] = []
 
-    strategies = [
-        {"kind": "selector", "value": '[data-statusid="192"]'},
-        {"kind": "selector", "value": 'a[data-statusid="192"]'},
-        {"kind": "selector", "value": '[data-statusid="192"][data-parentid="2"]'},
-        {"kind": "selector", "value": 'a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]'},
-        {"kind": "text", "value": 'Active'},
+    fixed_strategies = [
+        ("selector", '[data-statusid="192"]'),
+        ("selector", 'a[data-statusid="192"]'),
+        ("selector", '[data-statusid="192"][data-parentid="2"]'),
+        ("selector", 'a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]'),
+        ("text", "Active"),
     ]
 
-    for strat in strategies:
+    for kind, value in fixed_strategies:
         clear_status_filter(page)
 
-        if strat["kind"] == "selector":
-            res = try_click_selector(page, strat["value"])
+        if kind == "selector":
+            res = try_click_selector(page, value, "select_active")
         else:
-            res = try_click_text(page, strat["value"])
+            res = try_click_text(page, value, "select_active")
 
         state = current_filter_state(page)
         item = {
-            "strategy": strat,
+            "kind": kind,
+            "value": value,
             "result": res,
             "state": state,
         }
-        details["strategies"].append(item)
+        strategies.append(item)
 
         if state.get("hidden_filterCaseStatus") == "192":
-            dump_state(page, "03_active_selected")
+            snapshot(page, "03_active_selected")
             record_step("select_active", True, item)
-            return True, details
+            return {"ok": True, "strategies": strategies}
 
-    # brute force exato
-    candidates = page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-            }
-
-            function visible(el) {
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-            }
-
-            return Array.from(document.querySelectorAll('a,li,div,span,button'))
-                .filter(visible)
-                .map((el, idx) => ({
-                    idx,
-                    tag: el.tagName.toLowerCase(),
-                    text: txt(el),
-                    id: el.id || '',
-                    class_name: (el.className || '').toString(),
-                    data_statusid: el.getAttribute('data-statusid') || '',
-                    data_parentid: el.getAttribute('data-parentid') || ''
-                }))
-                .filter(x => x.text === 'Active' || x.data_statusid === '192')
-                .slice(0, 200);
-        }
-        """
-    )
+    candidates = scan_dom(page).get("active_candidates", [])
     save_json("03_active_candidates.json", candidates)
 
-    for i, candidate in enumerate(candidates):
+    for idx, candidate in enumerate(candidates[:120]):
         clear_status_filter(page)
 
         clicked = page.evaluate(
@@ -477,131 +595,155 @@ def test_select_active(page):
                     return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
                 }
 
-                const nodes = Array.from(document.querySelectorAll('a,li,div,span,button'))
+                const nodes = Array.from(document.querySelectorAll('a,button,div,span,li,label'))
                     .filter(visible)
                     .filter(el => {
                         const t = txt(el);
-                        return t === 'Active' || el.getAttribute('data-statusid') === '192';
+                        return t === 'Active' || t.toLowerCase().includes('active') || el.getAttribute('data-statusid') === '192';
                     });
 
                 const el = nodes[targetIndex];
-                if (!el) return false;
+                if (!el) return { ok: false, reason: 'candidate not found' };
 
                 try { el.click(); } catch(e) {}
-                try { el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); } catch(e) {}
-                try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch(e) {}
-                try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch(e) {}
-                try { el.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mouseover', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                try { el.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
 
-                return true;
+                const innerA = el.querySelector ? el.querySelector('a') : null;
+                if (innerA) {
+                    try { innerA.click(); } catch(e) {}
+                    try { innerA.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                    try { innerA.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                    try { innerA.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+                }
+
+                return { ok: true };
             }
             """,
-            i,
+            idx,
         )
-        page.wait_for_timeout(1000)
+        safe_wait(page, 900)
 
         state = current_filter_state(page)
         item = {
-            "strategy": {"kind": "candidate_index", "value": i, "candidate": candidate},
+            "kind": "candidate_scan",
+            "index": idx,
+            "candidate": candidate,
             "clicked": clicked,
             "state": state,
         }
-        details["strategies"].append(item)
+        strategies.append(item)
 
         if state.get("hidden_filterCaseStatus") == "192":
-            dump_state(page, "03_active_selected")
+            snapshot(page, "03_active_selected")
             record_step("select_active", True, item)
-            return True, details
+            return {"ok": True, "strategies": strategies}
 
-    dump_state(page, "03_active_failed")
-    record_step("select_active", False, {"last_strategies": details["strategies"][-20:]})
-    return False, details
+    snapshot(page, "03_active_failed")
+    record_step("select_active", False, {"last_strategies": strategies[-25:]})
+    return {"ok": False, "strategies": strategies}
 
 
-def test_submit_search(page):
-    details = {"strategies": []}
+def count_rows(page) -> int:
+    try:
+        return page.locator('tr.load-case.table-row.link[data-caseid]').count()
+    except Exception:
+        return 0
 
-    strategies = [
-        {"kind": "selector", "value": 'button:has-text("Process Search")'},
-        {"kind": "selector", "value": 'text="Process Search"'},
-        {"kind": "selector", "value": 'input[type="submit"][value*="Process Search"]'},
-        {"kind": "selector", "value": 'input[type="button"][value*="Process Search"]'},
-        {"kind": "selector", "value": "button.filters-submit"},
-        {"kind": "selector", "value": 'button:has-text("Search")'},
-        {"kind": "selector", "value": 'text="Search"'},
-        {"kind": "text", "value": "Process Search"},
-        {"kind": "text", "value": "Search"},
+
+def test_submit_search(page) -> Dict[str, Any]:
+    strategies: List[Dict[str, Any]] = []
+
+    strategy_list = [
+        ("selector", 'button:has-text("Process Search")'),
+        ("selector", 'text="Process Search"'),
+        ("selector", 'input[type="submit"][value*="Process Search"]'),
+        ("selector", 'input[type="button"][value*="Process Search"]'),
+        ("selector", "button.filters-submit"),
+        ("selector", 'button:has-text("Search")'),
+        ("selector", 'text="Search"'),
+        ("text", "Process Search"),
+        ("text", "Search"),
     ]
 
-    for strat in strategies:
-        if strat["kind"] == "selector":
-            res = try_click_selector(page, strat["value"])
+    for kind, value in strategy_list:
+        if kind == "selector":
+            res = try_click_selector(page, value, "submit_search")
         else:
-            res = try_click_text(page, strat["value"])
+            res = try_click_text(page, value, "submit_search")
 
-        page.wait_for_timeout(5000)
+        safe_wait(page, 5500)
 
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-        state = current_filter_state(page)
+        rows = count_rows(page)
         item = {
-            "strategy": strat,
+            "kind": kind,
+            "value": value,
             "result": res,
             "rows_after": rows,
-            "state": state,
+            "state": current_filter_state(page),
         }
-        details["strategies"].append(item)
+        strategies.append(item)
 
         if rows > 0:
-            dump_state(page, "04_search_ok")
+            snapshot(page, "04_search_ok")
             record_step("submit_search", True, item)
-            return True, details
+            return {"ok": True, "strategies": strategies}
 
-    dump_state(page, "04_search_failed")
-    record_step("submit_search", False, {"last_strategies": details["strategies"][-20:]})
-    return False, details
+    snapshot(page, "04_search_failed")
+    record_step("submit_search", False, {"last_strategies": strategies[-20:]})
+    return {"ok": False, "strategies": strategies}
 
 
-def test_open_first_detail(page):
-    details = {"strategies": []}
+def test_open_first_detail(page) -> Dict[str, Any]:
+    strategies: List[Dict[str, Any]] = []
 
-    try:
-        count = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-        if count == 0:
-            record_step("open_first_detail", False, {"reason": "no rows"})
-            return False, details
-    except Exception as e:
-        record_step("open_first_detail", False, {"error": str(e)})
-        return False, details
+    rows_count = count_rows(page)
+    if rows_count == 0:
+        record_step("open_first_detail", False, {"reason": "no rows"})
+        return {"ok": False, "strategies": strategies}
 
     row = page.locator('tr.load-case.table-row.link[data-caseid]').first
-    caseid = row.get_attribute("data-caseid") or ""
+    caseid = ""
+    try:
+        caseid = row.get_attribute("data-caseid") or ""
+    except Exception:
+        pass
 
     methods = [
         ("row.click", lambda: row.click(timeout=4000)),
         ("row.click(force=True)", lambda: row.click(force=True, timeout=4000)),
+        ("element_handle.click", lambda: row.element_handle().click(timeout=4000)),
         ("evaluate(el.click)", lambda: page.evaluate("(el) => el.click()", row.element_handle())),
     ]
 
     for name, fn in methods:
         try:
             fn()
-            page.wait_for_timeout(7000)
+            safe_wait(page, 7000)
+
             item = {
                 "method": name,
                 "caseid": caseid,
                 "url_after": page.url,
-                "body_sample": clean_text(page.locator("body").inner_text(timeout=3000))[:2000],
+                "body_sample": current_page_meta(page).get("body_sample", "")[:2500],
             }
-            details["strategies"].append(item)
-            dump_state(page, "05_detail_opened")
-            record_step("open_first_detail", True, item)
-            return True, details
-        except Exception as e:
-            details["strategies"].append({"method": name, "caseid": caseid, "error": str(e)})
+            strategies.append(item)
 
-    dump_state(page, "05_detail_failed")
-    record_step("open_first_detail", False, details)
-    return False, details
+            snapshot(page, "05_detail_opened")
+            record_step("open_first_detail", True, item)
+            return {"ok": True, "strategies": strategies}
+        except Exception as e:
+            strategies.append({
+                "method": name,
+                "caseid": caseid,
+                "error": str(e),
+            })
+
+    snapshot(page, "05_detail_failed")
+    record_step("open_first_detail", False, {"last_strategies": strategies[-10:]})
+    return {"ok": False, "strategies": strategies}
 
 
 def current_page_num(page) -> int:
@@ -619,49 +761,51 @@ def current_page_num(page) -> int:
         return 1
 
 
-def test_next_page(page):
-    details = {"strategies": []}
+def test_next_page(page) -> Dict[str, Any]:
+    strategies: List[Dict[str, Any]] = []
     before = current_page_num(page)
 
-    strategies = [
-        {"kind": "selector", "value": '[data-page="2"]'},
-        {"kind": "selector", "value": 'a[data-page="2"]'},
-        {"kind": "selector", "value": 'text="Page 2"'},
-        {"kind": "selector", "value": 'text=Page 2'},
-        {"kind": "selector", "value": 'div:has-text("Page 2")'},
-        {"kind": "selector", "value": 'span:has-text("Page 2")'},
+    strategy_list = [
+        ("selector", '[data-page="2"]'),
+        ("selector", 'a[data-page="2"]'),
+        ("selector", 'text="Page 2"'),
+        ("selector", "text=Page 2"),
+        ("selector", 'div:has-text("Page 2")'),
+        ("selector", 'span:has-text("Page 2")'),
     ]
 
-    for strat in strategies:
-        res = try_click_selector(page, strat["value"])
-        page.wait_for_timeout(3000)
+    for kind, value in strategy_list:
+        res = try_click_selector(page, value, "next_page")
+        safe_wait(page, 3200)
         after = current_page_num(page)
 
         item = {
-            "strategy": strat,
+            "kind": kind,
+            "value": value,
             "result": res,
             "page_before": before,
             "page_after": after,
         }
-        details["strategies"].append(item)
+        strategies.append(item)
 
         if after != before:
-            dump_state(page, "06_next_page_ok")
+            snapshot(page, "06_next_page_ok")
             record_step("next_page", True, item)
-            return True, details
+            return {"ok": True, "strategies": strategies}
 
-    # visual next
     visual = page.evaluate(
         """
         () => {
             function txt(el) {
                 return ((el.innerText || '').replace(/\\s+/g, ' ')).trim();
             }
+
             function visible(el) {
                 const r = el.getBoundingClientRect();
                 const s = window.getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
             }
+
             function cls(el) {
                 return ((el.className || '') + '').toLowerCase();
             }
@@ -692,35 +836,45 @@ def test_next_page(page):
 
                 if (!best || cand.score > best.score) best = cand;
             }
+
             return best;
         }
         """
     )
 
     if visual:
-        page.mouse.click(visual["x"], visual["y"])
-        page.wait_for_timeout(3000)
-        after = current_page_num(page)
-        item = {
-            "strategy": {"kind": "visual", "value": visual},
-            "page_before": before,
-            "page_after": after,
-        }
-        details["strategies"].append(item)
+        try:
+            page.mouse.click(visual["x"], visual["y"])
+            safe_wait(page, 3000)
+            after = current_page_num(page)
 
-        if after != before:
-            dump_state(page, "06_next_page_ok")
-            record_step("next_page", True, item)
-            return True, details
+            item = {
+                "kind": "visual",
+                "value": visual,
+                "page_before": before,
+                "page_after": after,
+            }
+            strategies.append(item)
 
-    dump_state(page, "06_next_page_failed")
-    record_step("next_page", False, {"last_strategies": details["strategies"][-20:]})
-    return False, details
+            if after != before:
+                snapshot(page, "06_next_page_ok")
+                record_step("next_page", True, item)
+                return {"ok": True, "strategies": strategies}
+        except Exception as e:
+            strategies.append({
+                "kind": "visual",
+                "value": visual,
+                "error": str(e),
+            })
+
+    snapshot(page, "06_next_page_failed")
+    record_step("next_page", False, {"last_strategies": strategies[-20:]})
+    return {"ok": False, "strategies": strategies}
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 def launch_browser(p):
     try:
         browser = p.chromium.launch(
@@ -747,6 +901,20 @@ def launch_browser(p):
         return browser
 
 
+def rerun_minimal_flow_to_rows(page):
+    page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    safe_wait(page, 3000)
+    humanize(page)
+
+    test_open_status(page)
+    test_select_active(page)
+    test_submit_search(page)
+
+
 def main():
     ensure_output_dir()
 
@@ -765,57 +933,42 @@ def main():
         )
 
         page = context.new_page()
+        attach_network_logging(page)
 
         if not test_page_load(page):
             browser.close()
             REPORT["finished_at"] = datetime.utcnow().isoformat()
-            save_json("miami_full_probe_report.json", REPORT)
+            save_json("miami_max_probe_report.json", REPORT)
             return
 
-        ok_status, status_details = test_open_status(page)
-        REPORT["results"]["open_status"] = status_details
+        open_status_result = test_open_status(page)
+        REPORT["results"]["open_status"] = open_status_result
 
-        ok_active = False
-        ok_search = False
+        if open_status_result.get("ok"):
+            select_active_result = test_select_active(page)
+            REPORT["results"]["select_active"] = select_active_result
 
-        if ok_status:
-            ok_active, active_details = test_select_active(page)
-            REPORT["results"]["select_active"] = active_details
+            if select_active_result.get("ok"):
+                submit_search_result = test_submit_search(page)
+                REPORT["results"]["submit_search"] = submit_search_result
 
-            if ok_active:
-                ok_search, search_details = test_submit_search(page)
-                REPORT["results"]["submit_search"] = search_details
+                if submit_search_result.get("ok"):
+                    open_detail_result = test_open_first_detail(page)
+                    REPORT["results"]["open_first_detail"] = open_detail_result
 
-                if ok_search:
-                    ok_detail, detail_details = test_open_first_detail(page)
-                    REPORT["results"]["open_first_detail"] = detail_details
-
-                    # voltar para tentar paginação só se detalhe não tiver mudado tudo
                     try:
-                        page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=15000)
-                        except Exception:
-                            pass
-                        page.wait_for_timeout(3000)
-                        humanize(page)
-
-                        # repetir fluxo mínimo até rows
-                        test_open_status(page)
-                        test_select_active(page)
-                        test_submit_search(page)
-
-                        ok_next, next_details = test_next_page(page)
-                        REPORT["results"]["next_page"] = next_details
+                        rerun_minimal_flow_to_rows(page)
+                        next_page_result = test_next_page(page)
+                        REPORT["results"]["next_page"] = next_page_result
                     except Exception as e:
-                        REPORT["results"]["next_page"] = {"error": str(e)}
+                        REPORT["results"]["next_page"] = {"ok": False, "error": str(e)}
                         record_step("next_page", False, {"error": str(e)})
 
         browser.close()
 
     REPORT["finished_at"] = datetime.utcnow().isoformat()
-    save_json("miami_full_probe_report.json", REPORT)
-    log.info("Finalizado. Relatório principal: %s", out_path("miami_full_probe_report.json"))
+    save_json("miami_max_probe_report.json", REPORT)
+    log.info("Relatório final: %s", out_path("miami_max_probe_report.json"))
 
 
 if __name__ == "__main__":
