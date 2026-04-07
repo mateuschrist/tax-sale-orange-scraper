@@ -53,9 +53,12 @@ jobs:
           mkdir -p miami_debug_output
 
       - name: Run max debug probe
+        env:
+        HEADLESS: "true"
+        MIAMI_DEBUG_DIR: "miami_debug_max_output"
         run: |
-          python debug_miami_max_probe.py
-        continue-on-error: true
+            python debug_miami_filters.py
+            continue-on-error: true
 
       - name: Run secondary debug script
         run: |
