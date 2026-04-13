@@ -96,6 +96,29 @@ def clean_text(value: Any) -> str:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
 
+def current_page_meta(page) -> Dict[str, Any]:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        pass
+
+    return {
+        "url": url,
+        "title": title,
+        "body_sample": clean_text(body_text)[:8000],
+    }
+
 
 def wait(page, ms: int) -> None:
     try:
