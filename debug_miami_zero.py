@@ -115,7 +115,7 @@ def open_dropdown(page):
 
 
 def select_exact_active(page):
-    log.info("Selecting exact Active checkbox...")
+    log.info("Selecting exact Active child option...")
 
     result = page.evaluate(
         """
@@ -132,67 +132,48 @@ def select_exact_active(page):
                 menu.classList.add('show');
             });
 
-            // achar a linha/grupo "Active" no topo
-            const rows = Array.from(document.querySelectorAll('.dropdown-section, .multiselect-group, li, div, a'));
+            const options = Array.from(document.querySelectorAll('.dropdown-menu a, .dropdown-menu .dropdown-item, .dropdown-menu li, .dropdown-menu div'))
+                .filter(el => txt(el) === 'Active');
 
-            const activeRow = rows.find(el => txt(el) == 'Active');
-            if (!activeRow) {
-                return { ok: false, reason: 'active row not found' };
+            if (!options.length) {
+                return { ok: false, reason: 'exact child Active not found' };
             }
 
-            // procurar checkbox dentro da linha
-            let checkbox =
-                activeRow.querySelector('input[type="checkbox"]') ||
-                activeRow.querySelector('.form-check-input') ||
-                activeRow.querySelector('[type="checkbox"]');
+            const target = options[0];
 
-            // fallback: procurar checkbox irmão/filho próximo
-            if (!checkbox) {
-                checkbox = activeRow.parentElement
-                    ? activeRow.parentElement.querySelector('input[type="checkbox"], .form-check-input, [type="checkbox"]')
-                    : null;
-            }
-
-            if (!checkbox) {
-                return { ok: false, reason: 'checkbox not found', row_text: txt(activeRow) };
-            }
-
-            try { activeRow.scrollIntoView({ block: 'center' }); } catch(e) {}
-            try { checkbox.scrollIntoView({ block: 'center' }); } catch(e) {}
-
-            try { checkbox.click(); } catch(e) {}
-            try { checkbox.dispatchEvent(new MouseEvent('mouseover', { bubbles:true })); } catch(e) {}
-            try { checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
-            try { checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
-            try { checkbox.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
-            try { checkbox.dispatchEvent(new Event('change', { bubbles:true })); } catch(e) {}
+            try { target.scrollIntoView({ block: 'center' }); } catch(e) {}
+            try { target.click(); } catch(e) {}
+            try { target.dispatchEvent(new MouseEvent('mouseover', { bubbles:true })); } catch(e) {}
+            try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+            try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+            try { target.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
 
             return {
                 ok: true,
-                row_text: txt(activeRow),
-                checked: !!checkbox.checked
+                clicked_text: txt(target),
+                class_name: (target.className || '').toString()
             };
         }
         """
     )
 
-    stabilize(page, "select_exact_active_checkbox", 10000)
+    stabilize(page, "select_exact_active_child", 10000)
 
     state = page.evaluate(
         """
         () => {
             const label = document.querySelector('#filterCaseStatusLabel');
-            const hidden = document.querySelector('#filterCaseStatus');
+            const trigger = document.querySelector('#filterButtonStatus, .filter-bar, .dropdown-toggle');
             return {
                 label: label ? label.innerText.trim() : '',
-                hidden: hidden ? hidden.value : ''
+                trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
             };
         }
         """
     )
 
     return {
-        "ok": bool(result.get("ok")) and (bool(state.get("label")) or bool(state.get("hidden"))),
+        "ok": bool(result.get("ok")),
         "result": result,
         "state": state,
     }
