@@ -192,7 +192,7 @@ def select_exact_active(page):
         "state": state,
     }
 
-    def select_exact_active(page):
+def select_exact_active(page):
     log.info("Selecting exact Active by fixed position...")
 
     data = page.evaluate(
