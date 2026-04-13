@@ -73,10 +73,10 @@ jobs:
           test -f debug_miami_zero.py
           ls -la
 
-      - name: Run debug scraper
+      - name: Run access probe
         run: |
-          python debug_miami_zero.py
-        continue-on-error: true
+          python debug_miami_access.py
+          continue-on-error: true
 
       - name: List generated files
         if: always()
