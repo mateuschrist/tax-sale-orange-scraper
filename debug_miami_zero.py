@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Any, Dict
 
 from playwright.sync_api import sync_playwright
 
@@ -14,6 +13,10 @@ OUT_DIR = os.getenv("MIAMI_DEBUG_DIR", "miami_zero_output")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miami_zero")
 
+
+# =========================
+# UTILS
+# =========================
 
 def ensure_dir():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -35,6 +38,25 @@ def screenshot(page, name):
     log.info(f"Saved screenshot: {path}")
 
 
+def wait_long(page, ms=15000):
+    page.wait_for_timeout(ms)
+
+
+def stabilize(page, label="", ms=12000):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except:
+        pass
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except:
+        pass
+
+    wait_long(page, ms)
+    log.info(f"Stabilized: {label}")
+
+
 def current_page_meta(page):
     return {
         "url": page.url,
@@ -43,13 +65,16 @@ def current_page_meta(page):
     }
 
 
+# =========================
+# CORE STEPS
+# =========================
+
 def open_dropdown(page):
-    log.info("Opening Case Status dropdown...")
+    log.info("Opening Case Status...")
 
     selectors = [
         "#filterButtonStatus",
         'text="Case Status"',
-        ".filter-bar"
     ]
 
     for sel in selectors:
@@ -59,7 +84,7 @@ def open_dropdown(page):
                 continue
 
             loc.click(force=True)
-            page.wait_for_timeout(1500)
+            stabilize(page, "open_dropdown", 10000)
 
             visible = page.evaluate("""
             () => {
@@ -72,7 +97,7 @@ def open_dropdown(page):
             """)
 
             if visible:
-                log.info(f"Dropdown aberto com: {sel}")
+                log.info(f"Dropdown OK via {sel}")
                 return True
 
         except Exception as e:
@@ -82,45 +107,42 @@ def open_dropdown(page):
 
 
 def select_active(page):
-    log.info("Selecting ACTIVE...")
+    log.info("Selecting Active...")
 
-    selectors = [
-        'a.dropdown-item.statusgroup1:has-text("Active")',
-        'text="Active"'
-    ]
+    result = page.evaluate("""
+    () => {
+        const items = Array.from(document.querySelectorAll('a.dropdown-item.statusgroup1'));
 
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
+        const active = items.find(el =>
+            (el.innerText || '').trim() === 'Active'
+        );
 
-            loc.click(force=True)
-            page.wait_for_timeout(1500)
+        if (!active) return {ok:false};
 
-            state = page.evaluate("""
-            () => {
-                const label = document.querySelector('#filterCaseStatusLabel');
-                return label ? label.innerText.trim() : '';
-            }
-            """)
+        const menu = active.closest('.dropdown-menu');
+        if (menu) {
+            menu.style.display = 'block';
+            menu.style.visibility = 'visible';
+            menu.classList.add('show');
+        }
 
-            if "Active" in state:
-                log.info(f"ACTIVE selecionado com {sel}")
-                return True
+        active.click();
 
-        except Exception as e:
-            log.warning(e)
+        return {ok:true};
+    }
+    """)
 
-    return False
+    stabilize(page, "select_active", 10000)
+
+    return result.get("ok", False)
 
 
 def click_search(page):
-    log.info("Clicking Process Search...")
+    log.info("Clicking search...")
 
     selectors = [
         "button.filters-submit",
-        'text="Process Search"'
+        'text="Process Search"',
     ]
 
     for sel in selectors:
@@ -130,12 +152,12 @@ def click_search(page):
                 continue
 
             loc.click(force=True)
-            page.wait_for_timeout(6000)
+            stabilize(page, "search", 15000)
 
             rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
 
             if rows > 0:
-                log.info(f"Search OK com {sel} ({rows} rows)")
+                log.info(f"Search OK ({rows} rows)")
                 return True
 
         except Exception as e:
@@ -164,81 +186,80 @@ def extract_cases(page):
 
 
 def next_page(page):
-    log.info("Trying next page...")
+    log.info("Next page...")
 
-    try:
-        result = page.evaluate("""
-        () => {
-            const icon = document.querySelector('i.fa-regular.fa-chevron-right');
-            if (!icon) return false;
+    result = page.evaluate("""
+    () => {
+        const icon = document.querySelector('i.fa-regular.fa-chevron-right');
+        if (!icon) return false;
 
-            const parent = icon.closest('a,button,div,span') || icon;
-            parent.click();
-            return true;
-        }
-        """)
+        const parent = icon.closest('a,button,div,span') || icon;
+        parent.click();
+        return true;
+    }
+    """)
 
-        page.wait_for_timeout(4000)
-        return result
+    stabilize(page, "next_page", 15000)
+    return result
 
-    except Exception as e:
-        log.warning(e)
-        return False
 
+# =========================
+# MAIN
+# =========================
 
 def main():
     ensure_dir()
-
-    report = {
-        "started": datetime.utcnow().isoformat()
-    }
 
     with sync_playwright() as p:
 
         try:
             browser = p.chromium.launch(channel="chrome", headless=HEADLESS)
-            log.info("Using Google Chrome")
+            log.info("Using Chrome")
         except:
             browser = p.chromium.launch(headless=HEADLESS)
             log.info("Using Chromium fallback")
 
         page = browser.new_page()
 
-        page.goto(URL)
-        page.wait_for_timeout(5000)
+        # LOAD PAGE
+        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        stabilize(page, "initial_load", 15000)
 
         screenshot(page, "01_initial.png")
         save("01_initial.json", current_page_meta(page))
 
+        # OPEN FILTER
         if not open_dropdown(page):
-            log.error("Failed to open dropdown")
+            log.error("Failed dropdown")
             return
 
         screenshot(page, "02_dropdown.png")
 
+        # SELECT ACTIVE
         if not select_active(page):
-            log.error("Failed to select Active")
+            log.error("Failed Active")
             return
 
         screenshot(page, "03_active.png")
 
+        # SEARCH
         if not click_search(page):
-            log.error("Failed search")
+            log.error("Search failed")
             return
 
         screenshot(page, "04_results.png")
 
+        # PAGE 1
         page1 = extract_cases(page)
         save("page1.json", page1)
 
+        # NEXT PAGE
         if next_page(page):
             screenshot(page, "05_page2.png")
             page2 = extract_cases(page)
             save("page2.json", page2)
 
         browser.close()
-
-    save("report.json", report)
 
 
 if __name__ == "__main__":
