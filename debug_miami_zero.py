@@ -284,43 +284,80 @@ def click_search(page):
             loc.click(force=True)
             stabilize(page, "search", 15000)
 
-            rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
             body = page.locator("body").inner_text(timeout=5000)
+            page_info = extract_cases(page)
 
-            if rows > 0:
-                log.info("Search OK with %s (%s rows)", sel, rows)
-                return {"ok": True, "selector": sel, "rows": rows, "body_sample": body[:1000]}
+            success = (
+                page_info["count"] > 0
+                or "Found" in body
+                or "Cases List" in body
+                or "Page 1 of" in body
+            )
 
-            return {"ok": False, "selector": sel, "rows": rows, "body_sample": body[:1000]}
+            return {
+                "ok": success,
+                "selector": sel,
+                "rows": page_info["count"],
+                "cases_found": len(page_info["cases"]),
+                "body_sample": body[:1500],
+            }
 
         except Exception as e:
             log.warning("click_search %s -> %s", sel, e)
 
     return {"ok": False, "selector": None, "rows": 0}
 
-
 def extract_cases(page):
-    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
-    count = rows.count()
+    data = page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ')).trim();
+            }
 
-    cases = []
-    rows_text = []
+            const selectors = [
+                'tr[data-caseid]',
+                'tr.load-case',
+                'table tbody tr',
+                'tbody tr'
+            ];
 
-    for i in range(count):
-        text = re.sub(r"\s+", " ", rows.nth(i).inner_text()).strip()
-        rows_text.append(text)
+            let rows = [];
+            for (const sel of selectors) {
+                const found = Array.from(document.querySelectorAll(sel));
+                if (found.length > 0) {
+                    rows = found;
+                    break;
+                }
+            }
 
-        parts = re.split(r"\s{2,}|\t", text)
-        parts = [p.strip() for p in parts if p.strip()]
-        if len(parts) >= 2:
-            cases.append(parts[1])
+            const parsed = rows.map((row, idx) => {
+                const text = txt(row);
+                const caseId = row.getAttribute('data-caseid') || '';
+
+                const m = text.match(/\\b(\\d{4}A\\d{5})\\b/);
+                return {
+                    index: idx,
+                    caseid: caseId,
+                    text,
+                    case_number: m ? m[1] : ''
+                };
+            });
+
+            return {
+                rows_count: parsed.length,
+                cases: parsed.map(x => x.case_number).filter(Boolean),
+                rows_sample: parsed.slice(0, 20)
+            };
+        }
+        """
+    )
 
     return {
-        "count": count,
-        "cases": cases,
-        "rows_sample": rows_text[:20],
+        "count": data["rows_count"],
+        "cases": data["cases"],
+        "rows_sample": data["rows_sample"],
     }
-
 
 def next_page(page):
     log.info("Trying next page...")
