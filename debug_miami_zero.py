@@ -115,57 +115,71 @@ def open_dropdown(page):
 
 
 def select_exact_active(page):
-    log.info("Selecting exact Active child option...")
+    log.info("Selecting exact Active by fixed position...")
 
     result = page.evaluate(
         """
         () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ')).trim();
+            const trigger = document.querySelector('#filterButtonStatus') ||
+                            document.querySelector('[aria-label*="Status"]') ||
+                            document.querySelector('.dropdown-toggle');
+
+            const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
+            if (!menu) {
+                return { ok: false, reason: 'menu not found' };
             }
 
-            const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
-            menus.forEach(menu => {
-                menu.style.display = 'block';
-                menu.style.visibility = 'visible';
-                menu.style.opacity = '1';
-                menu.classList.add('show');
-            });
+            menu.style.display = 'block';
+            menu.style.visibility = 'visible';
+            menu.style.opacity = '1';
+            menu.classList.add('show');
 
-            const options = Array.from(document.querySelectorAll('.dropdown-menu a, .dropdown-menu .dropdown-item, .dropdown-menu li, .dropdown-menu div'))
-                .filter(el => txt(el) === 'Active');
-
-            if (!options.length) {
-                return { ok: false, reason: 'exact child Active not found' };
+            const menuRect = menu.getBoundingClientRect();
+            if (!menuRect || menuRect.height <= 0) {
+                return { ok: false, reason: 'menu has no size' };
             }
 
-            const target = options[0];
-
-            try { target.scrollIntoView({ block: 'center' }); } catch(e) {}
-            try { target.click(); } catch(e) {}
-            try { target.dispatchEvent(new MouseEvent('mouseover', { bubbles:true })); } catch(e) {}
-            try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
-            try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
-            try { target.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+            // alvo aproximado:
+            // x = perto da esquerda do menu
+            // y = cerca de 1 linha abaixo do cabeçalho "Active"
+            const clickX = menuRect.left + 80;
+            const clickY = menuRect.top + 85;
 
             return {
                 ok: true,
-                clicked_text: txt(target),
-                class_name: (target.className || '').toString()
+                clickX,
+                clickY,
+                menuRect: {
+                    left: menuRect.left,
+                    top: menuRect.top,
+                    width: menuRect.width,
+                    height: menuRect.height
+                }
             };
         }
         """
     )
 
-    stabilize(page, "select_exact_active_child", 10000)
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "result": result,
+            "state": {}
+        }
+
+    page.mouse.click(result["clickX"], result["clickY"])
+    stabilize(page, "select_exact_active_fixed_xy", 10000)
 
     state = page.evaluate(
         """
         () => {
             const label = document.querySelector('#filterCaseStatusLabel');
-            const trigger = document.querySelector('#filterButtonStatus, .filter-bar, .dropdown-toggle');
+            const hidden = document.querySelector('#filterCaseStatus');
+            const trigger = document.querySelector('#filterButtonStatus');
+
             return {
                 label: label ? label.innerText.trim() : '',
+                hidden: hidden ? hidden.value : '',
                 trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
             };
         }
@@ -173,12 +187,85 @@ def select_exact_active(page):
     )
 
     return {
-        "ok": bool(result.get("ok")),
+        "ok": True,
         "result": result,
         "state": state,
     }
 
+    def select_exact_active(page):
+    log.info("Selecting exact Active by fixed position...")
 
+    data = page.evaluate(
+        """
+        () => {
+            const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
+            if (!menu) return { ok: false, reason: 'menu not found' };
+
+            menu.style.display = 'block';
+            menu.style.visibility = 'visible';
+            menu.style.opacity = '1';
+            menu.classList.add('show');
+
+            const r = menu.getBoundingClientRect();
+            return {
+                ok: r.width > 0 && r.height > 0,
+                left: r.left,
+                top: r.top,
+                width: r.width,
+                height: r.height
+            };
+        }
+        """
+    )
+
+    if not data.get("ok"):
+        return {"ok": False, "result": data, "state": {}}
+
+    x = data["left"] + 90
+    y_candidates = [
+        data["top"] + 78,
+        data["top"] + 88,
+        data["top"] + 98,
+    ]
+
+    attempts = []
+
+    for y in y_candidates:
+        page.mouse.click(x, y)
+        stabilize(page, f"select_exact_active_xy_{int(y)}", 8000)
+
+        state = page.evaluate(
+            """
+            () => {
+                const label = document.querySelector('#filterCaseStatusLabel');
+                const hidden = document.querySelector('#filterCaseStatus');
+                const trigger = document.querySelector('#filterButtonStatus');
+
+                return {
+                    label: label ? label.innerText.trim() : '',
+                    hidden: hidden ? hidden.value : '',
+                    trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
+                };
+            }
+            """
+        )
+
+        attempts.append({"x": x, "y": y, "state": state})
+
+        if state.get("label") or state.get("hidden") or "Active" in state.get("trigger_text", ""):
+            return {
+                "ok": True,
+                "result": {"x": x, "y": y, "menu": data},
+                "state": state,
+                "attempts": attempts,
+            }
+
+    return {
+        "ok": False,
+        "result": {"x": x, "menu": data},
+        "state": {},
+        "attempts": attempts,
+    }    
 def click_search(page):
     log.info("Clicking Process Search...")
 
