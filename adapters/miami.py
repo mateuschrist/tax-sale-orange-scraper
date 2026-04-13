@@ -4,6 +4,7 @@ import os
 import re
 from typing import Dict, List, Optional
 from urllib.parse import quote
+from datetime import datetime
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -31,6 +32,10 @@ PAGINATION_DIAGNOSTIC_MODE = os.getenv("MIAMI_PAGINATION_DIAGNOSTIC_MODE", "fals
 # =========================
 # BASIC HELPERS
 # =========================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -88,6 +93,25 @@ def payload_quality_score(payload: dict) -> int:
         "deed_status",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
+
+
+def wait_long(page, ms=15000):
+    page.wait_for_timeout(ms)
+
+
+def stabilize(page, label="", ms=12000):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    wait_long(page, ms)
+    log.info("Stabilized: %s", label)
 
 
 def dump_debug_artifacts(page, prefix: str):
@@ -441,48 +465,28 @@ def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
 # =========================
 # UI / FILTER / SEARCH
 # =========================
-def scan_clickables(page, prefix="miami_scan") -> Dict:
-    data = page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-            }
-            return {
-                url: location.href,
-                title: document.title,
-                body_sample: (document.body.innerText || '').slice(0, 3000),
-                clickables: Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],div,span,li'))
-                    .map((el, idx) => ({
-                        idx,
-                        tag: el.tagName.toLowerCase(),
-                        text: txt(el),
-                        id: el.id || '',
-                        class_name: (el.className || '').toString(),
-                        href: el.getAttribute('href') || '',
-                        onclick: el.getAttribute('onclick') || '',
-                        data_target: el.getAttribute('data-target') || '',
-                        data_toggle: el.getAttribute('data-toggle') || '',
-                        data_statusid: el.getAttribute('data-statusid') || '',
-                        data_parentid: el.getAttribute('data-parentid') || ''
-                    }))
-                    .filter(x => x.text || x.id || x.class_name || x.data_target || x.data_statusid)
-                    .slice(0, 2000)
-            };
-        }
-        """
-    )
+def click_element_handle_safe(el, page, name):
+    try:
+        el.click(timeout=6000)
+        log.info("%s clicked (normal)", name)
+        return True
+    except Exception:
+        pass
 
     try:
-        with open(f"{prefix}.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        log.info("Saved scan json: %s.json", prefix)
-    except Exception as e:
-        log.warning("Could not save scan json: %s", str(e))
+        el.click(force=True, timeout=6000)
+        log.info("%s clicked (force)", name)
+        return True
+    except Exception:
+        pass
 
-    dump_debug_artifacts(page, prefix)
-    log.info("SCAN title=%s url=%s", data.get("title"), data.get("url"))
-    return data
+    try:
+        page.evaluate("(el) => el.click()", el)
+        log.info("%s clicked (JS fallback)", name)
+        return True
+    except Exception as e:
+        log.error("%s FAILED: %s", name, e)
+        return False
 
 
 def click_safe(page, selector, name, timeout=6000):
@@ -535,178 +539,124 @@ def click_by_text_scan(page, texts: List[str], name: str) -> bool:
             if click_safe(page, sel, f"{name} [{text}]"):
                 return True
 
-    try:
-        for text in texts:
-            result = page.evaluate(
+    return False
+
+
+def open_dropdown(page):
+    log.info("Opening Case Status...")
+
+    selectors = [
+        "#filterButtonStatus",
+        'text="Case Status"',
+        'text="Select One or More Statuses..."',
+    ]
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+
+            loc.click(force=True)
+            stabilize(page, f"open_dropdown_{sel}", 10000)
+
+            visible = page.evaluate(
                 """
-                (needle) => {
-                    function txt(el) {
-                        return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-                    }
-
-                    const all = Array.from(document.querySelectorAll('a,button,div,span,li,input[type="button"],input[type="submit"]'));
-                    const target = all.find(el => txt(el).toLowerCase() === needle.toLowerCase())
-                        || all.find(el => txt(el).toLowerCase().includes(needle.toLowerCase()));
-
-                    if (!target) return false;
-                    target.click();
-                    return true;
+                () => {
+                    const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
+                    return menus.some(el => {
+                        const s = window.getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        return s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0;
+                    });
                 }
-                """,
-                text,
+                """
             )
-            if result:
-                log.info("%s clicked (text scan JS): %s", name, text)
+
+            if visible:
+                log.info("Dropdown OK via %s", sel)
                 return True
-    except Exception:
-        pass
 
-    log.warning("%s not found by text scan: %s", name, texts)
+        except Exception as e:
+            log.warning("open_dropdown %s -> %s", sel, e)
+
     return False
 
 
-def discover_and_open_status_filter(page) -> bool:
-    for sel in ["#filterButtonStatus", '[data-target="#filterStatus"]', '[data-target*="Status"]', "#caseStatus2"]:
-        if click_safe(page, sel, "FILTER BUTTON"):
-            page.wait_for_timeout(1000)
-            return True
+def select_exact_active(page):
+    log.info("Selecting exact Active by fixed position...")
 
-    if click_by_text_scan(page, ["Case Status", "Status"], "FILTER BUTTON TEXT"):
-        page.wait_for_timeout(1000)
-        return True
-
-    dump_debug_artifacts(page, "miami_filter_open_failed")
-    return False
-
-
-def force_clear_all_active_statuses(page):
-    page.evaluate(
+    data = page.evaluate(
         """
         () => {
-            const children = document.querySelectorAll('[data-statusid]');
-            children.forEach(el => {
-                el.classList.remove('selected');
-                const icon = el.querySelector('i');
-                if (icon) {
-                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
-                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
-                    if (!icon.className.includes('icon-circle-blank')) {
-                        icon.className = (icon.className + ' icon-circle-blank').trim();
-                    }
-                }
-            });
+            const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
+            if (!menu) return { ok: false, reason: 'menu not found' };
 
-            const hidden = document.querySelector('#filterCaseStatus');
-            if (hidden) hidden.value = '';
+            menu.style.display = 'block';
+            menu.style.visibility = 'visible';
+            menu.style.opacity = '1';
+            menu.classList.add('show');
 
-            const label = document.querySelector('#filterCaseStatusLabel');
-            if (label) label.innerText = 'None Selected';
-        }
-        """
-    )
-    log.info("Cleared UI + hidden filterCaseStatus")
-
-
-def force_select_active(page) -> str:
-    discovery = page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-            }
-
-            const all = Array.from(document.querySelectorAll('a, li, div, span, button'));
-
-            const visible = all.filter(el => {
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-            });
-
-            const exact = visible.map(el => ({
-                text: txt(el),
-                tag: el.tagName.toLowerCase(),
-                id: el.id || '',
-                class_name: (el.className || '').toString(),
-                data_statusid: el.getAttribute('data-statusid') || '',
-                data_parentid: el.getAttribute('data-parentid') || '',
-                onclick: el.getAttribute('onclick') || ''
-            }))
-            .filter(x => x.text === 'Active');
-
+            const r = menu.getBoundingClientRect();
             return {
-                exact_active_candidates: exact.slice(0, 50)
+                ok: r.width > 0 && r.height > 0,
+                left: r.left,
+                top: r.top,
+                width: r.width,
+                height: r.height
             };
         }
         """
     )
 
-    try:
-        with open("miami_active_exact_candidates.json", "w", encoding="utf-8") as f:
-            json.dump(discovery, f, indent=2, ensure_ascii=False)
-        log.info("Saved miami_active_exact_candidates.json")
-    except Exception:
-        pass
+    if not data.get("ok"):
+        return {"ok": False, "result": data, "state": {}}
 
-    clicked = page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+    x = data["left"] + 90
+    y_candidates = [
+        data["top"] + 78,
+        data["top"] + 88,
+        data["top"] + 98,
+    ]
+
+    attempts = []
+
+    for y in y_candidates:
+        page.mouse.click(x, y)
+        stabilize(page, f"select_exact_active_xy_{int(y)}", 8000)
+
+        state = page.evaluate(
+            """
+            () => {
+                const label = document.querySelector('#filterCaseStatusLabel');
+                const hidden = document.querySelector('#filterCaseStatus');
+                const trigger = document.querySelector('#filterButtonStatus');
+
+                return {
+                    label: label ? label.innerText.trim() : '',
+                    hidden: hidden ? hidden.value : '',
+                    trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
+                };
+            }
+            """
+        )
+
+        attempts.append({"x": x, "y": y, "state": state})
+
+        if state.get("label") or state.get("hidden") or "Active" in state.get("trigger_text", ""):
+            return {
+                "ok": True,
+                "result": {"x": x, "y": y, "menu": data},
+                "state": state,
+                "attempts": attempts,
             }
 
-            const all = Array.from(document.querySelectorAll('a, li, div, span, button'));
-
-            const visible = all.filter(el => {
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-            });
-
-            const exact = visible.filter(el => txt(el) === 'Active');
-
-            exact.sort((a, b) => {
-                const ra = a.getBoundingClientRect();
-                const rb = b.getBoundingClientRect();
-                return (ra.width * ra.height) - (rb.width * rb.height);
-            });
-
-            const target = exact[0];
-            if (!target) return { ok: false, reason: "exact Active not found" };
-
-            try { target.click(); } catch (e) {}
-            try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
-            try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
-            try { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
-
-            const hidden = document.querySelector('#filterCaseStatus');
-            const label = document.querySelector('#filterCaseStatusLabel');
-
-            return {
-                ok: true,
-                hidden_value: hidden ? hidden.value : '',
-                label: label ? label.innerText.trim() : ''
-            };
-        }
-        """
-    )
-
-    log.info("ACTIVE click result: %s", clicked)
-
-    hidden_value = clean_text((clicked or {}).get("hidden_value", ""))
-    if not clicked or not clicked.get("ok"):
-        dump_debug_artifacts(page, "miami_active_click_failed")
-        raise RuntimeError(f"Could not click exact Active. Result={clicked}")
-
-    if "," in hidden_value:
-        dump_debug_artifacts(page, "miami_active_group_clicked")
-        raise RuntimeError(f"Clicked Active group instead of leaf. hidden_filterCaseStatus={hidden_value}")
-
-    if not hidden_value:
-        raise RuntimeError("Active clicked but hidden filter value is empty")
-
-    log.info("ACTIVE leaf selected successfully: %s", hidden_value)
-    return hidden_value
+    return {
+        "ok": False,
+        "result": {"x": x, "menu": data},
+        "state": {},
+        "attempts": attempts,
+    }
 
 
 def get_filter_state(page):
@@ -730,52 +680,99 @@ def get_filter_state(page):
     )
 
 
-def click_search_button(page) -> bool:
+def extract_cases(page):
+    data = page.evaluate(
+        """
+        () => {
+            function txt(el) {
+                return ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ')).trim();
+            }
+
+            const selectors = [
+                'tr[data-caseid]',
+                'tr.load-case',
+                'table tbody tr',
+                'tbody tr'
+            ];
+
+            let rows = [];
+            for (const sel of selectors) {
+                const found = Array.from(document.querySelectorAll(sel));
+                if (found.length > 0) {
+                    rows = found;
+                    break;
+                }
+            }
+
+            const parsed = rows.map((row, idx) => {
+                const text = txt(row);
+                const caseId = row.getAttribute('data-caseid') || '';
+                const m = text.match(/\\b(\\d{4}A\\d{5})\\b/);
+
+                return {
+                    index: idx,
+                    caseid: caseId,
+                    text,
+                    case_number: m ? m[1] : ''
+                };
+            });
+
+            return {
+                rows_count: parsed.length,
+                cases: parsed.map(x => x.case_number).filter(Boolean),
+                rows_sample: parsed.slice(0, 20)
+            };
+        }
+        """
+    )
+
+    return {
+        "count": data["rows_count"],
+        "cases": data["cases"],
+        "rows_sample": data["rows_sample"],
+    }
+
+
+def click_search_button(page) -> Dict:
+    log.info("Clicking Process Search...")
+
     selectors = [
-        "button:has-text('Process Search')",
-        "text=Process Search",
-        'input[type="submit"][value*="Process Search"]',
-        'input[type="button"][value*="Process Search"]',
         "button.filters-submit",
-        "button:has-text('Search')",
-        "text=Search",
+        'button:has-text("Process Search")',
+        'text="Process Search"',
     ]
 
     for sel in selectors:
         try:
-            locator = page.locator(sel).first
-            if locator.count() == 0:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
                 continue
 
-            try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                    locator.click(timeout=6000)
-                log.info("SEARCH BUTTON clicked with navigation: %s", sel)
-                return True
-            except Exception:
-                pass
+            loc.click(force=True)
+            stabilize(page, "search", 15000)
 
-            try:
-                locator.click(timeout=6000)
-                page.wait_for_timeout(5000)
-                log.info("SEARCH BUTTON clicked (normal): %s", sel)
-                return True
-            except Exception:
-                pass
+            body = page.locator("body").inner_text(timeout=5000)
+            page_info = extract_cases(page)
 
-            try:
-                locator.click(force=True, timeout=6000)
-                page.wait_for_timeout(5000)
-                log.info("SEARCH BUTTON clicked (force): %s", sel)
-                return True
-            except Exception:
-                pass
+            success = (
+                page_info["count"] > 0
+                or "Found" in body
+                or "Cases List" in body
+                or "Page 1 of" in body
+            )
+
+            return {
+                "ok": success,
+                "selector": sel,
+                "rows": page_info["count"],
+                "cases_found": len(page_info["cases"]),
+                "body_sample": body[:1500],
+            }
 
         except Exception as e:
-            log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
+            log.warning("click_search %s -> %s", sel, e)
 
-    dump_debug_artifacts(page, "miami_search_click_failed")
-    return False
+    return {"ok": False, "selector": None, "rows": 0}
 
 
 def wait_for_case_rows(page, timeout_ms=30000):
@@ -783,10 +780,10 @@ def wait_for_case_rows(page, timeout_ms=30000):
     waited = 0
     step = 1000
     while waited < timeout_ms:
-        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
-        if rows > 0:
-            log.info("Rows after search: %s", rows)
-            return rows
+        page_info = extract_cases(page)
+        if page_info["count"] > 0:
+            log.info("Rows after search: %s", page_info["count"])
+            return page_info["count"]
         page.wait_for_timeout(step)
         waited += step
 
@@ -797,50 +794,43 @@ def wait_for_case_rows(page, timeout_ms=30000):
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
-    scan_clickables(page, "miami_before_filter")
-
     reset_ok = click_safe(page, "a.filters-reset", "RESET FILTERS")
     if reset_ok:
         page.wait_for_timeout(1200)
     else:
         log.warning("RESET FILTERS not found; continuing without reset")
 
-    if not discover_and_open_status_filter(page):
-        raise RuntimeError("Could not open filter button")
+    if not open_dropdown(page):
+        raise RuntimeError("Could not open Case Status dropdown")
 
-    scan_clickables(page, "miami_status_open")
+    active = select_exact_active(page)
+    log.info("ACTIVE selection result: %s", active)
 
-    force_clear_all_active_statuses(page)
-    page.wait_for_timeout(500)
+    if not active.get("ok"):
+        dump_debug_artifacts(page, "miami_active_click_failed")
+        raise RuntimeError(f"Could not select exact Active. Result={active}")
 
-    active_key = force_select_active(page)
-    page.wait_for_timeout(800)
+    hidden_value = clean_text(active.get("state", {}).get("hidden") or "")
+    if hidden_value != "192":
+        dump_debug_artifacts(page, "miami_active_not_192")
+        raise RuntimeError(f"Active filter did not stick as 192. Result={active}")
 
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
-    if not state.get("hidden_filterCaseStatus"):
-        raise RuntimeError(f"Status filter did not stick. Current state={state}")
+    search = click_search_button(page)
+    log.info("SEARCH CLICK RESULT: %s", search)
 
-    if "," in state.get("hidden_filterCaseStatus", ""):
-        raise RuntimeError(f"Active group was selected instead of a single status. Current state={state}")
-
-    if not active_key:
-        raise RuntimeError(f"Active key is empty. Current state={state}")
-
-    if not click_search_button(page):
-        raise RuntimeError("Could not click search")
+    if not search.get("ok"):
+        dump_debug_artifacts(page, "miami_search_click_failed")
+        raise RuntimeError(f"Could not search successfully. Result={search}")
 
     wait_for_case_rows(page)
 
 
 def open_list_and_apply_filter(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-    page.wait_for_timeout(4000)
+    stabilize(page, "initial_load", 15000)
     humanize(page)
     run_search_flow(page)
 
@@ -853,17 +843,18 @@ def get_results_summary(page) -> Dict:
         """
         () => {
             const bodyText = document.body.innerText || '';
-            const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
+            const rows = document.querySelectorAll('tr[data-caseid], tr.load-case, table tbody tr, tbody tr').length;
+
             const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
-            const m = bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+            const m = bodyText.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i) || bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
 
             return {
                 rows_on_page: rows,
                 page_links: pageLinks,
-                current_page_text: m ? `Page ${m[1]}/${m[2]}` : "",
+                current_page_text: m ? `Page ${m[1]} of ${m[2]}` : "",
                 body_sample: bodyText.slice(0, 3000)
             };
         }
@@ -877,7 +868,10 @@ def get_active_page_number(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                let m = body.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i);
+                if (m) return parseInt(m[1], 10);
+
+                m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
                 const els = Array.from(document.querySelectorAll('button, a, div, span'));
@@ -886,6 +880,7 @@ def get_active_page_number(page) -> int:
                     const mm = txt.match(/^Page\\s+(\\d+)$/i);
                     if (mm) return parseInt(mm[1], 10);
                 }
+
                 return 1;
             }
             """
@@ -896,8 +891,13 @@ def get_active_page_number(page) -> int:
 
 
 def collect_case_rows(page) -> List[Dict]:
-    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
+    rows = page.locator('tr[data-caseid]')
     count = rows.count()
+
+    if count == 0:
+        rows = page.locator('tr.load-case')
+        count = rows.count()
+
     log.info("Collecting case rows from current page: %s", count)
 
     items = []
@@ -917,8 +917,12 @@ def parse_total_pages(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                let m = body.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
+
+                m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                if (m) return parseInt(m[2], 10);
+
                 return 1;
             }
             """
@@ -934,7 +938,13 @@ def parse_total_items(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-                const patterns = [/Cases List\\s*»\\s*(\\d+)\\s*Cases/i, /(\\d+)\\s*Cases/i];
+
+                const patterns = [
+                    /Found\\s+(\\d+)\\s+Results/i,
+                    /Cases List\\s*»\\s*(\\d+)\\s*Cases/i,
+                    /(\\d+)\\s*Cases/i
+                ];
+
                 for (const rx of patterns) {
                     const m = body.match(rx);
                     if (m) return parseInt(m[1], 10);
@@ -951,9 +961,11 @@ def parse_total_items(page) -> int:
 
 def get_first_caseid(page) -> str:
     try:
-        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        row = page.locator('tr[data-caseid]').first
         if row.count() == 0:
-            return ""
+            row = page.locator('tr.load-case').first
+            if row.count() == 0:
+                return ""
         return row.get_attribute("data-caseid") or ""
     except Exception:
         return ""
@@ -961,9 +973,11 @@ def get_first_caseid(page) -> str:
 
 def get_first_row_text(page) -> str:
     try:
-        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
+        row = page.locator('tr[data-caseid]').first
         if row.count() == 0:
-            return ""
+            row = page.locator('tr.load-case').first
+            if row.count() == 0:
+                return ""
         return clean_text(row.inner_text())
     except Exception:
         return ""
@@ -976,11 +990,11 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_fi
     while waited < timeout_ms:
         try:
             current = get_active_page_number(page)
-            rows_count = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+            page_info = extract_cases(page)
             new_first_caseid = get_first_caseid(page)
             new_first_row_text = get_first_row_text(page)
 
-            page_changed = current != old_page and rows_count > 0
+            page_changed = current != old_page and page_info["count"] > 0
             first_case_changed = bool(old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid)
             first_text_changed = bool(old_first_row_text and new_first_row_text and new_first_row_text != old_first_row_text)
 
@@ -1000,7 +1014,7 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_fi
 def open_pager_dropdown(page) -> bool:
     selectors = [
         'text=/^Page\\s+\\d+\\s*$/',
-        'text=/^Page\\s+\\d+\\s*\\(results.*\\)$/i',
+        'text=/^Page\\s+\\d+\\s+of\\s+\\d+$/i',
         'div:has-text("Page 1")',
         'div:has-text("Page 2")',
         'span:has-text("Page 1")',
@@ -1161,54 +1175,22 @@ def click_next_page(page) -> bool:
         result = page.evaluate(
             """
             () => {
-                function isVisible(el) {
-                    if (!el) return false;
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return !!s && s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                }
+                const icon = document.querySelector('i.fa-regular.fa-chevron-right[aria-hidden="true"], i.fa-regular.fa-chevron-right, i.fa-chevron-right');
+                if (!icon) return { ok: false, reason: 'icon not found' };
 
-                function txt(el) {
-                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
-                }
+                const parent = icon.closest('a,button,div,span,td,li') || icon;
 
-                function cls(el) {
-                    return ((el && el.className) || '').toString().toLowerCase();
-                }
+                try { parent.scrollIntoView({ block: 'center' }); } catch(e) {}
+                try { parent.click(); } catch(e) {}
+                try { parent.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
+                try { parent.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
+                try { parent.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
 
-                const all = Array.from(document.querySelectorAll('a, button, span, div, td, img'));
-                const visible = all.filter(isVisible);
-
-                let best = null;
-
-                for (const el of visible) {
-                    const t = txt(el);
-                    const c = cls(el);
-                    let score = 0;
-
-                    if (t === '>' || t === '›' || t === '»') score += 200;
-                    if (c.includes('next')) score += 120;
-                    if (c.includes('right')) score += 80;
-                    if (c.includes('arrow')) score += 80;
-                    if (c.includes('chevron')) score += 80;
-                    if (el.tagName.toLowerCase() === 'img') score += 40;
-                    if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
-                    if (score <= 0) continue;
-
-                    const r = el.getBoundingClientRect();
-                    const candidate = {
-                        score,
-                        x: r.left + r.width / 2,
-                        y: r.top + r.height / 2,
-                        text: t,
-                        className: c
-                    };
-
-                    if (!best || candidate.score > best.score) best = candidate;
-                }
-
-                if (!best) return { ok: false, reason: 'no next candidate found' };
-                return { ok: true, ...best };
+                return {
+                    ok: true,
+                    tag: parent.tagName.toLowerCase(),
+                    class_name: (parent.className || '').toString()
+                };
             }
             """
         )
@@ -1216,7 +1198,6 @@ def click_next_page(page) -> bool:
         log.info("NEXT target detection: %s", result)
 
         if result and result.get("ok"):
-            page.mouse.click(result["x"], result["y"])
             if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                 return True
     except Exception as e:
@@ -1327,8 +1308,11 @@ def parse_row_text(row_text: str) -> Dict:
 
 
 def open_case_by_caseid(page, caseid: str) -> Dict:
-    rows = page.locator(f'tr.load-case.table-row.link[data-caseid="{caseid}"]')
+    rows = page.locator(f'tr[data-caseid="{caseid}"]')
     count = rows.count()
+    if count == 0:
+        rows = page.locator(f'tr.load-case[data-caseid="{caseid}"]')
+        count = rows.count()
     if count == 0:
         raise RuntimeError(f"Case row not found for caseid={caseid}")
 
