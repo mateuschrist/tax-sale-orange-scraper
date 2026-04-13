@@ -1,4 +1,4 @@
-name: Debug Miami Access
+name: Debug Miami Zero
 
 on:
   workflow_dispatch:
@@ -7,25 +7,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: debug-miami-access
+  group: debug-miami-zero
   cancel-in-progress: true
 
 jobs:
-  debug-miami-access:
+  debug-miami-zero:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
       PYTHONUNBUFFERED: "1"
       HEADLESS: "true"
-      MIAMI_DEBUG_DIR: "miami_access_output"
+      MIAMI_DEBUG_DIR: "miami_zero_output"
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -42,31 +42,40 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install playwright
 
-      - name: Install Playwright browser deps
+      - name: Install Playwright system deps
         run: |
           python -m playwright install --with-deps chromium
 
       - name: Install Google Chrome
-        id: setup-chrome
-        uses: browser-actions/setup-chrome@v1
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
 
-      - name: Show Chrome info
+      - name: Show browser versions
         run: |
-          echo "Chrome path: ${{ steps.setup-chrome.outputs.chrome-path }}"
-          "${{ steps.setup-chrome.outputs.chrome-path }}" --version || true
+          echo "Chrome path: ${{ steps.chrome.outputs.chrome-path }}"
+          echo "Chrome version: ${{ steps.chrome.outputs.chrome-version }}"
+          "${{ steps.chrome.outputs.chrome-path }}" --version || true
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              print("Playwright Chromium executable available:", bool(p.chromium))
+          PY
 
-      - name: Ensure output folder exists
+      - name: Ensure output directory exists
         run: |
-          mkdir -p miami_access_output
+          mkdir -p miami_zero_output
 
       - name: Check script exists
         run: |
-          test -f debug_miami_access.py
+          test -f debug_miami_zero.py
           ls -la
 
-      - name: Run access probe
+      - name: Run debug scraper
         run: |
-          python debug_miami_access.py
+          python debug_miami_zero.py
         continue-on-error: true
 
       - name: List generated files
@@ -74,28 +83,28 @@ jobs:
         run: |
           echo "=== ROOT ==="
           ls -la || true
-          echo "=== miami_access_output ==="
-          ls -la miami_access_output || true
+          echo "=== miami_zero_output ==="
+          ls -la miami_zero_output || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: miami-access-artifacts
+          name: miami-zero-artifacts
           if-no-files-found: warn
           retention-days: 7
           path: |
-            miami_access_output/**
-            **/*miami_access*.json
-            **/*miami_access*.html
-            **/*miami_access*.png
+            miami_zero_output/**
+            **/*miami_zero*.json
+            **/*miami_zero*.html
+            **/*miami_zero*.png
 
       - name: Write summary
         if: always()
         run: |
           {
-            echo "## Debug Miami Access"
+            echo "## Debug Miami Zero"
             echo ""
-            echo "- Artifact: \`miami-access-artifacts\`"
-            echo "- Main report: \`miami_access_output/miami_access_report.json\`"
+            echo "- Artifact: \`miami-zero-artifacts\`"
+            echo "- Main report: \`miami_zero_output/miami_zero_report.json\`"
           } >> "$GITHUB_STEP_SUMMARY"
