@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -32,10 +31,6 @@ PAGINATION_DIAGNOSTIC_MODE = os.getenv("MIAMI_PAGINATION_DIAGNOSTIC_MODE", "fals
 # =========================
 # BASIC HELPERS
 # =========================
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-
 def clean_text(value):
     if value is None:
         return ""
@@ -288,19 +283,9 @@ def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
         ok = r.status_code in (200, 204)
 
         if ok:
-            log.info(
-                "SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s",
-                record_id,
-                sale_date,
-                r.status_code,
-            )
+            log.info("SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s", record_id, sale_date, r.status_code)
         else:
-            log.warning(
-                "SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s",
-                record_id,
-                r.status_code,
-                r.text[:500],
-            )
+            log.warning("SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s", record_id, r.status_code, r.text[:500])
 
         return {"sent": ok, "status_code": r.status_code, "response_text": r.text[:1000]}
     except Exception as e:
@@ -346,23 +331,13 @@ def should_send_payload(payload: dict):
 
 def supabase_upsert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
-        return {
-            "sent": False,
-            "status_code": None,
-            "node": payload.get("node"),
-            "response_text": "SUPABASE not configured",
-        }
+        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": "SUPABASE not configured"}
 
     should_send, reason = should_send_payload(payload)
     log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
 
     if not should_send:
-        return {
-            "sent": False,
-            "status_code": 200,
-            "node": payload.get("node"),
-            "response_text": reason,
-        }
+        return {"sent": False, "status_code": 200, "node": payload.get("node"), "response_text": reason}
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
@@ -375,12 +350,7 @@ def supabase_upsert_property(payload: dict) -> dict:
         if ok:
             log.info("SUPABASE UPSERT OK status=%s node=%s", r.status_code, payload.get("node"))
         else:
-            log.error(
-                "SUPABASE UPSERT FAILED status=%s node=%s body=%s",
-                r.status_code,
-                payload.get("node"),
-                r.text[:600],
-            )
+            log.error("SUPABASE UPSERT FAILED status=%s node=%s body=%s", r.status_code, payload.get("node"), r.text[:600])
 
         return {"sent": ok, "status_code": r.status_code, "node": payload.get("node"), "response_text": r.text[:1000]}
     except Exception as e:
@@ -550,59 +520,118 @@ def click_safe(page, selector, name, timeout=6000):
 
 
 def open_dropdown(page):
-    log.info("Opening Case Status (robust)...")
+    log.info("Opening Case Status (robust fallback)...")
+
+    selectors = [
+        "#filterButtonStatus",
+        'button:has-text("Case Status")',
+        'text="Case Status"',
+        'text="Select One or More Statuses..."',
+    ]
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+
+            try:
+                loc.scroll_into_view_if_needed(timeout=4000)
+            except Exception:
+                pass
+
+            try:
+                loc.click(timeout=4000)
+            except Exception:
+                try:
+                    loc.click(force=True, timeout=4000)
+                except Exception:
+                    continue
+
+            stabilize(page, f"open_dropdown_{sel}", 10000)
+
+            menu_state = page.evaluate(
+                """
+                () => {
+                    const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
+                    for (const menu of menus) {
+                        const s = window.getComputedStyle(menu);
+                        const r = menu.getBoundingClientRect();
+                        if (s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0) {
+                            return {
+                                ok: true,
+                                display: s.display,
+                                visibility: s.visibility,
+                                height: r.height,
+                                text: (menu.innerText || '').slice(0, 500)
+                            };
+                        }
+                    }
+                    return { ok: false, reason: 'visible menu not found' };
+                }
+                """
+            )
+
+            log.info("open_dropdown selector=%s menu_state=%s", sel, menu_state)
+            if menu_state.get("ok"):
+                return True
+
+        except Exception as e:
+            log.warning("open_dropdown selector=%s failed: %s", sel, e)
 
     try:
-        result = page.evaluate(
+        js_result = page.evaluate(
             """
             () => {
-                const btn = document.querySelector('#filterButtonStatus');
-                if (!btn) return { ok: false, reason: 'button not found' };
+                function txt(el) {
+                    return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+                }
 
-                btn.scrollIntoView({ block: 'center' });
-                const r = btn.getBoundingClientRect();
+                const all = Array.from(document.querySelectorAll('button, a, div, span, label'));
+                const target =
+                    all.find(el => txt(el) === 'Case Status') ||
+                    all.find(el => txt(el).includes('Case Status')) ||
+                    all.find(el => txt(el).includes('Select One or More Statuses'));
+
+                if (!target) return { ok: false, reason: 'text target not found' };
+
+                try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+                try { target.click(); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+                try { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
+
+                const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
+                for (const menu of menus) {
+                    const s = window.getComputedStyle(menu);
+                    const r = menu.getBoundingClientRect();
+                    if (s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0) {
+                        return {
+                            ok: true,
+                            clicked_text: txt(target),
+                            menu_height: r.height
+                        };
+                    }
+                }
 
                 return {
-                    ok: r.width > 0 && r.height > 0,
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2
+                    ok: false,
+                    clicked_text: txt(target),
+                    reason: 'clicked but menu did not open'
                 };
             }
             """
         )
 
-        if not result.get("ok"):
-            log.warning("open_dropdown: button not found/visible: %s", result)
-            return False
-
-        page.mouse.click(result["x"], result["y"])
-        stabilize(page, "open_dropdown", 10000)
-
-        menu_state = page.evaluate(
-            """
-            () => {
-                const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
-                if (!menu) return { ok: false, reason: 'menu not found' };
-
-                const s = window.getComputedStyle(menu);
-                const r = menu.getBoundingClientRect();
-
-                return {
-                    ok: s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0,
-                    display: s.display,
-                    visibility: s.visibility,
-                    height: r.height
-                };
-            }
-            """
-        )
-
-        log.info("open_dropdown menu_state=%s", menu_state)
-        return bool(menu_state.get("ok"))
+        log.info("open_dropdown js_result=%s", js_result)
+        if js_result.get("ok"):
+            stabilize(page, "open_dropdown_js", 10000)
+            return True
 
     except Exception as e:
-        log.warning("open_dropdown failed: %s", e)
-        return False
+        log.warning("open_dropdown js fallback failed: %s", e)
+
+    return False
 
 
 def force_select_active(page):
@@ -835,7 +864,12 @@ def run_search_flow(page):
 
     if not open_dropdown(page):
         dump_debug_artifacts(page, "miami_open_dropdown_failed")
-        raise RuntimeError("Could not open Case Status dropdown")
+        body = ""
+        try:
+            body = page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            pass
+        raise RuntimeError(f"Could not open Case Status dropdown. body_sample={body[:1200]}")
 
     active = force_select_active(page)
     log.info("ACTIVE selection result: %s", active)
