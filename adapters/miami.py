@@ -543,120 +543,84 @@ def click_by_text_scan(page, texts: List[str], name: str) -> bool:
 
 
 def open_dropdown(page):
-    log.info("Opening Case Status...")
+    log.info("Opening Case Status (robust)...")
 
-    selectors = [
-        "#filterButtonStatus",
-        'text="Case Status"',
-        'text="Select One or More Statuses..."',
-    ]
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                const btn = document.querySelector('#filterButtonStatus');
+                if (!btn) return { ok: false, reason: 'button not found' };
 
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
+                const r = btn.getBoundingClientRect();
 
-            loc.click(force=True)
-            stabilize(page, f"open_dropdown_{sel}", 10000)
+                btn.scrollIntoView({ block: 'center' });
 
-            visible = page.evaluate(
-                """
-                () => {
-                    const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
-                    return menus.some(el => {
-                        const s = window.getComputedStyle(el);
-                        const r = el.getBoundingClientRect();
-                        return s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0;
-                    });
-                }
-                """
-            )
+                return {
+                    ok: true,
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2
+                };
+            }
+            """
+        )
 
-            if visible:
-                log.info("Dropdown OK via %s", sel)
-                return True
+        if not result.get("ok"):
+            return False
 
-        except Exception as e:
-            log.warning("open_dropdown %s -> %s", sel, e)
+        page.mouse.click(result["x"], result["y"])
+        page.wait_for_timeout(10000)
 
-    return False
+        return True
+
+    except Exception as e:
+        log.warning("open_dropdown failed: %s", e)
+        return False
 
 
-def select_exact_active(page):
-    log.info("Selecting exact Active by fixed position...")
+def force_select_active(page):
+    log.info("Selecting Active (fixed XY from working version)...")
 
     data = page.evaluate(
         """
         () => {
             const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
-            if (!menu) return { ok: false, reason: 'menu not found' };
-
-            menu.style.display = 'block';
-            menu.style.visibility = 'visible';
-            menu.style.opacity = '1';
-            menu.classList.add('show');
+            if (!menu) return { ok: false };
 
             const r = menu.getBoundingClientRect();
+
             return {
                 ok: r.width > 0 && r.height > 0,
                 left: r.left,
-                top: r.top,
-                width: r.width,
-                height: r.height
+                top: r.top
             };
         }
         """
     )
 
     if not data.get("ok"):
-        return {"ok": False, "result": data, "state": {}}
+        raise RuntimeError("Dropdown menu not found")
 
     x = data["left"] + 90
-    y_candidates = [
-        data["top"] + 78,
-        data["top"] + 88,
-        data["top"] + 98,
-    ]
+    y = data["top"] + 80
 
-    attempts = []
+    page.mouse.click(x, y)
+    page.wait_for_timeout(8000)
 
-    for y in y_candidates:
-        page.mouse.click(x, y)
-        stabilize(page, f"select_exact_active_xy_{int(y)}", 8000)
+    state = page.evaluate(
+        """
+        () => {
+            const hidden = document.querySelector('#filterCaseStatus');
+            return hidden ? hidden.value : '';
+        }
+        """
+    )
 
-        state = page.evaluate(
-            """
-            () => {
-                const label = document.querySelector('#filterCaseStatusLabel');
-                const hidden = document.querySelector('#filterCaseStatus');
-                const trigger = document.querySelector('#filterButtonStatus');
+    if not state:
+        raise RuntimeError("Active selection failed")
 
-                return {
-                    label: label ? label.innerText.trim() : '',
-                    hidden: hidden ? hidden.value : '',
-                    trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
-                };
-            }
-            """
-        )
-
-        attempts.append({"x": x, "y": y, "state": state})
-
-        if state.get("label") or state.get("hidden") or "Active" in state.get("trigger_text", ""):
-            return {
-                "ok": True,
-                "result": {"x": x, "y": y, "menu": data},
-                "state": state,
-                "attempts": attempts,
-            }
-
-    return {
-        "ok": False,
-        "result": {"x": x, "menu": data},
-        "state": {},
-        "attempts": attempts,
-    }
+    log.info("ACTIVE selected with hidden=%s", state)
+    return state
 
 
 def get_filter_state(page):
