@@ -796,24 +796,42 @@ def click_search_button(page) -> Dict:
 
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
+            locator = page.locator(sel).first
+            if locator.count() == 0:
                 continue
 
+            clicked = False
+
             try:
-                loc.click(force=True, timeout=6000)
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    locator.click(timeout=6000)
+                clicked = True
+                log.info("SEARCH BUTTON clicked with navigation: %s", sel)
             except Exception:
-                page.evaluate(
-                    """(selector) => {
-                        const el = document.querySelector(selector);
-                        if (el) el.click();
-                    }""",
-                    sel,
-                )
+                try:
+                    locator.click(timeout=6000)
+                    clicked = True
+                    log.info("SEARCH BUTTON clicked (normal): %s", sel)
+                except Exception:
+                    try:
+                        locator.click(force=True, timeout=6000)
+                        clicked = True
+                        log.info("SEARCH BUTTON clicked (force): %s", sel)
+                    except Exception as e:
+                        log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
+                        continue
+
+            if not clicked:
+                continue
 
             stabilize(page, f"search_{sel}", 15000)
 
-            body = page.locator("body").inner_text(timeout=5000)
+            body = ""
+            try:
+                body = page.locator("body").inner_text(timeout=5000)
+            except Exception:
+                pass
+
             page_info = extract_cases(page)
 
             success = (
@@ -821,6 +839,7 @@ def click_search_button(page) -> Dict:
                 or "Found" in body
                 or "Cases List" in body
                 or "Page 1 of" in body
+                or "Page 1 of 13" in body
             )
 
             return {
@@ -832,7 +851,7 @@ def click_search_button(page) -> Dict:
             }
 
         except Exception as e:
-            log.warning("click_search %s -> %s", sel, e)
+            log.warning("click_search unexpected failure %s -> %s", sel, e)
 
     return {"ok": False, "selector": None, "rows": 0, "cases_found": 0}
 
@@ -890,8 +909,6 @@ def run_search_flow(page):
         raise RuntimeError(f"Could not search successfully. Result={search}")
 
     wait_for_case_rows(page)
-
-
 def open_list_and_apply_filter(page):
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
     stabilize(page, "initial_load", 15000)
