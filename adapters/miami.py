@@ -2,9 +2,9 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote
-from datetime import datetime
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -288,9 +288,19 @@ def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
         ok = r.status_code in (200, 204)
 
         if ok:
-            log.info("SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s", record_id, sale_date, r.status_code)
+            log.info(
+                "SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s",
+                record_id,
+                sale_date,
+                r.status_code,
+            )
         else:
-            log.warning("SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s", record_id, r.status_code, r.text[:500])
+            log.warning(
+                "SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s",
+                record_id,
+                r.status_code,
+                r.text[:500],
+            )
 
         return {"sent": ok, "status_code": r.status_code, "response_text": r.text[:1000]}
     except Exception as e:
@@ -336,13 +346,23 @@ def should_send_payload(payload: dict):
 
 def supabase_upsert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
-        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": "SUPABASE not configured"}
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "response_text": "SUPABASE not configured",
+        }
 
     should_send, reason = should_send_payload(payload)
     log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
 
     if not should_send:
-        return {"sent": False, "status_code": 200, "node": payload.get("node"), "response_text": reason}
+        return {
+            "sent": False,
+            "status_code": 200,
+            "node": payload.get("node"),
+            "response_text": reason,
+        }
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
@@ -355,7 +375,12 @@ def supabase_upsert_property(payload: dict) -> dict:
         if ok:
             log.info("SUPABASE UPSERT OK status=%s node=%s", r.status_code, payload.get("node"))
         else:
-            log.error("SUPABASE UPSERT FAILED status=%s node=%s body=%s", r.status_code, payload.get("node"), r.text[:600])
+            log.error(
+                "SUPABASE UPSERT FAILED status=%s node=%s body=%s",
+                r.status_code,
+                payload.get("node"),
+                r.text[:600],
+            )
 
         return {"sent": ok, "status_code": r.status_code, "node": payload.get("node"), "response_text": r.text[:1000]}
     except Exception as e:
@@ -524,24 +549,6 @@ def click_safe(page, selector, name, timeout=6000):
     return False
 
 
-def click_by_text_scan(page, texts: List[str], name: str) -> bool:
-    for text in texts:
-        selectors = [
-            f'text="{text}"',
-            f'text={text}',
-            f'button:has-text("{text}")',
-            f'a:has-text("{text}")',
-            f'span:has-text("{text}")',
-            f'div:has-text("{text}")',
-            f'li:has-text("{text}")',
-        ]
-        for sel in selectors:
-            if click_safe(page, sel, f"{name} [{text}]"):
-                return True
-
-    return False
-
-
 def open_dropdown(page):
     log.info("Opening Case Status (robust)...")
 
@@ -552,12 +559,11 @@ def open_dropdown(page):
                 const btn = document.querySelector('#filterButtonStatus');
                 if (!btn) return { ok: false, reason: 'button not found' };
 
+                btn.scrollIntoView({ block: 'center' });
                 const r = btn.getBoundingClientRect();
 
-                btn.scrollIntoView({ block: 'center' });
-
                 return {
-                    ok: true,
+                    ok: r.width > 0 && r.height > 0,
                     x: r.left + r.width / 2,
                     y: r.top + r.height / 2
                 };
@@ -566,12 +572,33 @@ def open_dropdown(page):
         )
 
         if not result.get("ok"):
+            log.warning("open_dropdown: button not found/visible: %s", result)
             return False
 
         page.mouse.click(result["x"], result["y"])
-        page.wait_for_timeout(10000)
+        stabilize(page, "open_dropdown", 10000)
 
-        return True
+        menu_state = page.evaluate(
+            """
+            () => {
+                const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
+                if (!menu) return { ok: false, reason: 'menu not found' };
+
+                const s = window.getComputedStyle(menu);
+                const r = menu.getBoundingClientRect();
+
+                return {
+                    ok: s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0,
+                    display: s.display,
+                    visibility: s.visibility,
+                    height: r.height
+                };
+            }
+            """
+        )
+
+        log.info("open_dropdown menu_state=%s", menu_state)
+        return bool(menu_state.get("ok"))
 
     except Exception as e:
         log.warning("open_dropdown failed: %s", e)
@@ -585,42 +612,74 @@ def force_select_active(page):
         """
         () => {
             const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
-            if (!menu) return { ok: false };
+            if (!menu) return { ok: false, reason: 'menu not found' };
+
+            menu.style.display = 'block';
+            menu.style.visibility = 'visible';
+            menu.style.opacity = '1';
+            menu.classList.add('show');
 
             const r = menu.getBoundingClientRect();
-
             return {
                 ok: r.width > 0 && r.height > 0,
                 left: r.left,
-                top: r.top
+                top: r.top,
+                width: r.width,
+                height: r.height
             };
         }
         """
     )
 
     if not data.get("ok"):
-        raise RuntimeError("Dropdown menu not found")
+        raise RuntimeError(f"Dropdown menu not found: {data}")
 
     x = data["left"] + 90
-    y = data["top"] + 80
+    y_candidates = [
+        data["top"] + 78,
+        data["top"] + 88,
+        data["top"] + 98,
+    ]
 
-    page.mouse.click(x, y)
-    page.wait_for_timeout(8000)
+    attempts = []
 
-    state = page.evaluate(
-        """
-        () => {
-            const hidden = document.querySelector('#filterCaseStatus');
-            return hidden ? hidden.value : '';
-        }
-        """
-    )
+    for y in y_candidates:
+        try:
+            page.mouse.click(x, y)
+            stabilize(page, f"select_active_xy_{int(y)}", 8000)
 
-    if not state:
-        raise RuntimeError("Active selection failed")
+            state = page.evaluate(
+                """
+                () => {
+                    const label = document.querySelector('#filterCaseStatusLabel');
+                    const hidden = document.querySelector('#filterCaseStatus');
+                    const trigger = document.querySelector('#filterButtonStatus');
 
-    log.info("ACTIVE selected with hidden=%s", state)
-    return state
+                    return {
+                        label: label ? label.innerText.trim() : '',
+                        hidden: hidden ? hidden.value : '',
+                        trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
+                    };
+                }
+                """
+            )
+
+            attempts.append({"x": x, "y": y, "state": state})
+
+            hidden_value = clean_text(state.get("hidden") or "")
+            if hidden_value == "192":
+                log.info("ACTIVE selected successfully with hidden=192 attempts=%s", attempts)
+                return {
+                    "ok": True,
+                    "result": {"x": x, "y": y, "menu": data},
+                    "state": state,
+                    "attempts": attempts,
+                }
+
+        except Exception as e:
+            attempts.append({"x": x, "y": y, "error": str(e)})
+
+    raise RuntimeError(f"Active selection failed. Attempts={attempts}")
 
 
 def get_filter_state(page):
@@ -712,8 +771,18 @@ def click_search_button(page) -> Dict:
             if loc.count() == 0:
                 continue
 
-            loc.click(force=True)
-            stabilize(page, "search", 15000)
+            try:
+                loc.click(force=True, timeout=6000)
+            except Exception:
+                page.evaluate(
+                    """(selector) => {
+                        const el = document.querySelector(selector);
+                        if (el) el.click();
+                    }""",
+                    sel,
+                )
+
+            stabilize(page, f"search_{sel}", 15000)
 
             body = page.locator("body").inner_text(timeout=5000)
             page_info = extract_cases(page)
@@ -736,7 +805,7 @@ def click_search_button(page) -> Dict:
         except Exception as e:
             log.warning("click_search %s -> %s", sel, e)
 
-    return {"ok": False, "selector": None, "rows": 0}
+    return {"ok": False, "selector": None, "rows": 0, "cases_found": 0}
 
 
 def wait_for_case_rows(page, timeout_ms=30000):
@@ -765,14 +834,11 @@ def run_search_flow(page):
         log.warning("RESET FILTERS not found; continuing without reset")
 
     if not open_dropdown(page):
+        dump_debug_artifacts(page, "miami_open_dropdown_failed")
         raise RuntimeError("Could not open Case Status dropdown")
 
-    active = select_exact_active(page)
+    active = force_select_active(page)
     log.info("ACTIVE selection result: %s", active)
-
-    if not active.get("ok"):
-        dump_debug_artifacts(page, "miami_active_click_failed")
-        raise RuntimeError(f"Could not select exact Active. Result={active}")
 
     hidden_value = clean_text(active.get("state", {}).get("hidden") or "")
     if hidden_value != "192":
@@ -963,8 +1029,13 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_fi
             first_text_changed = bool(old_first_row_text and new_first_row_text and new_first_row_text != old_first_row_text)
 
             if page_changed or first_case_changed or first_text_changed:
-                log.info("Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
-                         old_page, current, old_first_caseid, new_first_caseid)
+                log.info(
+                    "Miami page changed successfully: old_page=%s new_page=%s old_caseid=%s new_caseid=%s",
+                    old_page,
+                    current,
+                    old_first_caseid,
+                    new_first_caseid,
+                )
                 return True
         except Exception:
             pass
@@ -1143,6 +1214,7 @@ def click_next_page(page) -> bool:
                 if (!icon) return { ok: false, reason: 'icon not found' };
 
                 const parent = icon.closest('a,button,div,span,td,li') || icon;
+                const r = parent.getBoundingClientRect();
 
                 try { parent.scrollIntoView({ block: 'center' }); } catch(e) {}
                 try { parent.click(); } catch(e) {}
@@ -1153,7 +1225,9 @@ def click_next_page(page) -> bool:
                 return {
                     ok: true,
                     tag: parent.tagName.toLowerCase(),
-                    class_name: (parent.className || '').toString()
+                    class_name: (parent.className || '').toString(),
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2
                 };
             }
             """
@@ -1164,6 +1238,13 @@ def click_next_page(page) -> bool:
         if result and result.get("ok"):
             if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
                 return True
+
+            try:
+                page.mouse.click(result["x"], result["y"])
+                if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
+                    return True
+            except Exception:
+                pass
     except Exception as e:
         log.warning("NEXT click failed: %s", str(e))
 
@@ -1611,8 +1692,14 @@ def run_miami():
                 row_index = row.get("index")
                 total_processed_rows += 1
 
-                log.info("[row %s/%s] Evaluating caseid=%s page=%s row=%s ...",
-                         total_processed_rows, MAX_LOTS, caseid, page_num, row_index)
+                log.info(
+                    "[row %s/%s] Evaluating caseid=%s page=%s row=%s ...",
+                    total_processed_rows,
+                    MAX_LOTS,
+                    caseid,
+                    page_num,
+                    row_index,
+                )
 
                 try:
                     row_parsed = parse_row_text(row.get("row_text", ""))
@@ -1636,8 +1723,12 @@ def run_miami():
                         if same_identity:
                             if existing_sale_date == pre_sale_date:
                                 skipped_fast_same_sale_date += 1
-                                log.info("FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
-                                         caseid, pre_sale_date, existing_sale_date)
+                                log.info(
+                                    "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
+                                    caseid,
+                                    pre_sale_date,
+                                    existing_sale_date,
+                                )
                                 continue
 
                             update_result = supabase_update_sale_date(existing.get("id"), pre_sale_date)
