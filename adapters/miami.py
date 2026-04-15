@@ -788,73 +788,100 @@ def extract_cases(page):
 def click_search_button(page) -> Dict:
     log.info("Clicking Process Search...")
 
-    selectors = [
-        "button.filters-submit",
-        'button:has-text("Process Search")',
-        'text="Process Search"',
-    ]
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                function txt(el) {
+                    return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+                }
 
-    for sel in selectors:
-        try:
-            locator = page.locator(sel).first
-            if locator.count() == 0:
-                continue
+                const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
 
-            clicked = False
+                let btn =
+                    document.querySelector('button.filters-submit') ||
+                    candidates.find(el => txt(el) === 'Process Search') ||
+                    candidates.find(el => txt(el).includes('Process Search'));
 
-            try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                    locator.click(timeout=6000)
-                clicked = True
-                log.info("SEARCH BUTTON clicked with navigation: %s", sel)
-            except Exception:
-                try:
-                    locator.click(timeout=6000)
-                    clicked = True
-                    log.info("SEARCH BUTTON clicked (normal): %s", sel)
-                except Exception:
-                    try:
-                        locator.click(force=True, timeout=6000)
-                        clicked = True
-                        log.info("SEARCH BUTTON clicked (force): %s", sel)
-                    except Exception as e:
-                        log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
-                        continue
+                if (!btn) {
+                    return { ok: false, reason: 'Process Search button not found' };
+                }
 
-            if not clicked:
-                continue
+                const r = btn.getBoundingClientRect();
 
-            stabilize(page, f"search_{sel}", 15000)
+                try { btn.scrollIntoView({ block: 'center' }); } catch (e) {}
 
-            body = ""
-            try:
-                body = page.locator("body").inner_text(timeout=5000)
-            except Exception:
-                pass
+                try { btn.click(); } catch (e) {}
+                try { btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+                try { btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+                try { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
 
-            page_info = extract_cases(page)
-
-            success = (
-                page_info["count"] > 0
-                or "Found" in body
-                or "Cases List" in body
-                or "Page 1 of" in body
-                or "Page 1 of 13" in body
-            )
-
-            return {
-                "ok": success,
-                "selector": sel,
-                "rows": page_info["count"],
-                "cases_found": len(page_info["cases"]),
-                "body_sample": body[:1500],
+                return {
+                    ok: true,
+                    x: r.left + (r.width / 2),
+                    y: r.top + (r.height / 2),
+                    text: txt(btn),
+                    class_name: (btn.className || '').toString()
+                };
             }
+            """
+        )
 
-        except Exception as e:
-            log.warning("click_search unexpected failure %s -> %s", sel, e)
+        log.info("SEARCH BUTTON JS result: %s", result)
 
-    return {"ok": False, "selector": None, "rows": 0, "cases_found": 0}
+        if not result.get("ok"):
+            return {"ok": False, "selector": None, "rows": 0, "cases_found": 0, "reason": result.get("reason")}
 
+        stabilize(page, "search_js_click", 15000)
+
+        body = ""
+        try:
+            body = page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            pass
+
+        page_info = extract_cases(page)
+
+        success = (
+            page_info["count"] > 0
+            or "Found" in body
+            or "Cases List" in body
+            or "Page 1 of" in body
+        )
+
+        if not success:
+            try:
+                page.mouse.click(result["x"], result["y"])
+                stabilize(page, "search_mouse_click", 15000)
+
+                body = ""
+                try:
+                    body = page.locator("body").inner_text(timeout=5000)
+                except Exception:
+                    pass
+
+                page_info = extract_cases(page)
+
+                success = (
+                    page_info["count"] > 0
+                    or "Found" in body
+                    or "Cases List" in body
+                    or "Page 1 of" in body
+                )
+            except Exception as e:
+                log.warning("SEARCH BUTTON mouse fallback failed: %s", e)
+
+        return {
+            "ok": success,
+            "selector": "js_process_search",
+            "rows": page_info["count"],
+            "cases_found": len(page_info["cases"]),
+            "body_sample": body[:1500],
+        }
+
+    except Exception as e:
+        log.warning("click_search_button failed: %s", e)
+        return {"ok": False, "selector": None, "rows": 0, "cases_found": 0, "reason": str(e)}
 
 def wait_for_case_rows(page, timeout_ms=30000):
     log.info("Waiting for Miami search results...")
@@ -909,12 +936,6 @@ def run_search_flow(page):
         raise RuntimeError(f"Could not search successfully. Result={search}")
 
     wait_for_case_rows(page)
-def open_list_and_apply_filter(page):
-    page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
-    stabilize(page, "initial_load", 15000)
-    humanize(page)
-    run_search_flow(page)
-
 
 # =========================
 # PAGINATION
