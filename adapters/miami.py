@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -31,6 +32,10 @@ PAGINATION_DIAGNOSTIC_MODE = os.getenv("MIAMI_PAGINATION_DIAGNOSTIC_MODE", "fals
 # =========================
 # BASIC HELPERS
 # =========================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -86,56 +91,52 @@ def payload_quality_score(payload: dict) -> int:
         "auction_source_url",
         "opening_bid",
         "deed_status",
+        "applicant_name",
     ]
     return sum(1 for f in fields if payload.get(f) not in (None, "", [], {}))
 
 
-def wait_long(page, ms=15000):
-    page.wait_for_timeout(ms)
+def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
+    new_score = payload_quality_score(payload)
+    old_score = payload_quality_score(existing)
+
+    if new_score > old_score:
+        return True
+
+    important_fields = [
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "pdf_url",
+        "auction_source_url",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+    ]
+
+    for f in important_fields:
+        old_val = clean_text(existing.get(f) or "")
+        new_val = clean_text(payload.get(f) or "")
+        if not old_val and new_val:
+            return True
+
+    return False
 
 
-def stabilize(page, label="", ms=12000):
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:
-        pass
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-
-    wait_long(page, ms)
-    log.info("Stabilized: %s", label)
-
-
-def dump_debug_artifacts(page, prefix: str):
-    try:
-        page.screenshot(path=f"{prefix}.png", full_page=True)
-        log.info("Saved screenshot: %s.png", prefix)
-    except Exception as e:
-        log.warning("Could not save screenshot %s.png: %s", prefix, str(e))
-
-    try:
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.info("Saved html: %s.html", prefix)
-    except Exception as e:
-        log.warning("Could not save html %s.html: %s", prefix, str(e))
-
-
-def humanize(page):
-    try:
-        page.mouse.move(250, 220)
-        page.wait_for_timeout(300)
-        page.mouse.move(520, 360)
-        page.wait_for_timeout(500)
-        page.mouse.wheel(0, 350)
-        page.wait_for_timeout(700)
-        page.mouse.wheel(0, -180)
-        page.wait_for_timeout(400)
-    except Exception:
-        pass
+def record_needs_enrichment(existing: dict) -> bool:
+    important_fields = [
+        "pdf_url",
+        "address",
+        "city",
+        "state_address",
+        "zip",
+        "opening_bid",
+        "deed_status",
+        "applicant_name",
+        "auction_source_url",
+    ]
+    return any(not clean_text(existing.get(f) or "") for f in important_fields)
 
 
 # =========================
@@ -173,189 +174,230 @@ def sb_headers():
     }
 
 
-def supabase_find_existing_case(node: str):
-    if not CAN_CHECK_SUPABASE or not node:
-        return None
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.Miami-Dade"
-        f"&node=eq.{quote(str(node), safe='')}"
-        f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
-
-    try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
-        log.warning("supabase_find_existing_case non-200 status=%s body=%s", r.status_code, r.text[:300])
-    except Exception as e:
-        log.warning("supabase_find_existing_case failed: %s", str(e))
-
-    return None
-
-
-def supabase_find_existing_property(parcel_number: str, sale_date: str):
-    if not CAN_CHECK_SUPABASE or not parcel_number or not sale_date:
-        return None
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/properties"
-        f"?county=eq.Miami-Dade"
-        f"&parcel_number=eq.{quote(str(parcel_number), safe='')}"
-        f"&sale_date=eq.{quote(str(sale_date), safe='')}"
-        f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-        f"&limit=1"
-    )
-
-    try:
-        r = requests.get(url, headers=sb_headers(), timeout=30)
-        if r.status_code == 200:
-            arr = r.json()
-            return arr[0] if arr else None
-        log.warning("supabase_find_existing_property non-200 status=%s body=%s", r.status_code, r.text[:300])
-    except Exception as e:
-        log.warning("supabase_find_existing_property failed: %s", str(e))
-
-    return None
-
-
-def supabase_fetch_existing_cases_by_nodes(nodes: List[str]) -> Dict[str, dict]:
+def supabase_fetch_all_miami_records() -> List[dict]:
     if not CAN_CHECK_SUPABASE:
-        return {}
+        return []
 
-    clean_nodes = [str(x).strip() for x in nodes if str(x).strip()]
-    if not clean_nodes:
-        return {}
+    all_rows = []
+    offset = 0
+    page_size = 1000
 
-    results = {}
-    batch_size = 100
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/properties"
+            f"?county=eq.Miami-Dade"
+            f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,"
+            f"pdf_url,auction_source_url,opening_bid,deed_status,applicant_name,is_active,removed_at"
+            f"&offset={offset}"
+            f"&limit={page_size}"
+        )
 
-    for i in range(0, len(clean_nodes), batch_size):
-        batch = clean_nodes[i:i + batch_size]
         try:
-            quoted_nodes = ",".join(f'"{quote(node, safe="")}"' for node in batch)
-            url = (
-                f"{SUPABASE_URL}/rest/v1/properties"
-                f"?county=eq.Miami-Dade"
-                f"&node=in.({quoted_nodes})"
-                f"&select=id,node,tax_sale_id,parcel_number,sale_date,address,city,state_address,zip,pdf_url,auction_source_url,opening_bid,deed_status,applicant_name"
-                f"&limit={len(batch)}"
-            )
-
-            r = requests.get(url, headers=sb_headers(), timeout=30)
+            r = requests.get(url, headers=sb_headers(), timeout=60)
             if r.status_code != 200:
-                log.warning(
-                    "supabase_fetch_existing_cases_by_nodes non-200 status=%s body=%s",
-                    r.status_code,
-                    r.text[:500],
-                )
-                continue
+                log.warning("supabase_fetch_all_miami_records failed status=%s body=%s", r.status_code, r.text[:500])
+                break
 
             arr = r.json() or []
-            for item in arr:
-                node = str(item.get("node") or "").strip()
-                if node:
-                    results[node] = item
+            if not arr:
+                break
+
+            all_rows.extend(arr)
+
+            if len(arr) < page_size:
+                break
+
+            offset += page_size
 
         except Exception as e:
-            log.warning("supabase_fetch_existing_cases_by_nodes batch failed: %s", str(e))
+            log.warning("supabase_fetch_all_miami_records exception: %s", str(e))
+            break
 
-    return results
+    log.info("Loaded %s Miami records from Supabase", len(all_rows))
+    return all_rows
+
+
+def build_supabase_indexes(rows: List[dict]) -> Dict[str, Dict]:
+    by_node = {}
+    by_tax_sale_parcel = {}
+
+    for row in rows:
+        node = clean_text(row.get("node") or "")
+        tax_sale_id = clean_text(row.get("tax_sale_id") or "")
+        parcel_number = clean_text(row.get("parcel_number") or "")
+
+        if node:
+            by_node[node] = row
+
+        if tax_sale_id and parcel_number:
+            by_tax_sale_parcel[(tax_sale_id, parcel_number)] = row
+
+    return {
+        "by_node": by_node,
+        "by_tax_sale_parcel": by_tax_sale_parcel,
+    }
 
 
 def supabase_update_sale_date(record_id: str, sale_date: Optional[str]) -> dict:
-    if not CAN_CHECK_SUPABASE:
-        return {"sent": False, "status_code": None, "response_text": "SUPABASE not configured"}
-    if not record_id:
-        return {"sent": False, "status_code": None, "response_text": "Missing record id"}
+    if not CAN_CHECK_SUPABASE or not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "record_id": record_id,
+            "response_text": "missing config or record id",
+        }
 
     url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
     headers = sb_headers()
     headers["Prefer"] = "return=representation"
 
-    payload = {"sale_date": sale_date}
+    payload = {
+        "sale_date": sale_date,
+        "updated_at": now_iso(),
+        "is_active": True,
+        "removed_at": None,
+    }
 
     try:
         r = requests.patch(url, headers=headers, json=payload, timeout=20)
         ok = r.status_code in (200, 204)
 
         if ok:
-            log.info("SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s", record_id, sale_date, r.status_code)
+            log.info(
+                "SUPABASE SALE_DATE UPDATE OK id=%s sale_date=%s status=%s",
+                record_id,
+                sale_date,
+                r.status_code,
+            )
         else:
-            log.warning("SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s", record_id, r.status_code, r.text[:500])
+            log.warning(
+                "SUPABASE SALE_DATE UPDATE FAILED id=%s status=%s body=%s",
+                record_id,
+                r.status_code,
+                r.text[:500],
+            )
 
-        return {"sent": ok, "status_code": r.status_code, "response_text": r.text[:1000]}
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
+
     except Exception as e:
         log.warning("SUPABASE SALE_DATE UPDATE EXCEPTION id=%s error=%s", record_id, str(e))
-        return {"sent": False, "status_code": None, "response_text": str(e)}
+        return {
+            "sent": False,
+            "status_code": None,
+            "record_id": record_id,
+            "response_text": str(e),
+        }
 
 
-def payload_is_better_than_existing(payload: dict, existing: dict) -> bool:
-    new_score = payload_quality_score(payload)
-    old_score = payload_quality_score(existing)
-
-    if new_score > old_score:
-        return True
-
-    for f in ["address", "city", "state_address", "zip", "pdf_url", "auction_source_url"]:
-        old_val = (existing.get(f) or "").strip() if existing.get(f) else ""
-        new_val = (payload.get(f) or "").strip() if payload.get(f) else ""
-        if not old_val and new_val:
-            return True
-
-    return False
-
-
-def should_send_payload(payload: dict):
-    node = payload.get("node")
-    parcel = payload.get("parcel_number")
-    sale_date = payload.get("sale_date")
-
-    existing_case = supabase_find_existing_case(node)
-    if existing_case:
-        if payload_is_better_than_existing(payload, existing_case):
-            return True, "existing node found, but new payload is better"
-        return False, "duplicate node already exists"
-
-    existing_prop = supabase_find_existing_property(parcel, sale_date)
-    if existing_prop:
-        if payload_is_better_than_existing(payload, existing_prop):
-            return True, "existing parcel_number + sale_date found, but new payload is better"
-        return False, "duplicate parcel_number + sale_date already exists"
-
-    return True, "new record"
-
-
-def supabase_upsert_property(payload: dict) -> dict:
+def supabase_insert_property(payload: dict) -> dict:
     if not CAN_CHECK_SUPABASE:
-        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": "SUPABASE not configured"}
-
-    should_send, reason = should_send_payload(payload)
-    log.info("SUPABASE DEDUP node=%s => %s", payload.get("node"), reason)
-
-    if not should_send:
-        return {"sent": False, "status_code": 200, "node": payload.get("node"), "response_text": reason}
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": None,
+            "response_text": "SUPABASE not configured",
+        }
 
     url = f"{SUPABASE_URL}/rest/v1/properties"
     headers = sb_headers()
-    headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    headers["Prefer"] = "return=representation"
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         ok = r.status_code in (200, 201)
 
-        if ok:
-            log.info("SUPABASE UPSERT OK status=%s node=%s", r.status_code, payload.get("node"))
-        else:
-            log.error("SUPABASE UPSERT FAILED status=%s node=%s body=%s", r.status_code, payload.get("node"), r.text[:600])
+        record_id = None
+        try:
+            body = r.json()
+            if isinstance(body, list) and body:
+                record_id = body[0].get("id")
+        except Exception:
+            pass
 
-        return {"sent": ok, "status_code": r.status_code, "node": payload.get("node"), "response_text": r.text[:1000]}
+        if ok:
+            log.info("SUPABASE INSERT OK node=%s status=%s id=%s", payload.get("node"), r.status_code, record_id)
+        else:
+            log.error(
+                "SUPABASE INSERT FAILED status=%s node=%s body=%s",
+                r.status_code,
+                payload.get("node"),
+                r.text[:600],
+            )
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
     except Exception as e:
-        log.exception("SUPABASE UPSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
-        return {"sent": False, "status_code": None, "node": payload.get("node"), "response_text": str(e)}
+        log.exception("SUPABASE INSERT EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": None,
+            "response_text": str(e),
+        }
+
+
+def supabase_update_property(record_id: str, payload: dict) -> dict:
+    if not CAN_CHECK_SUPABASE or not record_id:
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": "missing config or record id",
+        }
+
+    url = f"{SUPABASE_URL}/rest/v1/properties?id=eq.{quote(str(record_id), safe='')}"
+    headers = sb_headers()
+    headers["Prefer"] = "return=representation"
+
+    try:
+        r = requests.patch(url, headers=headers, json=payload, timeout=30)
+        ok = r.status_code in (200, 204)
+
+        if ok:
+            log.info("SUPABASE PATCH OK id=%s node=%s status=%s", record_id, payload.get("node"), r.status_code)
+        else:
+            log.error(
+                "SUPABASE PATCH FAILED status=%s node=%s body=%s",
+                r.status_code,
+                payload.get("node"),
+                r.text[:600],
+            )
+
+        return {
+            "sent": ok,
+            "status_code": r.status_code,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": r.text[:1000],
+        }
+    except Exception as e:
+        log.exception("SUPABASE PATCH EXCEPTION node=%s error=%s", payload.get("node"), str(e))
+        return {
+            "sent": False,
+            "status_code": None,
+            "node": payload.get("node"),
+            "record_id": record_id,
+            "response_text": str(e),
+        }
+
+
+def supabase_save_property(payload: dict, existing: dict | None) -> dict:
+    if existing and existing.get("id"):
+        return supabase_update_property(existing["id"], payload)
+    return supabase_insert_property(payload)
 
 
 def supabase_list_all_nodes() -> List[str]:
@@ -377,8 +419,13 @@ def supabase_list_all_nodes() -> List[str]:
             )
 
             r = requests.get(url, headers=sb_headers(), timeout=60)
+
             if r.status_code != 200:
-                log.warning("supabase_list_all_nodes non-200 status=%s body=%s", r.status_code, r.text[:500])
+                log.warning(
+                    "supabase_list_all_nodes non-200 status=%s body=%s",
+                    r.status_code,
+                    r.text[:500],
+                )
                 break
 
             arr = r.json() or []
@@ -394,6 +441,7 @@ def supabase_list_all_nodes() -> List[str]:
                 break
 
             offset += page_size
+
     except Exception as e:
         log.warning("supabase_list_all_nodes failed: %s", str(e))
 
@@ -402,11 +450,19 @@ def supabase_list_all_nodes() -> List[str]:
 
 def supabase_delete_nodes(nodes: List[str]) -> Dict:
     if not CAN_CHECK_SUPABASE:
-        return {"executed": False, "deleted_count": 0, "reason": "SUPABASE not configured"}
+        return {
+            "executed": False,
+            "deleted_count": 0,
+            "reason": "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured",
+        }
 
     nodes = [str(x).strip() for x in nodes if str(x).strip()]
     if not nodes:
-        return {"executed": True, "deleted_count": 0, "reason": "no nodes to delete"}
+        return {
+            "executed": True,
+            "deleted_count": 0,
+            "reason": "no nodes to delete",
+        }
 
     deleted_count = 0
     errors = []
@@ -417,9 +473,15 @@ def supabase_delete_nodes(nodes: List[str]) -> Dict:
 
         try:
             in_clause = ",".join(f'"{quote(node, safe="")}"' for node in batch)
-            url = f"{SUPABASE_URL}/rest/v1/properties?county=eq.Miami-Dade&node=in.({in_clause})"
+
+            url = (
+                f"{SUPABASE_URL}/rest/v1/properties"
+                f"?county=eq.Miami-Dade"
+                f"&node=in.({in_clause})"
+            )
 
             r = requests.delete(url, headers=sb_headers(), timeout=60)
+
             if r.status_code in (200, 204):
                 deleted_count += len(batch)
                 log.info("SUPABASE DELETE batch ok count=%s", len(batch))
@@ -427,21 +489,34 @@ def supabase_delete_nodes(nodes: List[str]) -> Dict:
                 msg = f"status={r.status_code} body={r.text[:500]}"
                 errors.append(msg)
                 log.warning("SUPABASE DELETE batch failed: %s", msg)
+
         except Exception as e:
             msg = str(e)
             errors.append(msg)
             log.warning("SUPABASE DELETE batch exception: %s", msg)
 
-    return {"executed": True, "deleted_count": deleted_count, "requested_delete_count": len(nodes), "errors": errors}
+    return {
+        "executed": True,
+        "deleted_count": deleted_count,
+        "requested_delete_count": len(nodes),
+        "errors": errors,
+    }
 
 
 def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
     try:
         existing_nodes = set(supabase_list_all_nodes())
         site_nodes = {str(x).strip() for x in seen_nodes_this_run if str(x).strip()}
+
         to_delete = sorted(existing_nodes - site_nodes)
 
-        log.info("RECONCILE MIAMI: supabase=%s site=%s delete=%s", len(existing_nodes), len(site_nodes), len(to_delete))
+        log.info(
+            "RECONCILE MIAMI: supabase=%s site=%s delete=%s",
+            len(existing_nodes),
+            len(site_nodes),
+            len(to_delete),
+        )
+
         delete_result = supabase_delete_nodes(to_delete)
 
         return {
@@ -452,14 +527,49 @@ def reconcile_supabase_to_site(seen_nodes_this_run: set) -> Dict:
             "delete_candidates_sample": to_delete[:50],
             "delete_result": delete_result,
         }
+
     except Exception as e:
         log.exception("reconcile_supabase_to_site failed: %s", str(e))
-        return {"executed": False, "reason": str(e)}
+        return {
+            "executed": False,
+            "reason": str(e),
+        }
 
 
 # =========================
-# UI / FILTER / SEARCH
+# UI HELPERS
 # =========================
+def click_safe(page, selector, name, timeout=6000):
+    try:
+        page.click(selector, timeout=timeout)
+        log.info("%s clicked (normal)", name)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.locator(selector).first.click(force=True, timeout=timeout)
+        log.info("%s clicked (force)", name)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) throw new Error(`not found: ${sel}`);
+                el.click();
+            }""",
+            selector,
+        )
+        log.info("%s clicked (JS fallback)", name)
+        return True
+    except Exception as e:
+        log.error("%s FAILED: %s", name, e)
+        return False
+
+
 def click_element_handle_safe(el, page, name):
     try:
         el.click(timeout=6000)
@@ -484,458 +594,224 @@ def click_element_handle_safe(el, page, name):
         return False
 
 
-def click_safe(page, selector, name, timeout=6000):
-    try:
-        page.locator(selector).first.click(timeout=timeout)
-        log.info("%s clicked (locator): %s", name, selector)
-        return True
-    except Exception:
-        pass
-
-    try:
-        page.locator(selector).first.click(force=True, timeout=timeout)
-        log.info("%s clicked (force): %s", name, selector)
-        return True
-    except Exception:
-        pass
-
-    try:
-        clicked = page.evaluate(
-            """(sel) => {
-                const el = document.querySelector(sel);
-                if (!el) return false;
-                el.click();
-                return true;
-            }""",
-            selector,
-        )
-        if clicked:
-            log.info("%s clicked (JS): %s", name, selector)
-            return True
-    except Exception:
-        pass
-
-    log.warning("%s not found/clickable: %s", name, selector)
-    return False
-
-
-def open_dropdown(page):
-    log.info("Opening Case Status (robust fallback)...")
-
-    selectors = [
-        "#filterButtonStatus",
-        'button:has-text("Case Status")',
-        'text="Case Status"',
-        'text="Select One or More Statuses..."',
-    ]
-
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
-
-            try:
-                loc.scroll_into_view_if_needed(timeout=4000)
-            except Exception:
-                pass
-
-            try:
-                loc.click(timeout=4000)
-            except Exception:
-                try:
-                    loc.click(force=True, timeout=4000)
-                except Exception:
-                    continue
-
-            stabilize(page, f"open_dropdown_{sel}", 10000)
-
-            menu_state = page.evaluate(
-                """
-                () => {
-                    const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
-                    for (const menu of menus) {
-                        const s = window.getComputedStyle(menu);
-                        const r = menu.getBoundingClientRect();
-                        if (s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0) {
-                            return {
-                                ok: true,
-                                display: s.display,
-                                visibility: s.visibility,
-                                height: r.height,
-                                text: (menu.innerText || '').slice(0, 500)
-                            };
-                        }
-                    }
-                    return { ok: false, reason: 'visible menu not found' };
-                }
-                """
-            )
-
-            log.info("open_dropdown selector=%s menu_state=%s", sel, menu_state)
-            if menu_state.get("ok"):
-                return True
-
-        except Exception as e:
-            log.warning("open_dropdown selector=%s failed: %s", sel, e)
-
-    try:
-        js_result = page.evaluate(
-            """
-            () => {
-                function txt(el) {
-                    return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-                }
-
-                const all = Array.from(document.querySelectorAll('button, a, div, span, label'));
-                const target =
-                    all.find(el => txt(el) === 'Case Status') ||
-                    all.find(el => txt(el).includes('Case Status')) ||
-                    all.find(el => txt(el).includes('Select One or More Statuses'));
-
-                if (!target) return { ok: false, reason: 'text target not found' };
-
-                try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
-                try { target.click(); } catch (e) {}
-                try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
-                try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
-                try { target.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
-
-                const menus = Array.from(document.querySelectorAll('.dropdown-menu.public, .dropdown-menu'));
-                for (const menu of menus) {
-                    const s = window.getComputedStyle(menu);
-                    const r = menu.getBoundingClientRect();
-                    if (s.display !== 'none' && s.visibility !== 'hidden' && r.height > 0) {
-                        return {
-                            ok: true,
-                            clicked_text: txt(target),
-                            menu_height: r.height
-                        };
-                    }
-                }
-
-                return {
-                    ok: false,
-                    clicked_text: txt(target),
-                    reason: 'clicked but menu did not open'
-                };
-            }
-            """
-        )
-
-        log.info("open_dropdown js_result=%s", js_result)
-        if js_result.get("ok"):
-            stabilize(page, "open_dropdown_js", 10000)
-            return True
-
-    except Exception as e:
-        log.warning("open_dropdown js fallback failed: %s", e)
-
-    return False
-
-
-def force_select_active(page):
-    log.info("Selecting Active (fixed XY from working version)...")
-
-    data = page.evaluate(
+def force_clear_all_active_statuses(page):
+    page.evaluate(
         """
         () => {
-            const menu = document.querySelector('.dropdown-menu.public, .dropdown-menu');
-            if (!menu) return { ok: false, reason: 'menu not found' };
+            const children = document.querySelectorAll('a.filter-status-nosub.status-sub[data-parentid="2"]');
+            children.forEach(el => {
+                el.classList.remove('selected');
+                const icon = el.querySelector('i');
+                if (icon) {
+                    icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    icon.className = (icon.className + ' icon-circle-blank').trim();
+                }
+            });
 
-            menu.style.display = 'block';
-            menu.style.visibility = 'visible';
-            menu.style.opacity = '1';
-            menu.classList.add('show');
+            const parent = document.querySelector('#caseStatus2');
+            if (parent) {
+                parent.classList.remove('selected');
+                const picon = parent.querySelector('i');
+                if (picon) {
+                    picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    picon.className = (picon.className + ' icon-circle-blank').trim();
+                }
+            }
 
-            const r = menu.getBoundingClientRect();
-            return {
-                ok: r.width > 0 && r.height > 0,
-                left: r.left,
-                top: r.top,
-                width: r.width,
-                height: r.height
-            };
+            const hidden = document.querySelector('#filterCaseStatus');
+            if (hidden) hidden.value = '';
+
+            const label = document.querySelector('#filterCaseStatusLabel');
+            if (label) label.innerText = 'None Selected';
         }
         """
     )
+    log.info("Cleared UI + hidden filterCaseStatus")
 
-    if not data.get("ok"):
-        raise RuntimeError(f"Dropdown menu not found: {data}")
 
-    x = data["left"] + 90
-    y_candidates = [
-        data["top"] + 78,
-        data["top"] + 88,
-        data["top"] + 98,
-    ]
+def force_select_only_192(page):
+    page.evaluate(
+        """
+        () => {
+            const el = document.querySelector('a.filter-status-nosub.status-sub[data-statusid="192"][data-parentid="2"]');
+            if (!el) throw new Error("Status 192 not found");
 
-    attempts = []
+            el.classList.add('selected');
 
-    for y in y_candidates:
-        try:
-            page.mouse.click(x, y)
-            stabilize(page, f"select_active_xy_{int(y)}", 8000)
+            const icon = el.querySelector('i');
+            if (icon) {
+                icon.className = icon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                icon.className = icon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                icon.className = (icon.className + ' icon-ok-sign').trim();
+            }
 
-            state = page.evaluate(
-                """
-                () => {
-                    const label = document.querySelector('#filterCaseStatusLabel');
-                    const hidden = document.querySelector('#filterCaseStatus');
-                    const trigger = document.querySelector('#filterButtonStatus');
-
-                    return {
-                        label: label ? label.innerText.trim() : '',
-                        hidden: hidden ? hidden.value : '',
-                        trigger_text: trigger ? ((trigger.innerText || '').replace(/\\s+/g, ' ').trim()) : ''
-                    };
+            const parent = document.querySelector('#caseStatus2');
+            if (parent) {
+                parent.classList.add('selected');
+                const picon = parent.querySelector('i');
+                if (picon) {
+                    picon.className = picon.className.replace(/\\bicon-circle-blank\\b/g, '').trim();
+                    picon.className = picon.className.replace(/\\bicon-ok-sign\\b/g, '').trim();
+                    picon.className = (picon.className + ' icon-ok-sign').trim();
                 }
-                """
-            )
+            }
 
-            attempts.append({"x": x, "y": y, "state": state})
+            const hidden = document.querySelector('#filterCaseStatus');
+            if (hidden) hidden.value = '192';
 
-            hidden_value = clean_text(state.get("hidden") or "")
-            if hidden_value == "192":
-                log.info("ACTIVE selected successfully with hidden=192 attempts=%s", attempts)
-                return {
-                    "ok": True,
-                    "result": {"x": x, "y": y, "menu": data},
-                    "state": state,
-                    "attempts": attempts,
-                }
-
-        except Exception as e:
-            attempts.append({"x": x, "y": y, "error": str(e)})
-
-    raise RuntimeError(f"Active selection failed. Attempts={attempts}")
+            const label = document.querySelector('#filterCaseStatusLabel');
+            if (label) label.innerText = '1 Selected';
+        }
+        """
+    )
+    log.info("Forced UI + hidden filterCaseStatus=192")
 
 
 def get_filter_state(page):
     return page.evaluate(
         """
         () => {
+            const selected192 = document.querySelector('a[data-statusid="192"][data-parentid="2"]');
             const hidden = document.querySelector('#filterCaseStatus');
             const label = document.querySelector('#filterCaseStatusLabel');
-            const selected = Array.from(document.querySelectorAll('.selected,[aria-selected="true"]'))
-                .map(el => ((el.innerText || '').replace(/\\s+/g, ' ').trim()))
-                .filter(Boolean)
-                .slice(0, 30);
-
             return {
                 label: (label?.innerText || '').trim(),
                 hidden_filterCaseStatus: hidden ? hidden.value : '',
-                selected_items: selected
+                selected192_class: selected192 ? selected192.className : ''
             };
         }
         """
     )
 
 
-def extract_cases(page):
-    data = page.evaluate(
-        """
-        () => {
-            function txt(el) {
-                return ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ')).trim();
-            }
-
-            const selectors = [
-                'tr[data-caseid]',
-                'tr.load-case',
-                'table tbody tr',
-                'tbody tr'
-            ];
-
-            let rows = [];
-            for (const sel of selectors) {
-                const found = Array.from(document.querySelectorAll(sel));
-                if (found.length > 0) {
-                    rows = found;
-                    break;
-                }
-            }
-
-            const parsed = rows.map((row, idx) => {
-                const text = txt(row);
-                const caseId = row.getAttribute('data-caseid') || '';
-                const m = text.match(/\\b(\\d{4}A\\d{5})\\b/);
-
-                return {
-                    index: idx,
-                    caseid: caseId,
-                    text,
-                    case_number: m ? m[1] : ''
-                };
-            });
-
-            return {
-                rows_count: parsed.length,
-                cases: parsed.map(x => x.case_number).filter(Boolean),
-                rows_sample: parsed.slice(0, 20)
-            };
-        }
-        """
-    )
-
-    return {
-        "count": data["rows_count"],
-        "cases": data["cases"],
-        "rows_sample": data["rows_sample"],
-    }
-
-
-def click_search_button(page) -> Dict:
-    log.info("Clicking Process Search...")
-
-    try:
-        result = page.evaluate(
-            """
-            () => {
-                function txt(el) {
-                    return ((el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
-                }
-
-                const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
-
-                let btn =
-                    document.querySelector('button.filters-submit') ||
-                    candidates.find(el => txt(el) === 'Process Search') ||
-                    candidates.find(el => txt(el).includes('Process Search'));
-
-                if (!btn) {
-                    return { ok: false, reason: 'Process Search button not found' };
-                }
-
-                const r = btn.getBoundingClientRect();
-
-                try { btn.scrollIntoView({ block: 'center' }); } catch (e) {}
-
-                try { btn.click(); } catch (e) {}
-                try { btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
-                try { btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
-                try { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) {}
-
-                return {
-                    ok: true,
-                    x: r.left + (r.width / 2),
-                    y: r.top + (r.height / 2),
-                    text: txt(btn),
-                    class_name: (btn.className || '').toString()
-                };
-            }
-            """
-        )
-
-        log.info("SEARCH BUTTON JS result: %s", result)
-
-        if not result.get("ok"):
-            return {"ok": False, "selector": None, "rows": 0, "cases_found": 0, "reason": result.get("reason")}
-
-        stabilize(page, "search_js_click", 15000)
-
-        body = ""
-        try:
-            body = page.locator("body").inner_text(timeout=5000)
-        except Exception:
-            pass
-
-        page_info = extract_cases(page)
-
-        success = (
-            page_info["count"] > 0
-            or "Found" in body
-            or "Cases List" in body
-            or "Page 1 of" in body
-        )
-
-        if not success:
-            try:
-                page.mouse.click(result["x"], result["y"])
-                stabilize(page, "search_mouse_click", 15000)
-
-                body = ""
-                try:
-                    body = page.locator("body").inner_text(timeout=5000)
-                except Exception:
-                    pass
-
-                page_info = extract_cases(page)
-
-                success = (
-                    page_info["count"] > 0
-                    or "Found" in body
-                    or "Cases List" in body
-                    or "Page 1 of" in body
-                )
-            except Exception as e:
-                log.warning("SEARCH BUTTON mouse fallback failed: %s", e)
-
-        return {
-            "ok": success,
-            "selector": "js_process_search",
-            "rows": page_info["count"],
-            "cases_found": len(page_info["cases"]),
-            "body_sample": body[:1500],
-        }
-
-    except Exception as e:
-        log.warning("click_search_button failed: %s", e)
-        return {"ok": False, "selector": None, "rows": 0, "cases_found": 0, "reason": str(e)}
-
-def wait_for_case_rows(page, timeout_ms=30000):
+def wait_for_case_rows(page, timeout_ms=25000):
     log.info("Waiting for Miami search results...")
     waited = 0
     step = 1000
     while waited < timeout_ms:
-        page_info = extract_cases(page)
-        if page_info["count"] > 0:
-            log.info("Rows after search: %s", page_info["count"])
-            return page_info["count"]
+        rows = page.locator('tr.load-case.table-row.link[data-caseid]').count()
+        if rows > 0:
+            log.info("Rows after search: %s", rows)
+            return rows
         page.wait_for_timeout(step)
         waited += step
 
-    dump_debug_artifacts(page, "miami_no_rows_after_search")
     raise RuntimeError("No case rows found after Miami search")
+
+
+def click_search_button(page) -> bool:
+    selectors = [
+        "button.filters-submit",
+        "text=Search",
+        "button:has-text('Search')",
+    ]
+
+    for sel in selectors:
+        try:
+            locator = page.locator(sel).first
+            if locator.count() == 0:
+                continue
+
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    locator.click(timeout=6000)
+                log.info("SEARCH BUTTON clicked with navigation: %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                locator.click(timeout=6000)
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (normal): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                locator.click(force=True, timeout=6000)
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (force): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    page.evaluate(
+                        """(selector) => {
+                            const el = document.querySelector(selector);
+                            if (!el) throw new Error('search button not found');
+                            el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            el.click();
+                        }""",
+                        sel,
+                    )
+                log.info("SEARCH BUTTON clicked (JS + navigation): %s", sel)
+                return True
+            except Exception:
+                pass
+
+            try:
+                page.evaluate(
+                    """(selector) => {
+                        const el = document.querySelector(selector);
+                        if (!el) throw new Error('search button not found');
+                        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        el.click();
+                    }""",
+                    sel,
+                )
+                page.wait_for_timeout(3000)
+                log.info("SEARCH BUTTON clicked (JS fallback): %s", sel)
+                return True
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.warning("SEARCH BUTTON selector failed %s: %s", sel, str(e))
+
+    log.error("SEARCH BUTTON FAILED")
+    return False
 
 
 def run_search_flow(page):
     log.info("Running Miami ACTIVE-only flow...")
 
-    reset_ok = click_safe(page, "a.filters-reset", "RESET FILTERS")
-    if reset_ok:
-        page.wait_for_timeout(1200)
-    else:
-        log.warning("RESET FILTERS not found; continuing without reset")
+    if not click_safe(page, "a.filters-reset", "RESET FILTERS"):
+        raise RuntimeError("Could not reset filters")
+    page.wait_for_timeout(1500)
 
-    if not open_dropdown(page):
-        dump_debug_artifacts(page, "miami_open_dropdown_failed")
-        body = ""
-        try:
-            body = page.locator("body").inner_text(timeout=5000)
-        except Exception:
-            pass
-        raise RuntimeError(f"Could not open Case Status dropdown. body_sample={body[:1200]}")
+    if not click_safe(page, "#filterButtonStatus", "FILTER BUTTON"):
+        raise RuntimeError("Could not open filter button")
+    page.wait_for_timeout(1000)
 
-    active = force_select_active(page)
-    log.info("ACTIVE selection result: %s", active)
+    force_clear_all_active_statuses(page)
+    page.wait_for_timeout(400)
 
-    hidden_value = clean_text(active.get("state", {}).get("hidden") or "")
-    if hidden_value != "192":
-        dump_debug_artifacts(page, "miami_active_not_192")
-        raise RuntimeError(f"Active filter did not stick as 192. Result={active}")
+    force_select_only_192(page)
+    page.wait_for_timeout(800)
 
     state = get_filter_state(page)
     log.info("SEARCH STATE BEFORE SUBMIT: %s", state)
 
-    search = click_search_button(page)
-    log.info("SEARCH CLICK RESULT: %s", search)
-
-    if not search.get("ok"):
-        dump_debug_artifacts(page, "miami_search_click_failed")
-        raise RuntimeError(f"Could not search successfully. Result={search}")
+    if not click_search_button(page):
+        raise RuntimeError("Could not click search")
 
     wait_for_case_rows(page)
+
+
+def open_list_and_apply_filter(page):
+    page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(6000)
+    run_search_flow(page)
+
 
 # =========================
 # PAGINATION
@@ -945,18 +821,18 @@ def get_results_summary(page) -> Dict:
         """
         () => {
             const bodyText = document.body.innerText || '';
-            const rows = document.querySelectorAll('tr[data-caseid], tr.load-case, table tbody tr, tbody tr').length;
+            const rows = document.querySelectorAll('tr.load-case.table-row.link[data-caseid]').length;
 
             const pageLinks = Array.from(document.querySelectorAll('a, button, span, div'))
                 .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
                 .filter(x => /^Page\\s+\\d+/i.test(x));
 
-            const m = bodyText.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i) || bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+            const m = bodyText.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
 
             return {
                 rows_on_page: rows,
                 page_links: pageLinks,
-                current_page_text: m ? `Page ${m[1]} of ${m[2]}` : "",
+                current_page_text: m ? `Page ${m[1]}/${m[2]}` : "",
                 body_sample: bodyText.slice(0, 3000)
             };
         }
@@ -970,10 +846,7 @@ def get_active_page_number(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-                let m = body.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i);
-                if (m) return parseInt(m[1], 10);
-
-                m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[1], 10);
 
                 const els = Array.from(document.querySelectorAll('button, a, div, span'));
@@ -993,13 +866,8 @@ def get_active_page_number(page) -> int:
 
 
 def collect_case_rows(page) -> List[Dict]:
-    rows = page.locator('tr[data-caseid]')
+    rows = page.locator('tr.load-case.table-row.link[data-caseid]')
     count = rows.count()
-
-    if count == 0:
-        rows = page.locator('tr.load-case')
-        count = rows.count()
-
     log.info("Collecting case rows from current page: %s", count)
 
     items = []
@@ -1019,12 +887,8 @@ def parse_total_pages(page) -> int:
             """
             () => {
                 const body = document.body.innerText || '';
-                let m = body.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i);
+                const m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
                 if (m) return parseInt(m[2], 10);
-
-                m = body.match(/Page\\s+(\\d+)\\s*\\/\\s*(\\d+)/i);
-                if (m) return parseInt(m[2], 10);
-
                 return 1;
             }
             """
@@ -1042,7 +906,6 @@ def parse_total_items(page) -> int:
                 const body = document.body.innerText || '';
 
                 const patterns = [
-                    /Found\\s+(\\d+)\\s+Results/i,
                     /Cases List\\s*»\\s*(\\d+)\\s*Cases/i,
                     /(\\d+)\\s*Cases/i
                 ];
@@ -1051,6 +914,7 @@ def parse_total_items(page) -> int:
                     const m = body.match(rx);
                     if (m) return parseInt(m[1], 10);
                 }
+
                 return 0;
             }
             """
@@ -1063,11 +927,9 @@ def parse_total_items(page) -> int:
 
 def get_first_caseid(page) -> str:
     try:
-        row = page.locator('tr[data-caseid]').first
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
         if row.count() == 0:
-            row = page.locator('tr.load-case').first
-            if row.count() == 0:
-                return ""
+            return ""
         return row.get_attribute("data-caseid") or ""
     except Exception:
         return ""
@@ -1075,28 +937,32 @@ def get_first_caseid(page) -> str:
 
 def get_first_row_text(page) -> str:
     try:
-        row = page.locator('tr[data-caseid]').first
+        row = page.locator('tr.load-case.table-row.link[data-caseid]').first
         if row.count() == 0:
-            row = page.locator('tr.load-case').first
-            if row.count() == 0:
-                return ""
+            return ""
         return clean_text(row.inner_text())
     except Exception:
         return ""
 
 
-def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_first_row_text: str = "", timeout_ms: int = 22000) -> bool:
+def wait_for_page_change(
+    page,
+    old_page: int,
+    old_first_caseid: str = "",
+    old_first_row_text: str = "",
+    timeout_ms: int = 22000,
+) -> bool:
     waited = 0
     step = 1000
 
     while waited < timeout_ms:
         try:
             current = get_active_page_number(page)
-            page_info = extract_cases(page)
+            rows_count = page.locator('tr.load-case.table-row.link[data-caseid]').count()
             new_first_caseid = get_first_caseid(page)
             new_first_row_text = get_first_row_text(page)
 
-            page_changed = current != old_page and page_info["count"] > 0
+            page_changed = current != old_page and rows_count > 0
             first_case_changed = bool(old_first_caseid and new_first_caseid and new_first_caseid != old_first_caseid)
             first_text_changed = bool(old_first_row_text and new_first_row_text and new_first_row_text != old_first_row_text)
 
@@ -1121,7 +987,7 @@ def wait_for_page_change(page, old_page: int, old_first_caseid: str = "", old_fi
 def open_pager_dropdown(page) -> bool:
     selectors = [
         'text=/^Page\\s+\\d+\\s*$/',
-        'text=/^Page\\s+\\d+\\s+of\\s+\\d+$/i',
+        'text=/^Page\\s+\\d+\\s*\\(results.*\\)$/i',
         'div:has-text("Page 1")',
         'div:has-text("Page 2")',
         'span:has-text("Page 1")',
@@ -1133,12 +999,14 @@ def open_pager_dropdown(page) -> bool:
             loc = page.locator(sel)
             if loc.count() == 0:
                 continue
+
             loc.first.click(timeout=4000)
             page.wait_for_timeout(1200)
             log.info("Opened pager dropdown using selector: %s", sel)
             return True
         except Exception:
             continue
+
     return False
 
 
@@ -1178,9 +1046,12 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
                     }) || null;
                 }
 
-                if (!target) return { ok: false, reason: 'target page element not found' };
+                if (!target) {
+                    return { ok: false, reason: 'target page element not found' };
+                }
 
                 const r = target.getBoundingClientRect();
+
                 try { target.click(); } catch (e) {}
                 try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
                 try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
@@ -1201,16 +1072,29 @@ def click_page_option_direct_without_dropdown(page, target_page: int) -> bool:
         log.info("Direct hidden/visible page option result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
-            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
                 return True
 
             try:
                 if result.get("visible"):
                     page.mouse.click(result["x"], result["y"])
-                    if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
+                    if wait_for_page_change(
+                        page,
+                        old_page=current_before,
+                        old_first_caseid=old_first_caseid,
+                        old_first_row_text=old_first_row_text,
+                        timeout_ms=16000,
+                    ):
                         return True
             except Exception:
                 pass
+
     except Exception as e:
         log.warning("click_page_option_direct_without_dropdown failed for page %s: %s", target_page, str(e))
 
@@ -1236,9 +1120,12 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
                     return t === `Page ${targetPage}` || t.startsWith(`Page ${targetPage} (results`);
                 });
 
-                if (!option) return { ok: false, reason: 'dropdown option not found' };
+                if (!option) {
+                    return { ok: false, reason: 'dropdown option not found' };
+                }
 
                 const r = option.getBoundingClientRect();
+
                 try { option.click(); } catch (e) {}
                 try { option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
                 try { option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
@@ -1258,15 +1145,28 @@ def click_page_option_from_dropdown(page, target_page: int) -> bool:
         log.info("Dropdown page option click result for page %s: %s", target_page, result)
 
         if result and result.get("ok"):
-            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
                 return True
 
             try:
                 page.mouse.click(result["x"], result["y"])
-                if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
+                if wait_for_page_change(
+                    page,
+                    old_page=current_before,
+                    old_first_caseid=old_first_caseid,
+                    old_first_row_text=old_first_row_text,
+                    timeout_ms=16000,
+                ):
                     return True
             except Exception:
                 pass
+
     except Exception as e:
         log.warning("click_page_option_from_dropdown failed for page %s: %s", target_page, str(e))
 
@@ -1278,29 +1178,70 @@ def click_next_page(page) -> bool:
     old_first_caseid = get_first_caseid(page)
     old_first_row_text = get_first_row_text(page)
 
+    log.info("Current Miami page before NEXT click: %s", current_before)
+
     try:
         result = page.evaluate(
             """
             () => {
-                const icon = document.querySelector('i.fa-regular.fa-chevron-right[aria-hidden="true"], i.fa-regular.fa-chevron-right, i.fa-chevron-right');
-                if (!icon) return { ok: false, reason: 'icon not found' };
+                function isVisible(el) {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return !!s &&
+                        s.display !== 'none' &&
+                        s.visibility !== 'hidden' &&
+                        r.width > 0 &&
+                        r.height > 0;
+                }
 
-                const parent = icon.closest('a,button,div,span,td,li') || icon;
-                const r = parent.getBoundingClientRect();
+                function txt(el) {
+                    return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+                }
 
-                try { parent.scrollIntoView({ block: 'center' }); } catch(e) {}
-                try { parent.click(); } catch(e) {}
-                try { parent.dispatchEvent(new MouseEvent('mousedown', { bubbles:true })); } catch(e) {}
-                try { parent.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })); } catch(e) {}
-                try { parent.dispatchEvent(new MouseEvent('click', { bubbles:true })); } catch(e) {}
+                function cls(el) {
+                    return ((el && el.className) || '').toString().toLowerCase();
+                }
 
-                return {
-                    ok: true,
-                    tag: parent.tagName.toLowerCase(),
-                    class_name: (parent.className || '').toString(),
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2
-                };
+                const all = Array.from(document.querySelectorAll('a, button, span, div, td, img'));
+                const visible = all.filter(isVisible);
+
+                let best = null;
+
+                for (const el of visible) {
+                    const t = txt(el);
+                    const c = cls(el);
+                    let score = 0;
+
+                    if (t === '>' || t === '›' || t === '»') score += 200;
+                    if (c.includes('next')) score += 120;
+                    if (c.includes('right')) score += 80;
+                    if (c.includes('arrow')) score += 80;
+                    if (c.includes('chevron')) score += 80;
+                    if (el.tagName.toLowerCase() === 'img') score += 40;
+                    if (el.querySelector && el.querySelector('img,svg,i')) score += 30;
+
+                    if (score <= 0) continue;
+
+                    const r = el.getBoundingClientRect();
+                    const candidate = {
+                        score,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        text: t,
+                        className: c
+                    };
+
+                    if (!best || candidate.score > best.score) {
+                        best = candidate;
+                    }
+                }
+
+                if (!best) {
+                    return { ok: false, reason: 'no next candidate found' };
+                }
+
+                return { ok: true, ...best };
             }
             """
         )
@@ -1308,15 +1249,16 @@ def click_next_page(page) -> bool:
         log.info("NEXT target detection: %s", result)
 
         if result and result.get("ok"):
-            if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
-                return True
+            page.mouse.click(result["x"], result["y"])
 
-            try:
-                page.mouse.click(result["x"], result["y"])
-                if wait_for_page_change(page, current_before, old_first_caseid, old_first_row_text, 16000):
-                    return True
-            except Exception:
-                pass
+            if wait_for_page_change(
+                page,
+                old_page=current_before,
+                old_first_caseid=old_first_caseid,
+                old_first_row_text=old_first_row_text,
+                timeout_ms=16000,
+            ):
+                return True
     except Exception as e:
         log.warning("NEXT click failed: %s", str(e))
 
@@ -1335,7 +1277,11 @@ def log_pagination_diagnostics(page):
                         const style = window.getComputedStyle(el);
                         const text = ((el.innerText || '')).replace(/\\s+/g, ' ').trim();
 
-                        if (!text.includes('Page') && !el.getAttribute('data-page') && !((el.getAttribute('href') || '').includes('javascript:void(0)'))) {
+                        if (
+                            !text.includes('Page') &&
+                            !el.getAttribute('data-page') &&
+                            !((el.getAttribute('href') || '').includes('javascript:void(0)'))
+                        ) {
                             return null;
                         }
 
@@ -1372,7 +1318,11 @@ def go_to_page_number(page, page_num: int) -> bool:
         return True
 
     if page_num < current:
-        log.warning("Requested page %s but current page is %s. Reload is required to go backwards.", page_num, current)
+        log.warning(
+            "Requested page %s but current page is %s. Reload is required to go backwards.",
+            page_num,
+            current,
+        )
         return False
 
     for attempt in range(1, 4):
@@ -1414,7 +1364,7 @@ def go_to_page_number(page, page_num: int) -> bool:
 def parse_row_text(row_text: str) -> Dict:
     parts = re.split(r"\s{2,}|\t", row_text)
     parts = [clean_text(x) for x in parts if clean_text(x)]
-    return {
+    payload = {
         "status": parts[0] if len(parts) > 0 else "",
         "case_number": parts[1] if len(parts) > 1 else "",
         "date_created": parts[2] if len(parts) > 2 else "",
@@ -1422,14 +1372,12 @@ def parse_row_text(row_text: str) -> Dict:
         "parcel_number": parts[4] if len(parts) > 4 else "",
         "sale_date": parts[5] if len(parts) > 5 else "",
     }
+    return payload
 
 
 def open_case_by_caseid(page, caseid: str) -> Dict:
-    rows = page.locator(f'tr[data-caseid="{caseid}"]')
+    rows = page.locator(f'tr.load-case.table-row.link[data-caseid="{caseid}"]')
     count = rows.count()
-    if count == 0:
-        rows = page.locator(f'tr.load-case[data-caseid="{caseid}"]')
-        count = rows.count()
     if count == 0:
         raise RuntimeError(f"Case row not found for caseid={caseid}")
 
@@ -1593,7 +1541,7 @@ def build_final_record(case_detail: Dict) -> Dict:
     parcel_number = header.get("parcel_number") or row_parsed.get("parcel_number") or parcel.get("text", "")
     case_number = header.get("case_number") or row_parsed.get("case_number", "")
 
-    return {
+    record = {
         "source": "MiamiDade",
         "county": "Miami-Dade",
         "visible_in_app": True,
@@ -1618,6 +1566,7 @@ def build_final_record(case_detail: Dict) -> Dict:
         "homestead": summary.get("homestead", ""),
         "parcel_appraiser_url": parcel.get("href", ""),
     }
+    return record
 
 
 def build_properties_payload(record: dict) -> dict:
@@ -1641,7 +1590,6 @@ def build_properties_payload(record: dict) -> dict:
         "state": "FL",
         "node": str(record.get("caseid") or ""),
         "pdf_url": record.get("parcel_appraiser_url") or None,
-        "auction_source_url": AUCTION_URL,
         "tax_sale_id": record.get("case_number"),
         "parcel_number": record.get("parcel_number"),
         "sale_date": normalize_sale_date_value(record.get("sale_date")),
@@ -1652,14 +1600,50 @@ def build_properties_payload(record: dict) -> dict:
         "city": city,
         "state_address": state_address,
         "zip": zip_code,
+        "address_source_marker": "CASE_SUMMARY_PROPERTY_ADDRESS" if address_only else None,
+        "status": "new",
+        "notes": None,
+        "auction_location": "Miami-Dade RealForeclose",
+        "auction_start_time": None,
+        "auction_platform": "Miami-Dade RealForeclose",
+        "auction_source_url": AUCTION_URL,
+        "removed_at": None,
+        "is_active": True,
+        "updated_at": now_iso(),
+    }
+
+
+def build_index_record(existing_id: Optional[str], payload: dict) -> dict:
+    return {
+        "id": existing_id,
+        "node": payload.get("node"),
+        "tax_sale_id": payload.get("tax_sale_id"),
+        "parcel_number": payload.get("parcel_number"),
+        "sale_date": payload.get("sale_date"),
+        "address": payload.get("address"),
+        "city": payload.get("city"),
+        "state_address": payload.get("state_address"),
+        "zip": payload.get("zip"),
+        "pdf_url": payload.get("pdf_url"),
+        "auction_source_url": payload.get("auction_source_url"),
+        "opening_bid": payload.get("opening_bid"),
+        "deed_status": payload.get("deed_status"),
+        "applicant_name": payload.get("applicant_name"),
+        "is_active": True,
+        "removed_at": None,
     }
 
 
 # =========================
-# BROWSER
+# MAIN
 # =========================
-def launch_browser(p):
-    try:
+def run_miami():
+    log.info("=== MIAMI FINAL OPERATIONAL V8 + STANDARDIZED SAVE FLOW + SAFE DELETE ===")
+
+    supabase_rows = supabase_fetch_all_miami_records() if CAN_CHECK_SUPABASE else []
+    indexes = build_supabase_indexes(supabase_rows)
+
+    with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="chrome",
             headless=HEADLESS,
@@ -1669,28 +1653,6 @@ def launch_browser(p):
                 "--disable-dev-shm-usage",
             ],
         )
-        log.info("Launched with channel=chrome")
-        return browser
-    except Exception as e:
-        log.warning("Chrome channel unavailable, falling back to chromium: %s", str(e))
-        return p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-
-# =========================
-# MAIN
-# =========================
-def run_miami():
-    log.info("=== MIAMI FINAL FIXED MODE ===")
-
-    with sync_playwright() as p:
-        browser = launch_browser(p)
 
         context = browser.new_context(
             user_agent=(
@@ -1747,14 +1709,10 @@ def run_miami():
             processed_pages += 1
             log.info("Processing all %s rows from page %s before moving forward", len(rows), page_num)
 
-            page_nodes = []
             for row in rows:
                 caseid = str(row.get("caseid") or "").strip()
                 if caseid:
                     seen_nodes_this_run.add(caseid)
-                    page_nodes.append(caseid)
-
-            existing_by_node = supabase_fetch_existing_cases_by_nodes(page_nodes)
 
             for row in rows:
                 if total_processed_rows >= MAX_LOTS:
@@ -1780,50 +1738,51 @@ def run_miami():
                     pre_parcel_number = clean_text(row_parsed.get("parcel_number", ""))
                     pre_sale_date = normalize_sale_date_value(row_parsed.get("sale_date", ""))
 
-                    existing = existing_by_node.get(caseid)
+                    existing = indexes["by_node"].get(caseid)
+                    if not existing and pre_tax_sale_id and pre_parcel_number:
+                        existing = indexes["by_tax_sale_parcel"].get((pre_tax_sale_id, pre_parcel_number))
 
                     if existing:
-                        existing_tax_sale_id = clean_text(existing.get("tax_sale_id", ""))
-                        existing_parcel_number = clean_text(existing.get("parcel_number", ""))
-                        existing_sale_date = normalize_sale_date_value(existing.get("sale_date"))
-
+                        db_sale_date = normalize_sale_date_value(existing.get("sale_date"))
                         same_identity = (
-                            existing_parcel_number == pre_parcel_number and
-                            (not existing_tax_sale_id or existing_tax_sale_id == pre_tax_sale_id)
+                            clean_text(existing.get("parcel_number") or "") == pre_parcel_number
+                            and (
+                                not clean_text(existing.get("tax_sale_id") or "")
+                                or clean_text(existing.get("tax_sale_id") or "") == pre_tax_sale_id
+                            )
                         )
+                        is_inactive = existing.get("is_active") is False or clean_text(existing.get("removed_at") or "") != ""
 
-                        if same_identity:
-                            if existing_sale_date == pre_sale_date:
-                                skipped_fast_same_sale_date += 1
-                                log.info(
-                                    "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
-                                    caseid,
-                                    pre_sale_date,
-                                    existing_sale_date,
-                                )
-                                continue
+                        if same_identity and not record_needs_enrichment(existing) and not is_inactive and db_sale_date == pre_sale_date:
+                            skipped_fast_same_sale_date += 1
+                            log.info(
+                                "FAST SKIP node=%s reason=same identity and same sale_date site=%s db=%s",
+                                caseid,
+                                pre_sale_date,
+                                db_sale_date,
+                            )
+                            continue
 
+                        if same_identity and not record_needs_enrichment(existing) and db_sale_date != pre_sale_date:
                             update_result = supabase_update_sale_date(existing.get("id"), pre_sale_date)
                             supabase_results.append({
-                                "sent": update_result.get("sent", False),
-                                "status_code": update_result.get("status_code"),
                                 "node": caseid,
-                                "response_text": f"sale_date_only_update: {update_result.get('response_text', '')}",
+                                "mode": "update_sale_date_only",
+                                **update_result,
                             })
                             updated_sale_date_only += 1
 
-                            log.info("SALE_DATE ONLY UPDATE node=%s old=%s new=%s", caseid, existing_sale_date, pre_sale_date)
+                            if update_result.get("sent"):
+                                existing["sale_date"] = pre_sale_date
+                                existing["is_active"] = True
+                                existing["removed_at"] = None
 
-                            mini_payload = {
-                                "county": "Miami-Dade",
-                                "state": "FL",
-                                "node": caseid,
-                                "tax_sale_id": pre_tax_sale_id,
-                                "parcel_number": pre_parcel_number,
-                                "sale_date": pre_sale_date,
-                                "auction_source_url": AUCTION_URL,
-                            }
-                            send_to_app(mini_payload)
+                            log.info(
+                                "SALE_DATE ONLY UPDATE node=%s old=%s new=%s",
+                                caseid,
+                                db_sale_date,
+                                pre_sale_date,
+                            )
                             continue
 
                     opened_detail_count += 1
@@ -1841,10 +1800,47 @@ def run_miami():
 
                     prop_payload = build_properties_payload(record)
 
-                    sb_result = supabase_upsert_property(prop_payload)
-                    supabase_results.append(sb_result)
+                    existing = indexes["by_node"].get(prop_payload.get("node"))
+                    if not existing:
+                        key = (
+                            clean_text(prop_payload.get("tax_sale_id") or ""),
+                            clean_text(prop_payload.get("parcel_number") or ""),
+                        )
+                        if key[0] and key[1]:
+                            existing = indexes["by_tax_sale_parcel"].get(key)
 
-                    send_to_app(prop_payload)
+                    if existing and not payload_is_better_than_existing(prop_payload, existing):
+                        is_inactive = existing.get("is_active") is False or clean_text(existing.get("removed_at") or "") != ""
+                        if not is_inactive:
+                            log.info("DETAIL READ but payload not better → skip save node=%s", prop_payload.get("node"))
+                            open_list_and_apply_filter(page)
+                            if page_num > 1:
+                                ok = go_to_page_number(page, page_num)
+                                if not ok:
+                                    raise RuntimeError(f"Could not return to page {page_num} after caseid={caseid}")
+                            continue
+
+                    sb_result = supabase_save_property(prop_payload, existing)
+                    supabase_results.append({
+                        "node": prop_payload.get("node"),
+                        "mode": "full_save",
+                        **sb_result,
+                    })
+
+                    if sb_result.get("sent"):
+                        record_id = sb_result.get("record_id") or (existing.get("id") if existing else None)
+                        idx_record = build_index_record(record_id, prop_payload)
+
+                        node_key = clean_text(prop_payload.get("node") or "")
+                        tax_sale_key = clean_text(prop_payload.get("tax_sale_id") or "")
+                        parcel_key = clean_text(prop_payload.get("parcel_number") or "")
+
+                        if node_key:
+                            indexes["by_node"][node_key] = idx_record
+                        if tax_sale_key and parcel_key:
+                            indexes["by_tax_sale_parcel"][(tax_sale_key, parcel_key)] = idx_record
+
+                        send_to_app(prop_payload)
 
                     log.info("SUCCESS DETAIL OPEN node=%s", prop_payload.get("node"))
 
@@ -1863,8 +1859,6 @@ def run_miami():
                         "error": str(e),
                     })
 
-                    dump_debug_artifacts(page, f"miami_failed_case_{caseid}")
-
                     try:
                         open_list_and_apply_filter(page)
                         if page_num > 1:
@@ -1872,7 +1866,9 @@ def run_miami():
                     except Exception:
                         pass
 
-        completed_all_pages = (expected_total_pages > 0 and processed_pages == expected_total_pages)
+        completed_all_pages = (
+            expected_total_pages > 0 and processed_pages == expected_total_pages
+        )
 
         can_delete_missing = (
             completed_all_pages
@@ -1888,7 +1884,8 @@ def run_miami():
             reconcile_result = {
                 "executed": False,
                 "reason": (
-                    f"safe delete blocked: completed_all_pages={completed_all_pages}, "
+                    f"safe delete blocked: "
+                    f"completed_all_pages={completed_all_pages}, "
                     f"processed_pages={processed_pages}, "
                     f"expected_total_pages={expected_total_pages}, "
                     f"seen_nodes={len(seen_nodes_this_run)}, "
@@ -1901,7 +1898,7 @@ def run_miami():
 
         final_payload = {
             "source": "MiamiDade",
-            "mode": "final_fixed_mode",
+            "mode": "final_operational_v8_standardized_save_flow_safe_delete",
             "expected_total_pages": expected_total_pages,
             "expected_total_items": expected_total_items,
             "processed_pages": processed_pages,
@@ -1929,5 +1926,8 @@ def run_miami():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
     run_miami()
